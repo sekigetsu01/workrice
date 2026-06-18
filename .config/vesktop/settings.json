@@ -1,0 +1,11 @@
+{
+    "discordBranch": "stable",
+    "minimizeToTray": false,
+    "arRPC": true,
+    "customTitleBar": false,
+    "enableSplashScreen": false,
+    "splashTheming": false,
+    "tray": false,
+    "splashColor": "rgb(235, 219, 178)",
+    "splashBackground": "rgb(29, 32, 33)"
+}

@@ -1,0 +1,3 @@
+#!/bin/bash
+
+wlsunset -S 5:40 -T 6500 -s 22:00 -t 1000

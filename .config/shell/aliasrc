@@ -1,0 +1,95 @@
+#!/bin/sh
+# Use neovim for vim if present.
+[ -x "$(command -v nvim)" ] && alias vim="nvim" && alias vimdiff="nvim -d"
+
+# sudo not required for some system commands
+for command in mount umount sv pacman updatedb su shutdown poweroff reboot; do
+	alias $command="sudo $command"
+done; unset command
+
+se() {
+	choice="$(find ~/.local/bin -mindepth 1 -printf '%P\n' | fzf)"
+	[ -f "$HOME/.local/bin/$choice" ] && $EDITOR "$HOME/.local/bin/$choice"
+}
+
+# Verbosity and settings that you pretty much just always are going to want.
+alias \
+	cp="cp -iv" \
+	mv="mv -iv" \
+	rm="rm -rf" \
+	bc="bc -ql" \
+	rs="rsync -avh --partial --append-verify --progress" \
+	mkd="mkdir -pv" \
+	yt="yt-dlp --embed-metadata -i" \
+	yta="yt-dlp -x -f bestaudio/best --embed-chapters" \
+	ffmpeg="ffmpeg -hide_banner"
+
+# Colorize commands when possible.
+alias \
+	ls="eza --icons --group-directories-first" \
+	grep="grep --color=auto" \
+	diff="diff --color=auto" \
+	ccat="highlight --out-format=ansi" \
+	ip="ip -color=auto" \
+	cat="bat --style=numbers,changes,header --color=always"
+
+# These common commands are just too long! Abbreviate them.
+alias \
+	ka="killall" \
+	f="fastfetch" \
+	mpvl="mpv --loop" \
+	mpv="mpv --vo=wlshm" \
+	v="nvim" \
+	sy="syncthing" \
+	Ss="sudo pacman -Ss" \
+	g="git" \
+	gin="git init" \
+	ga="git add ." \
+	gcm="git commit -m" \
+	gb="git branch -M main" \
+	gr="git remote add origin" \
+	gp="git push -f origin main" \
+	gcl="git clone" \
+	sdn="shutdown -h now" \
+	p="sudo pacman -Syu" \
+	pd="sudo pacman -Rns" \
+	cm="chmod 777" \
+	sip="curl ipinfo.io" \
+	xo="xdg-open" \
+	vp="vpn-startup" \
+	vpn="vpn-setup" \
+	y="yazi" \
+	l="yazi" \
+	u="unzip" \
+	si="sioyek" \
+	i="swayimg"
+
+ipa() { ip route get 1.1.1.1 | awk '{print $7; exit}'; }
+
+# Shortcut directories
+alias \
+	pp="yazi ~/Pictures" \
+	wp="yazi ~/sync/wallpapers" \
+	S="yazi ~/sync" \
+	vd="z ~/Videos" \
+	m="z ~/music && ls" \
+	L="yazi ~/Library" \
+	cf="z ~/.config && ls" \
+	cac="z ~/.cache && ls" \
+	sc="z ~/.local/bin && ls" \
+	D="z ~/Downloads && ls" \
+	d="z ~/sync/documents && ls" \
+	dt="z ~/.local/share && ls" \
+	gi="z ~/github && ls" \
+	W="z ~/sync/wallpapers && ls" \
+	rv="z ~/RiseupVPN-OpenVPN && ls" \
+	co="z ~/sync/programming && ls"
+	m="z /mnt" \
+	mh="z /mnt/hdd"
+
+# Shortcut files
+alias \
+	cfv="v ~/.config/nvim/init.vim" \
+	cfz="v ~/.zshrc" \
+	cfm="v ~/.config/mango/config.conf" \
+	gf="v ~/github/git-reminders.txt"

@@ -1,0 +1,11 @@
+#!/bin/bash
+
+rm -rf $HOME/RiseupVPN-OpenVPN
+
+git clone https://github.com/BarbossHack/RiseupVPN-OpenVPN.git $HOME/RiseupVPN-OpenVPN
+
+cd $HOME/RiseupVPN-OpenVPN
+
+./generate.sh
+
+notify-send "VPN has been setup"

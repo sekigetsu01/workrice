@@ -1,0 +1,100 @@
+#!/bin/bash
+
+OUTPUT_DIR="$HOME/Videos"
+LOG_FILE="/tmp/screen-recorder.log"
+PID_FILE="/tmp/screen-recorder.pid"
+OUT_FILE="/tmp/screen-recorder.outpath"
+
+notify() {
+    if command -v notify-send &>/dev/null; then
+        notify-send --app-name="Screen Recorder" --icon="media-record" "$1" "$2"
+    elif command -v kdialog &>/dev/null; then
+        kdialog --passivepopup "$2" 3
+    fi
+}
+
+_stop() {
+    if kill -0 "$RECORDER_PID" 2>/dev/null; then
+        kill -SIGTERM "$RECORDER_PID"
+        for i in {1..10}; do
+            sleep 0.5
+            kill -0 "$RECORDER_PID" 2>/dev/null || break
+        done
+        kill -0 "$RECORDER_PID" 2>/dev/null && kill -SIGKILL "$RECORDER_PID"
+        wait "$RECORDER_PID" 2>/dev/null
+    fi
+    rm -f "$PID_FILE" "$OUT_FILE"
+    if [ -s "$OUTPUT_FILE" ]; then
+        notify "Screen Recorder" "✅ Saved: $(basename "$OUTPUT_FILE")"
+        echo "Saved to: $OUTPUT_FILE"
+    else
+        notify "Screen Recorder" "⚠️ File missing"
+    fi
+}
+
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "Already recording (PID: $(cat "$PID_FILE")). Run end-recording to stop."
+    exit 1
+fi
+
+command -v ffmpeg &>/dev/null || { notify "Screen Recorder" "❌ ffmpeg not installed"; exit 1; }
+
+if [ -n "$WAYLAND_DISPLAY" ]; then
+    BACKEND="wayland"
+elif [ -n "$DISPLAY" ]; then
+    BACKEND="x11"
+    RESOLUTION=$(xdpyinfo 2>/dev/null | awk '/dimensions/{print $2; exit}')
+    RESOLUTION=${RESOLUTION:-1920x1080}
+else
+    notify "Screen Recorder" "❌ No display detected"
+    exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_FILE="$OUTPUT_DIR/recording_$(date +"%Y-%m-%d_%H-%M-%S").mp4"
+echo "$OUTPUT_FILE" > "$OUT_FILE"
+echo $$ > "$PID_FILE"
+
+trap '_stop; exit 0' SIGTERM SIGINT
+
+if [ "$BACKEND" = "x11" ]; then
+    ffmpeg -y \
+        -f x11grab \
+        -r 30 \
+        -s "$RESOLUTION" \
+        -i "${DISPLAY:-:0}.0" \
+        -c:v libx264 \
+        -preset fast \
+        -crf 18 \
+        -pix_fmt rgb24 \
+        -vf "format=yuv444p" \
+        -color_range pc \
+        -color_primaries bt709 \
+        -color_trc bt709 \
+        -colorspace bt709 \
+        "$OUTPUT_FILE" \
+        > "$LOG_FILE" 2>&1 &
+else
+    command -v wf-recorder &>/dev/null || { notify "Screen Recorder" "❌ wf-recorder not installed"; rm -f "$PID_FILE" "$OUT_FILE"; exit 1; }
+    wf-recorder \
+        --codec libx264 \
+        --codec-param crf=18 \
+        --codec-param preset=fast \
+        -f "$OUTPUT_FILE" \
+        > "$LOG_FILE" 2>&1 &
+fi
+
+RECORDER_PID=$!
+
+sleep 1
+if ! kill -0 "$RECORDER_PID" 2>/dev/null; then
+    notify "Screen Recorder" "❌ Failed to start"
+    echo "ERROR: Check $LOG_FILE"; cat "$LOG_FILE"
+    rm -f "$PID_FILE" "$OUT_FILE"
+    exit 1
+fi
+
+notify "Screen Recorder" "🔴 Recording started"
+echo "Recording started (PID: $RECORDER_PID) → $OUTPUT_FILE"
+
+wait "$RECORDER_PID"

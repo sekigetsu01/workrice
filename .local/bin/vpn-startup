@@ -1,0 +1,4 @@
+#!/bin/sh
+
+cd /home/user/RiseupVPN-OpenVPN
+sudo openvpn --config riseup-ovpn.conf

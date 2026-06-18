@@ -1,0 +1,35 @@
+#!/bin/bash
+source "$HOME/.zshrc"
+
+WALLPAPERS_DIR="/home/user/sync/wallpapers"
+LAST_WALLPAPER="$HOME/.config/mango/last_wallpaper.txt"
+
+[ -d "$WALLPAPERS_DIR" ] || { echo "Error: Wallpapers directory not found."; exit 1; }
+
+PREVIOUS=$(cat "$LAST_WALLPAPER" 2>/dev/null)
+
+for _ in $(seq 10); do
+    CANDIDATE=$(find "$WALLPAPERS_DIR" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.gif" -o -iname "*.bmp" -o -iname "*.svg" \) | shuf -n 1)
+    [ "$CANDIDATE" != "$PREVIOUS" ] && { IMAGE="$CANDIDATE"; break; }
+done
+
+[ -z "$IMAGE" ] && { echo "Error: No images found."; exit 1; }
+
+echo "$IMAGE" > "$LAST_WALLPAPER"
+
+if ! awww query &>/dev/null; then
+    awww init &
+    sleep 0.5
+fi
+
+awww img "$IMAGE" \
+    --transition-type wipe \
+    --transition-duration 0.5 \
+    --transition-fps 60
+
+wal -n -i "$(readlink -f "$IMAGE")" -o "${HOME}/.config/wal/postrun"
+
+pkill waybar
+sleep 0.1
+waybar &
+mmsg dispatch reload_config

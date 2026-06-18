@@ -1,0 +1,114 @@
+{
+  "layer": "top",
+  "position": "top",
+  "height": 22,
+  "spacing": 4,
+  "modules-left": [
+    "ext/workspaces",
+    "custom/sep",
+    "dwl/window"
+  ],
+  "modules-right": [
+    "custom/sep",
+    "cpu",
+    "custom/sep",
+    "memory",
+    "custom/sep",
+    "disk",
+    "custom/sep",
+    "pulseaudio",
+    "custom/sep",
+    "network",
+    "custom/sep",
+    "battery",
+    "custom/sep",
+    "clock#date",
+    "custom/sep",
+    "clock",
+    "custom/sep",
+    "tray"
+  ],
+  "clock": {
+    "format": "<span size='13000'></span> {:%H:%M}"
+  },
+  "clock#date": {
+    "format": "<span size='13000'> </span>{:%a %d %b}",
+    "on-click": "foot -e calcurse"
+  },
+
+  "cpu": {
+    "format": "CPU: {usage}%",
+    "tooltip": false,
+    "on-click": "foot -e btop"
+  },
+  "memory": {
+    "format": "Mem: {used}GiB",
+    "on-click": "foot -e btop"
+  },
+  "disk": {
+    "interval": 60,
+    "path": "/",
+    "format": "Disk: {free}",
+    "on-click": "foot -e ncdu"
+  },
+  "network": {
+   "format": "⚠ Disabled",
+   "format-wifi": "<span size='16000'></span> {essid}",
+   "format-ethernet": "<span size='15000'></span> Wired",
+   "format-disconnected": "Disconnected ",
+   "on-click": "qs ipc call network toggle"
+  },
+
+  "ext/workspaces": {
+    "format": "{icon}",
+    "ignore-hidden": false,
+    "on-click": "activate",
+    "sort-by-id": true
+  },
+  "custom/vpn": {
+    "exec": "~/.local/bin/vpn-status",
+    "return-type": "json",
+    "interval": 5
+  },
+  "dwl/window": {
+    "format": "[{layout}] {title}",
+    "max-length": 40,
+    "separate-outputs": false
+  },
+  "custom/sep": {
+    "format": "|",
+    "interval": 0
+  },
+  "pulseaudio": {
+    "format": "<span size='14000'>{icon}</span>{volume:>3}%",
+    "format-muted": "<span size='13500'>󰖁</span> Muted",
+    "format-icons": {
+    "default": ["󰖀", "󰕾"]
+    },
+    "on-click": "foot -e pulsemixer"
+  },
+
+ "battery": {
+         "interval":30,
+         "states": {
+             "good": 95,
+             "warning": 30,
+             "critical": 20
+         },
+         "format": "{capacity}% {icon}",
+         "format-charging": "{capacity}% 󰂄",
+         "format-plugged": "{capacity}% 󰂄 ",
+         "format-alt": "{time} {icon}",
+         "format-icons": [
+             "󰁻",
+         "󰁼",
+         "󰁾",
+         "󰂀",
+         "󰂂",
+         "󰁹"
+         ]
+  },
+  "tray": {
+    "spacing": 10
+  }
+}
