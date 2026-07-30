@@ -1,0 +1,17 @@
+#!/bin/bash
+
+PID_FILE="/tmp/screen-recorder.pid"
+
+if [ ! -f "$PID_FILE" ]; then
+    echo "No active recording found."
+    exit 1
+fi
+
+PID=$(cat "$PID_FILE")
+
+if kill -0 "$PID" 2>/dev/null; then
+    kill -SIGTERM "$PID"
+else
+    echo "Process $PID not running — cleaning up."
+    rm -f "$PID_FILE" /tmp/screen-recorder.outpath
+fi

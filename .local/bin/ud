@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+#
+# Wipes git history on a local dotfiles repo and force-pushes it as a fresh
+# commit to GitHub, then re-clones it into ~/github.
+#
+# Remembers your last GitHub username and previously used repo names in
+# ~/.config/update-dotfiles/. Username is pre-filled (edit or press Enter).
+# Repo name offers live fuzzy autofill suggestions via fzf if installed
+# (falls back to bash's read -e Tab-completion otherwise).
+#
+set -euo pipefail
+
+GITHUB_DIR="$HOME/github"
+CONFIG_DIR="${XDG_STATE_HOME:-$HOME/.cache/update-dotfiles}"
+NAME_HISTORY_FILE="$CONFIG_DIR/usernames"
+REPO_HISTORY_FILE="$CONFIG_DIR/repos"
+
+mkdir -p "$CONFIG_DIR" "$GITHUB_DIR"
+touch "$NAME_HISTORY_FILE" "$REPO_HISTORY_FILE"
+
+HAS_FZF=false
+command -v fzf > /dev/null 2>&1 && HAS_FZF=true
+
+last_line() {
+    # last non-empty line of a file, or "" if none
+    tail -n 1 "$1" 2>/dev/null || true
+}
+
+move_to_end() {
+    # write $2 as the last (most recent) line of file $1, deduped
+    local file="$1" val="$2"
+    grep -qxF "$val" "$file" 2>/dev/null && grep -vxF "$val" "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    echo "$val" >> "$file"
+}
+
+# --- Username prompt (pre-filled, editable) ----------------------------------
+LAST_GH_NAME="$(last_line "$NAME_HISTORY_FILE")"
+read -e -i "$LAST_GH_NAME" -p "GitHub username: " GH_NAME
+
+if [[ -z "$GH_NAME" ]]; then
+    echo "Error: GitHub username is required." >&2
+    exit 1
+fi
+
+# --- Repo prompt --------------------------------------------------------------
+# Known repos = history file entries + existing folders under ~/github
+declare -A KNOWN_REPOS=()
+while IFS= read -r line; do
+    [[ -n "$line" ]] && KNOWN_REPOS["$line"]=1
+done < "$REPO_HISTORY_FILE"
+for d in "$GITHUB_DIR"/*/; do
+    [[ -d "$d" ]] || continue
+    KNOWN_REPOS["$(basename "$d")"]=1
+done
+
+LAST_REPO="$(last_line "$REPO_HISTORY_FILE")"
+
+if $HAS_FZF; then
+    FZF_OUT=$(printf '%s\n' "${!KNOWN_REPOS[@]}" | fzf --print-query --prompt="Repo name> " \
+        --header="Type to filter, Tab/Enter to accept, Esc to quit" || true)
+    REPO_NAME=$(printf '%s\n' "$FZF_OUT" | sed -n '2p')
+    [[ -z "$REPO_NAME" ]] && REPO_NAME=$(printf '%s\n' "$FZF_OUT" | sed -n '1p')
+else
+    echo "Known repos: ${!KNOWN_REPOS[*]}"
+    for r in "${!KNOWN_REPOS[@]}"; do
+        history -s "$r"
+    done
+    pushd "$GITHUB_DIR" > /dev/null
+    read -e -i "$LAST_REPO" -p "Repo name: " REPO_NAME
+    popd > /dev/null
+fi
+
+if [[ -z "$REPO_NAME" ]]; then
+    echo "Error: repo name is required." >&2
+    exit 1
+fi
+
+REMOTE_URL="git@github.com:${GH_NAME}/${REPO_NAME}.git"
+CLONE_URL="https://github.com/${GH_NAME}/${REPO_NAME}"
+REPO_PATH="${GITHUB_DIR}/${REPO_NAME}"
+
+if [[ ! -d "$REPO_PATH" ]]; then
+    echo "Error: directory '${REPO_PATH}' not found." >&2
+    exit 1
+fi
+
+cd "$REPO_PATH"
+
+echo "==> Resetting git history in $(pwd)"
+rm -rf .git
+git init
+git add .
+git commit -m "Created"
+git branch -M main
+git remote add origin "$REMOTE_URL"
+
+echo "==> Force-pushing to ${REMOTE_URL}"
+git push -f origin main
+
+cd "$GITHUB_DIR"
+
+echo "==> Removing old local copy at ${REPO_PATH}"
+rm -rf "$REPO_PATH"
+
+echo "==> Re-cloning ${CLONE_URL}"
+git clone "$CLONE_URL"
+
+# --- Save username + repo name for next time ---------------------------------
+move_to_end "$NAME_HISTORY_FILE" "$GH_NAME"
+move_to_end "$REPO_HISTORY_FILE" "$REPO_NAME"
+
+echo "Done."

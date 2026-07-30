@@ -1,0 +1,165 @@
+{
+    "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+    "logo": {
+	"source": "/home/user/.config/fastfetch/images/logo.txt",
+    },
+    "display": {
+        "separator": " -> ",
+        "constants": [
+            "──────────────────────────────"
+        ]
+    },
+    "modules": [
+        {
+            "type": "custom",
+            "format": "┌{$1}{$1}┐",
+            "outputColor": "90"
+        },
+        {
+            "type": "title",
+            "keyWidth": 10
+        },
+        {
+            "type": "custom",
+            "format": "└{$1}{$1}┘",
+            "outputColor": "90"
+        },
+        {
+            "type": "custom",
+            "format": " {#90}  {#31}  {#32}  {#33}  {#34}  {#35}  {#36}  {#37}  {#38}  {#39}       {#38}  {#37}  {#36}  {#35}  {#34}  {#33}  {#32}  {#31}  {#90}"
+        },
+        {
+            "type": "custom",
+            "format": "┌{$1}{$1}┐",
+            "outputColor": "90"
+        },
+        {
+            "type": "os",
+            "key": " OS",
+            "keyColor": "yellow"
+        },
+        {
+            "type": "kernel",
+            "key": "│ ├ Kernel",
+            "keyColor": "yellow"
+        },
+        {
+            "type": "packages",
+            "key": "│ ├󰏖 Packages",
+            "keyColor": "yellow"
+        },
+        {
+            "type": "shell",
+            "key": "│ └ Shell",
+            "keyColor": "yellow"
+        },
+        {
+            "type": "processes",
+            "key": "│ ├󰏖 Processes",
+            "keyColor": "yellow"
+        },
+        {
+            "type": "uptime",
+            "key": "│ ├󰅐 Uptime",
+            "keyColor": "yellow"
+        },
+
+        {
+            "type": "wm",
+            "key": " WM",
+            "keyColor": "blue"
+        },
+        {
+            "type": "display",
+            "key": "│ └󰍹 Display",
+            "keyColor": "blue"
+        },
+
+        {
+            "type": "lm",
+            "key": "│ ├󰧨 Login",
+            "keyColor": "blue"
+        },
+        {
+            "type": "fonts",
+            "key": "│ ├ Terminal Font",
+            "keyColor": "blue"
+        },
+        {
+            "type": "terminal",
+            "key": "│ ├ Terminal",
+            "keyColor": "blue"
+        },
+        {
+            "type": "terminalfont",
+            "key": "│ ├ Font",
+            "keyColor": "blue"
+        },
+
+        {
+            "type": "host",
+            "key": "󰌢 PC",
+            "keyColor": "green"
+        },
+        {
+            "type": "cpu",
+            "format": "{1}",
+            "key": "│ ├ CPU" ,
+            "keyColor": "green"
+        },
+        {
+            "type": "gpu",
+            "format": "{2}",
+            "key": "│ ├ GPU",
+            "keyColor": "green"
+        },
+
+
+    {
+      "type": "gpu",
+      "format": "{3}",
+      "key": "│ ├ GPU Driver",
+      "keyColor": "green"
+    },
+        {
+            "type": "disk",
+            "key": "│ ├ Disk",
+            "keyColor": "green"
+        },
+        {
+            "type": "memory",
+            "key": "│ ├ Memory",
+            "keyColor": "green"
+        },
+        {
+            "type": "swap",
+            "key": "│ ├ Swap",
+            "keyColor": "green"
+        },
+        {
+            "type": "sound",
+            "key": " SND",
+            "keyColor": "cyan"
+        },
+        {
+            "type": "player",
+            "key": "│ ├󰥠",
+            "keyColor": "cyan"
+        },
+        {
+            "type": "media",
+            "key": "│ └󰝚",
+            "keyColor": "cyan"
+        },
+        {
+            "type": "custom",
+            "format": "└{$1}{$1}┘",
+            "outputColor": "90"
+        },
+        "break",
+        {
+            "type": "custom",
+            "format": " {#90}  {#31}  {#32}  {#33}  {#34}  {#35}  {#36}  {#37}  {#38}  {#39}       {#38}  {#37}  {#36}  {#35}  {#34}  {#33}  {#32}  {#31}  {#90}"
+        }
+    ]
+}
