@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""
+Controls:
+  Space / P   - Pause / Resume
+  I           - Toggle info overlay
+  , / .       - Slow down / Speed up (25 wpm)
+  [ / ]       - Fewer / More words per flash
+  Left / H    - Rewind 20 words
+  Right / L   - Forward 20 words
+  Q / Esc     - Quit
+"""
+
+import sys, argparse, shutil, select, termios, tty, signal, re, subprocess
+
+CLEAR       = "\033[2J"
+HOME        = "\033[H"
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+BOLD        = "\033[1m"
+DIM         = "\033[2m"
+RESET       = "\033[0m"
+RED         = "\033[38;5;203m"
+GRAY        = "\033[38;5;238m"
+GRAY2       = "\033[38;5;244m"
+WHITE       = "\033[38;5;255m"
+AMBER       = "\033[38;5;215m"
+
+def move(row, col):
+    return f"\033[{row};{col}H"
+
+def extract_pdf(path):
+
+    candidates = ["pdftotext", "/usr/bin/pdftotext", "/usr/local/bin/pdftotext"]
+    for cmd in candidates:
+        try:
+            r = subprocess.run([cmd, path, "-"], capture_output=True, text=True, check=True)
+            return r.stdout
+        except FileNotFoundError:
+            continue
+        except subprocess.CalledProcessError as e:
+            print(f"Error reading PDF: {e}")
+            sys.exit(1)
+    print(
+        "Error: pdftotext not found.\n"
+        "  Ubuntu/Debian : sudo apt install poppler-utils\n"
+        "  macOS (Homebrew): brew install poppler\n"
+        "  Fedora/RHEL   : sudo dnf install poppler-utils"
+    )
+    sys.exit(1)
+
+def tokenize(text):
+    return re.sub(r'\s+', ' ', text).split()
+
+def focus_index(word):
+    n = len(word)
+    if n == 1:  return 0
+    if n <= 4:  return 1
+    if n <= 8:  return 2
+    if n <= 12: return 3
+    return 4
+
+class RawInput:
+    def __init__(self):
+        self.fd = open('/dev/tty', 'r')
+        self.old = termios.tcgetattr(self.fd)
+    def __enter__(self):
+        tty.setraw(self.fd)
+        return self
+    def __exit__(self, *_):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+        self.fd.close()
+    def read_key(self, timeout=0.05):
+        if not select.select([self.fd], [], [], timeout)[0]:
+            return None
+        ch = self.fd.read(1)
+        if ch == '\x1b' and select.select([self.fd], [], [], 0.05)[0]:
+            ch2 = self.fd.read(1)
+            if ch2 == '[' and select.select([self.fd], [], [], 0.05)[0]:
+                return f"ESC[{self.fd.read(1)}"
+        return ch
+
+def render(chunk, wpm, idx, total, paused, cols, rows, show_info, notif, notif_ttl, chunk_size):
+    out = [CLEAR + HOME]
+    center_row = rows // 2
+    center_col = cols // 2
+
+    if chunk:
+        if chunk_size == 1:
+            word = chunk[0]
+            fi = focus_index(word)
+            word_start = center_col - fi
+            out.append(move(center_row, word_start))
+            out.append(WHITE + BOLD + word[:fi] + RESET)
+            out.append(move(center_row, word_start + fi))
+            out.append(RED + BOLD + word[fi] + RESET)
+            out.append(move(center_row, word_start + fi + 1))
+            out.append(WHITE + BOLD + word[fi + 1:] + RESET)
+        else:
+            display = " ".join(chunk)
+            out.append(move(center_row, max(1, center_col - len(display) // 2)))
+            out.append(WHITE + BOLD + display + RESET)
+
+    if show_info:
+        bar_w   = min(cols - 4, 50)
+        filled  = int(bar_w * idx / max(total - 1, 1))
+        eta_sec = (total - idx) / (wpm / 60) if wpm > 0 else 0
+        state   = "paused" if paused else "reading"
+        out.append(move(center_row - 5, 2))
+        out.append(GRAY2 + f"{state}   {wpm} wpm   {idx + 1}/{total}   "
+                           f"{int(eta_sec // 60)}m {int(eta_sec % 60)}s left   "
+                           f"{chunk_size} word{'s' if chunk_size != 1 else ''}/flash" + RESET)
+        out.append(move(center_row - 4, 2))
+        out.append(GRAY + "█" * filled + "░" * (bar_w - filled) + RESET)
+
+    if notif and notif_ttl > 0:
+        out.append(move(center_row + 3, max(1, (cols - len(notif)) // 2)))
+        out.append((AMBER if notif_ttl > 0.5 else GRAY2) + notif + RESET)
+
+    hint = "i info   spc pause   , . speed   [ ] chunk   <- -> skip   q quit"
+    out.append(move(rows - 1, max(1, (cols - len(hint)) // 2)))
+    out.append(GRAY + DIM + hint + RESET)
+
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+_resized = False
+
+def _on_sigwinch(*_):
+    global _resized
+    _resized = True
+
+def run(words, wpm, start, chunk_size=1):
+    global _resized
+    idx       = max(0, min(start, len(words) - 1))
+    total     = len(words)
+    paused    = False
+    show_info = False
+    notif     = ""
+    notif_ttl = 0.0
+    NOTIF_DUR = 1.5
+    SKIP      = 20
+    tick      = 0.05
+
+    signal.signal(signal.SIGWINCH, _on_sigwinch)
+    sys.stdout.write(HIDE_CURSOR)
+    sys.stdout.flush()
+
+    try:
+        with RawInput() as kb:
+            delay = 60.0 / wpm
+
+            while idx < total:
+                cols, rows = shutil.get_terminal_size()
+                chunk = words[idx : idx + chunk_size]
+                render(chunk, wpm, idx, total, paused, cols, rows,
+                       show_info, notif, notif_ttl, chunk_size)
+
+                elapsed = 0.0
+                skipped = False
+
+                while paused or elapsed < delay:
+                    if _resized:
+                        _resized = False
+                        cols, rows = shutil.get_terminal_size()
+                        render(chunk, wpm, idx, total, paused, cols, rows,
+                               show_info, notif, notif_ttl, chunk_size)
+
+                    key = kb.read_key(timeout=tick)
+
+                    if notif_ttl > 0:
+                        notif_ttl = max(0.0, notif_ttl - tick)
+                        if notif_ttl <= 0.0:
+                            notif_ttl = 0.0
+                            notif = ""
+                        cols, rows = shutil.get_terminal_size()
+                        render(chunk, wpm, idx, total, paused, cols, rows,
+                               show_info, notif, notif_ttl, chunk_size)
+
+                    if key:
+                        k = key.lower()
+
+
+
+                        if k in ('q', '\x1b') and not key.startswith('ESC['):
+                            return idx
+
+                        elif k in (' ', 'p'):
+                            paused = not paused
+
+                        elif k == 'i':
+                            show_info = not show_info
+
+                        elif k == '.':
+                            wpm = min(wpm + 25, 1500)
+                            delay = 60.0 / wpm
+                            notif, notif_ttl = f"Speed: {wpm} wpm", NOTIF_DUR
+
+                        elif k == ',':
+                            wpm = max(wpm - 25, 50)
+                            delay = 60.0 / wpm
+                            notif, notif_ttl = f"Speed: {wpm} wpm", NOTIF_DUR
+
+                        elif k == ']':
+                            chunk_size += 1
+                            chunk = words[idx : idx + chunk_size]
+                            notif, notif_ttl = f"Words/flash: {chunk_size}  ({wpm} wpm)", NOTIF_DUR
+
+                        elif k == '[':
+                            if chunk_size <= 1:
+                                notif, notif_ttl = "Already at minimum (1 word)", NOTIF_DUR
+                            else:
+                                chunk_size -= 1
+                                chunk = words[idx : idx + chunk_size]
+                                notif, notif_ttl = f"Words/flash: {chunk_size}  ({wpm} wpm)", NOTIF_DUR
+
+                        elif key == 'ESC[D' or k == 'h':
+                            old = idx
+                            idx = max(0, idx - SKIP)
+                            notif, notif_ttl = f"<- back {old - idx} words", NOTIF_DUR
+                            skipped = True
+                            break
+
+                        elif key == 'ESC[C' or k == 'l':
+                            old = idx
+                            idx = min(total - 1, idx + SKIP)
+                            notif, notif_ttl = f"-> forward {idx - old} words", NOTIF_DUR
+                            skipped = True
+                            break
+
+                        cols, rows = shutil.get_terminal_size()
+                        render(chunk, wpm, idx, total, paused, cols, rows,
+                               show_info, notif, notif_ttl, chunk_size)
+
+                    if not paused:
+                        elapsed += tick
+
+                if not skipped and not paused:
+
+                    idx = min(idx + chunk_size, total)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write(SHOW_CURSOR + CLEAR + HOME)
+        sys.stdout.flush()
+
+    return min(idx, total)
+
+def main():
+    parser = argparse.ArgumentParser(description="Terminal based speedreader")
+    parser.add_argument("file", nargs="?", help="Text or PDF file")
+    parser.add_argument("-w", "--wpm",   type=int, default=400, help="Words per minute (default 400)")
+    parser.add_argument("-n", "--start", type=int, default=1,   help="Start from word N (default 1)")
+    parser.add_argument("-c", "--chunk", type=int, default=1,   help="Words shown at once (default 1)")
+    args = parser.parse_args()
+
+    if args.file:
+        if args.file.lower().endswith(".pdf"):
+            text = extract_pdf(args.file)
+        else:
+            with open(args.file, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read()
+    else:
+        parser.print_help()
+        sys.exit(0)
+
+    words = tokenize(text)
+    if not words:
+        print("No words found.")
+        sys.exit(1)
+
+    chunk_size = max(1, args.chunk)
+    final = run(words, args.wpm, max(0, args.start - 1), chunk_size)
+    print(f"Stopped at word {final + 1}/{len(words)}")
+    print(f"Resume: speedreader {args.file or '<file>'} -n {final + 1} -w {args.wpm} -c {chunk_size}")
+
+if __name__ == "__main__":
+    main()

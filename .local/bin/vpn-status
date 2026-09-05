@@ -1,0 +1,15 @@
+#!/bin/sh
+# VPN status for waybar
+# Shows 🔒 when any tun/wg interface is active, nothing when not connected
+
+# Check for tun interfaces (OpenVPN, etc.)
+tun=$(cat /sys/class/net/tun*/operstate 2>/dev/null)
+
+# Check for WireGuard interfaces
+wg=$(cat /sys/class/net/wg*/operstate 2>/dev/null)
+
+if [ -n "$tun" ] || [ -n "$wg" ]; then
+    echo '{"text": "🔒", "tooltip": "VPN active", "class": "vpn-active"}'
+else
+    echo '{"text": "", "tooltip": "No VPN", "class": "vpn-inactive"}'
+fi

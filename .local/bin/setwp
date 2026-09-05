@@ -1,0 +1,50 @@
+#!/bin/bash
+IMAGE="$1"
+
+[ -z "$IMAGE" ] && { echo "Usage: setwp <image_path>"; exit 1; }
+[ -f "$IMAGE" ] || { echo "Error: File not found: $IMAGE"; exit 1; }
+
+TRANSITIONS=("center" "grow" "fade")
+T_TYPE=$(printf "%s\n" "${TRANSITIONS[@]}" | shuf -n 1)
+
+if ! awww query &>/dev/null; then
+    awww init &
+    sleep 0.5
+fi
+
+awww img "$IMAGE" \
+    --transition-type "$T_TYPE" \
+    --transition-duration "1.5" \
+    --transition-fps 60
+
+wal -n -i "$(readlink -f "$IMAGE")" -o "${HOME}/.config/wal/postrun"
+
+pkill waybar
+sleep 0.5
+
+# Relaunch waybar with the full session environment so that click handlers
+# that spawn terminals get WAYLAND_DISPLAY, DBUS_SESSION_BUS_ADDRESS, etc.
+# When waybar is spawned as a child of this script (which runs inside
+# Quickshell's Process), it inherits a stripped environment — enough for
+# waybar itself but not for the terminals it tries to launch on click.
+# Passing env vars explicitly or using systemctl keeps the session intact.
+if systemctl --user is-enabled waybar &>/dev/null 2>&1; then
+    systemctl --user restart waybar
+elif command -v systemd-run &>/dev/null; then
+    systemd-run --user --scope --unit=waybar-manual \
+        env WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+            DISPLAY="$DISPLAY" \
+            XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+            DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+            XDG_CURRENT_DESKTOP="$XDG_CURRENT_DESKTOP" \
+            waybar &>/dev/null &
+else
+    env WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+        DISPLAY="$DISPLAY" \
+        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+        XDG_CURRENT_DESKTOP="$XDG_CURRENT_DESKTOP" \
+        waybar &
+fi
+
+mmsg dispatch reload_config

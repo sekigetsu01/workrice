@@ -1,0 +1,6 @@
+#!/bin/bash
+
+sudo pacman -Rns $(yay -Qdtq)
+sudo rm -rf /var/cache/pacman/pkg/download*
+yay -Scc
+yay -Sc

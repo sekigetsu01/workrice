@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+#
+# lk
+#
+# Set up, mount, and unmount LUKS-encrypted drives.
+#
+# Usage:
+#   ./lk setup     # partition, luksFormat, open, mkfs.ext4
+#   ./lk mount     # cryptsetup open + mount
+#   ./lk unmount   # umount + cryptsetup close
+#
+# Device/partition pickers are driven by lsblk output and shown as an
+# fzf dropdown (falls back to a plain numbered list + read if fzf isn't
+# installed), so you always pick a real, full /dev path instead of typing
+# one by hand.
+#
+# SAFETY: the disk backing your root filesystem (and everything under it —
+# its partitions, its LUKS/crypt mapper, etc.) is auto-detected and excluded
+# from every picker, with a warning printed up front.
+#
+# All disk/crypt/mount operations require root, so this script re-execs
+# itself with sudo if not already running as root.
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/lk"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+usage() {
+    echo "Usage: $0 {setup|mount|unmount} (or: s|m|u)" >&2
+    exit 1
+}
+
+[[ $# -eq 1 ]] || usage
+ACTION="$1"
+case "$ACTION" in
+    setup|s) ACTION="setup" ;;
+    mount|m) ACTION="mount" ;;
+    unmount|u) ACTION="unmount" ;;
+    *) usage ;;
+esac
+
+# Re-exec with sudo if not root, preserving the invoking user's HOME so the
+# config file above is read/written in the right place.
+if [[ "$(id -u)" -ne 0 ]]; then
+    exec sudo --preserve-env=HOME "$0" "$ACTION"
+fi
+
+mkdir -p "$CONFIG_DIR"
+touch "$CONFIG_FILE"
+
+LAST_MAPPER=""
+LAST_MOUNTPOINT=""
+
+# Read the config as plain KEY="VALUE" data, never as executable shell —
+# so even a hand-edited or corrupted config file can't run arbitrary code
+# when this script starts (which happens as root, right after the sudo
+# re-exec above).
+load_config() {
+    local key value
+    while IFS='=' read -r key value; do
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        value="${value%\"}"
+        value="${value#\"}"
+        case "$key" in
+            LAST_MAPPER) LAST_MAPPER="$value" ;;
+            LAST_MOUNTPOINT) LAST_MOUNTPOINT="$value" ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+load_config
+
+# validate_field: reject characters that have no business in a mapper name
+# or mount path and that would be dangerous if ever written into, then
+# re-read from, a file we treat as data.
+validate_field() {
+    local val="$1" label="$2"
+    if [[ "$val" =~ [\"\'\`\$\\\;\|\&] ]]; then
+        echo "Error: ${label} contains invalid characters (\", ', \`, \$, \\, ;, |, &)." >&2
+        exit 1
+    fi
+}
+
+save_config() {
+    printf 'LAST_MAPPER="%s"\n' "$MAPPER_NAME" > "$CONFIG_FILE"
+    printf 'LAST_MOUNTPOINT="%s"\n' "$MOUNTPOINT" >> "$CONFIG_FILE"
+}
+
+HAS_FZF=false
+command -v fzf > /dev/null 2>&1 && HAS_FZF=true
+
+# --- System disk detection & protection --------------------------------------
+# Walk up from the root filesystem's source device to the physical disk that
+# backs it, so it (and everything on it) can be kept out of every picker.
+SYSTEM_DISK=""
+SYSTEM_DEVICES=""
+if command -v findmnt > /dev/null 2>&1; then
+    ROOT_SRC=$(findmnt -no SOURCE / 2>/dev/null || true)
+    if [[ -n "$ROOT_SRC" ]]; then
+        # Take one full-system snapshot (NAME + PKNAME) and look parents up
+        # from it, rather than querying `lsblk -no PKNAME <dev>` per device —
+        # the latter doesn't reliably resolve dm-crypt/mapper devices when
+        # queried in isolation and can stop climbing one level too early.
+        FULL_TABLE=$(lsblk -lnpo NAME,PKNAME 2>/dev/null || true)
+        get_parent() {
+            local dev="$1"
+            local pk
+            pk=$(awk -v d="$dev" '$1==d {print $2}' <<< "$FULL_TABLE")
+            echo "$pk"
+        }
+
+        WALK="$ROOT_SRC"
+        for _ in 1 2 3 4 5 6; do  # hard cap so a bad lookup can't loop forever
+            PARENT=$(get_parent "$WALK")
+            [[ -z "$PARENT" ]] && break
+            WALK="$PARENT"
+        done
+        SYSTEM_DISK="$WALK"
+
+        # Build the exclusion set by walking every device's own parent chain
+        # (using the same get_parent lookup above) and keeping it if that
+        # chain ever reaches SYSTEM_DISK. This is more reliable than asking
+        # lsblk to list "children of $SYSTEM_DISK" directly, which doesn't
+        # always surface dm-crypt/mapper devices.
+        ALL_DEVICES=$(lsblk -lnpo NAME 2>/dev/null || true)
+        while IFS= read -r dev; do
+            [[ -z "$dev" ]] && continue
+            walk="$dev"
+            matched=false
+            for _ in 1 2 3 4 5 6 7; do
+                if [[ "$walk" == "$SYSTEM_DISK" ]]; then
+                    matched=true
+                    break
+                fi
+                p=$(get_parent "$walk")
+                [[ -z "$p" ]] && break
+                walk="$p"
+            done
+            $matched && SYSTEM_DEVICES+="${dev}"$'\n'
+        done <<< "$ALL_DEVICES"
+    fi
+fi
+
+if [[ -n "$SYSTEM_DISK" ]]; then
+    SYS_MODEL=$(lsblk -no MODEL "$SYSTEM_DISK" 2>/dev/null | xargs || true)
+    echo "!! System disk detected: ${SYSTEM_DISK} (${SYS_MODEL:-unknown model}) — excluded from all selections below." >&2
+else
+    echo "!! Could not auto-detect the system disk — double-check your selection carefully." >&2
+fi
+
+# filter_system: drop any lsblk line whose device path is part of the
+# detected system disk's tree (the disk itself, its partitions, its crypt
+# mapper, etc.)
+filter_system() {
+    if [[ -z "$SYSTEM_DEVICES" ]]; then
+        cat
+        return
+    fi
+    # Exact match on column 1 only (the /dev path) against the exclusion
+    # set — NOT a substring match, so /dev/sdaa is never excluded just
+    # because /dev/sda happens to be a prefix of it.
+    awk -v devs="$SYSTEM_DEVICES" '
+        BEGIN {
+            n = split(devs, arr, "\n")
+            for (i = 1; i <= n; i++) if (arr[i] != "") exclude[arr[i]] = 1
+        }
+        !($1 in exclude)
+    '
+}
+
+# is_system_device DEV -> true if DEV is the system disk or under it
+is_system_device() {
+    local dev="$1"
+    [[ -z "$SYSTEM_DEVICES" ]] && return 1
+    grep -qFx "$dev" <<< "$SYSTEM_DEVICES"
+}
+
+# pick_line HEADER
+#   Reads lsblk-formatted lines from stdin (col1 = full /dev path), lets the
+#   user pick one via fzf (or a numbered fallback list), prints the chosen
+#   line's first column.
+pick_line() {
+    local header="$1"
+    local lines
+    lines=$(cat)
+
+    if [[ -z "$lines" ]]; then
+        echo "Error: no matching devices found." >&2
+        exit 1
+    fi
+
+    if $HAS_FZF; then
+        printf '%s\n' "$lines" | fzf --prompt="Select> " --header="$header" \
+            --header-first --reverse | awk '{print $1}'
+    else
+        echo "$header" >&2
+        local i=1
+        while IFS= read -r l; do
+            printf "  %d) %s\n" "$i" "$l" >&2
+            i=$((i+1))
+        done <<< "$lines"
+        local choice
+        read -rp "Choose number: " choice
+        printf '%s\n' "$lines" | sed -n "${choice}p" | awk '{print $1}'
+    fi
+}
+
+case "$ACTION" in
+
+setup)
+    DISK=$(lsblk -lnpo NAME,SIZE,TYPE,MODEL | awk '$3=="disk"' | filter_system \
+        | pick_line "NAME              SIZE   TYPE   MODEL   (disk to partition)")
+    [[ -n "$DISK" && -b "$DISK" ]] || { echo "Error: no disk selected." >&2; exit 1; }
+    if is_system_device "$DISK"; then
+        echo "Error: refusing to touch the system disk (${DISK})." >&2
+        exit 1
+    fi
+
+    echo
+    echo "==> Launching cfdisk on ${DISK}"
+    echo "    Delete the existing partition(s), create a new one as type"
+    echo "    'Linux filesystem', then Write and Quit."
+    read -rp "Press Enter to launch cfdisk..." _
+    cfdisk "$DISK"
+
+    PARTITION=$(lsblk -lnpo NAME,SIZE,TYPE,FSTYPE | awk -v d="$DISK" '$1 ~ ("^" d "(p?[0-9]+)$") && $3=="part"' | filter_system \
+        | pick_line "NAME              SIZE   TYPE   FSTYPE   (new partition on ${DISK})")
+    [[ -n "$PARTITION" && -b "$PARTITION" ]] || { echo "Error: no partition selected." >&2; exit 1; }
+    if is_system_device "$PARTITION"; then
+        echo "Error: refusing to touch the system disk (${PARTITION})." >&2
+        exit 1
+    fi
+
+    read -e -i "$LAST_MAPPER" -p "Mapper name for this drive (e.g. drive): " MAPPER_NAME
+    [[ -z "$MAPPER_NAME" ]] && { echo "Error: mapper name is required." >&2; exit 1; }
+    validate_field "$MAPPER_NAME" "mapper name"
+
+    echo
+    echo "==> cryptsetup luksFormat ${PARTITION}"
+    echo "    This will DESTROY all data on ${PARTITION}."
+    read -rp "Type YES to continue: " CONFIRM
+    [[ "$CONFIRM" == "YES" ]] || { echo "Aborted."; exit 1; }
+    cryptsetup luksFormat "$PARTITION"
+
+    echo "==> cryptsetup open ${PARTITION} ${MAPPER_NAME}"
+    cryptsetup open "$PARTITION" "$MAPPER_NAME"
+
+    echo "==> mkfs.ext4 /dev/mapper/${MAPPER_NAME}"
+    mkfs.ext4 "/dev/mapper/${MAPPER_NAME}"
+
+    read -e -i "$LAST_MOUNTPOINT" -p "Mount point to use later (e.g. /mnt/hdd): " MOUNTPOINT
+    [[ -z "$MOUNTPOINT" ]] && MOUNTPOINT="/mnt/hdd"
+    validate_field "$MOUNTPOINT" "mount point"
+    mkdir -p "$MOUNTPOINT"
+
+    save_config
+    echo "Done. Drive is set up and currently open at /dev/mapper/${MAPPER_NAME}."
+    echo "Run '$0 mount' next time to open and mount it, or mount it now:"
+    echo "  mount /dev/mapper/${MAPPER_NAME} ${MOUNTPOINT}"
+    echo
+    lsblk
+    ;;
+
+mount)
+    DEVICE=$(lsblk -lnpo NAME,SIZE,FSTYPE,MOUNTPOINT | awk '$3=="crypto_LUKS"' | filter_system \
+        | pick_line "NAME              SIZE   FSTYPE       MOUNTPOINT   (LUKS partitions)")
+    [[ -n "$DEVICE" && -b "$DEVICE" ]] || { echo "Error: no partition selected." >&2; exit 1; }
+    if is_system_device "$DEVICE"; then
+        echo "Error: refusing to touch the system disk (${DEVICE})." >&2
+        exit 1
+    fi
+
+    read -e -i "$LAST_MAPPER" -p "Mapper name: " MAPPER_NAME
+    [[ -z "$MAPPER_NAME" ]] && { echo "Error: mapper name is required." >&2; exit 1; }
+    validate_field "$MAPPER_NAME" "mapper name"
+
+    read -e -i "$LAST_MOUNTPOINT" -p "Mount point (e.g. /mnt/hdd): " MOUNTPOINT
+    [[ -z "$MOUNTPOINT" ]] && { echo "Error: mount point is required." >&2; exit 1; }
+    validate_field "$MOUNTPOINT" "mount point"
+
+    if [[ -e "/dev/mapper/${MAPPER_NAME}" ]]; then
+        EXISTING_DEV=$(cryptsetup status "$MAPPER_NAME" 2>/dev/null | awk '/device:/ {print $2}')
+        if [[ -z "$EXISTING_DEV" ]] || [[ "$(readlink -f "$EXISTING_DEV")" != "$(readlink -f "$DEVICE")" ]]; then
+            echo "Error: /dev/mapper/${MAPPER_NAME} is already open but backed by ${EXISTING_DEV:-an unknown device}, not ${DEVICE}." >&2
+            exit 1
+        fi
+        echo "==> /dev/mapper/${MAPPER_NAME} already open on ${DEVICE}, skipping cryptsetup open"
+    else
+        echo "==> cryptsetup open ${DEVICE} ${MAPPER_NAME}"
+        cryptsetup open "$DEVICE" "$MAPPER_NAME"
+    fi
+
+    mkdir -p "$MOUNTPOINT"
+    echo "==> mount /dev/mapper/${MAPPER_NAME} ${MOUNTPOINT}"
+    mount "/dev/mapper/${MAPPER_NAME}" "$MOUNTPOINT"
+
+    save_config
+    echo "Done. Mounted at ${MOUNTPOINT}."
+    echo
+    lsblk
+    ;;
+
+unmount)
+    # Pick from currently open+mounted crypt mappers; grabs mapper name and
+    # mount point together so there's nothing left to type.
+    SELECTION=$(lsblk -lnpo NAME,MOUNTPOINT,TYPE | awk '$3=="crypt" && $2!=""' | filter_system \
+        | pick_line "NAME                    MOUNTPOINT       TYPE   (open, mounted drives)")
+    [[ -n "$SELECTION" ]] || { echo "Error: no open mounted drive selected." >&2; exit 1; }
+    if is_system_device "$SELECTION"; then
+        echo "Error: refusing to touch the system disk (${SELECTION})." >&2
+        exit 1
+    fi
+
+    MAPPER_NAME=$(basename "$SELECTION")
+    MOUNTPOINT=$(lsblk -lnpo NAME,MOUNTPOINT | awk -v n="$SELECTION" '$1==n {print $2}')
+    [[ -n "$MOUNTPOINT" ]] || { echo "Error: could not determine mount point for ${SELECTION}." >&2; exit 1; }
+
+    echo "==> umount ${MOUNTPOINT}"
+    umount "$MOUNTPOINT"
+
+    echo "==> cryptsetup close ${MAPPER_NAME}"
+    cryptsetup close "$MAPPER_NAME"
+
+    save_config
+    echo "Done. ${MOUNTPOINT} unmounted and ${MAPPER_NAME} closed."
+    echo
+    lsblk
+    ;;
+
+esac

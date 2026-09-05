@@ -1,0 +1,12 @@
+#!/bin/sh
+sleep 5
+while true; do
+    BATTERY=$(cat /sys/class/power_supply/BAT1/capacity)
+    STATUS=$(cat /sys/class/power_supply/BAT1/status)
+    if [ "$BATTERY" -le 15 ] && [ "$STATUS" = "Discharging" ]; then
+        notify-send -u critical "Battery Low" "${BATTERY}% remaining"
+    fi
+    sleep 10
+done
+
+mmsg -d reload_config
