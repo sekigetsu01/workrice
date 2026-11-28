@@ -1,0 +1,12 @@
+# .m4b audiobooks open in Books (hidden from the launcher: Alt+b opens Books)
+[Desktop Entry]
+Type=Application
+Name=Books
+Comment=Listen to audiobooks: remembers where you stopped, chapters, bookmarks
+Exec=books %f
+Icon=audio-x-generic
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+MimeType=audio/x-m4b;
+NoDisplay=true
+X-Apphide=edited

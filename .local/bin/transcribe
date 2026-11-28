@@ -1,0 +1,387 @@
+#!/bin/bash
+# transcribe FILE…: audiobooks, talks and videos to a Word document and a PDF next to each, offline (c t in yazi)
+#   -m MODEL · -l LANG · -k keeps FILE.md too · run it again to carry on after a stop (transcribe -h)
+set -o pipefail
+M=${XDG_DATA_HOME:-$HOME/.local/share}/whisper
+C=${XDG_CACHE_HOME:-$HOME/.cache}/transcribe
+U=https://huggingface.co/ggerganov/whisper.cpp/resolve/main
+LONG=2400000 PART=1200000 PAUSE=1.0
+
+usage() {
+    cat >&2 <<'EOF'
+transcribe: turn audiobooks, talks and videos into a Word document and a PDF, offline.
+Saved next to each file. Chapters become headings.
+  transcribe FILE...    FILE.docx and FILE.pdf
+  -m MODEL              tiny, base (default), small or medium: bigger is slower and more accurate
+  -l LANG               the language spoken, if not English: fr, de, es, ja… or auto
+  -k                    keep the text as FILE.md too
+Stopped or crashed? Run the same command again: it carries on from the last chapter it finished.
+EOF
+    exit 2
+}
+
+PY=$(cat <<'EOF'
+import json, os, re, sys
+
+def esc(s):
+    s = re.sub(r"([\\`*_\[\]<>#~^|$@])", r"\\\1", s)
+    return re.sub(r"^(\d+)([.)])|^([-+])", lambda m: (m.group(1) or "") + "\\" + (m.group(2) or m.group(3)), s)
+
+def put(path, text):
+    with open(path + ".part", "w", encoding="utf-8") as o:
+        o.write(text)
+    os.replace(path + ".part", path)
+
+def one(s):
+    return " ".join(str(s or "").split())
+
+def probe(name):
+    d = json.load(sys.stdin)
+    st = d.get("streams") or []
+    if not st:
+        sys.exit(3)
+    f = d.get("format") or {}
+    tags = {k.lower(): one(v) for k, v in (f.get("tags") or {}).items()}
+    for k, v in (st[0].get("tags") or {}).items():
+        tags.setdefault(k.lower(), one(v))
+    get = lambda *ks: next((tags[k] for k in ks if tags.get(k)), "")
+    stem = os.path.splitext(name)[0] if "." in name[1:] else name
+    title = get("title", "album") or stem
+    author = get("artist", "album_artist", "author")
+    date = get("date", "year")
+    if re.match(r"\d{4}-\d\d-\d\dT", date):
+        date = date[:10]
+    dur = int(float(f.get("duration") or st[0].get("duration") or 0) * 1000)
+    ch = []
+    for c in d.get("chapters") or []:
+        a, b = int(float(c["start_time"]) * 1000), int(float(c["end_time"]) * 1000)
+        if dur:
+            b = min(b, dur)
+        if b - a >= 500:
+            ch.append((a, b, one((c.get("tags") or {}).get("title"))))
+    if len(ch) < 2:
+        ch = [(0, dur, "")]
+    else:
+        ch = [(a, b, t or f"Chapter {n}") for n, (a, b, t) in enumerate(ch, 1)]
+    us = "\x1f"
+    print(us.join([title, author, date, str(sum(b - a for a, b, _ in ch))]).replace("\n", " "))
+    for a, b, t in ch:
+        print(us.join([str(a), str(b), t]))
+
+def cuts(length, long, part):
+    length, long, part = int(length), int(long), int(part)
+    if length <= long:
+        print(0)
+        return
+    sil, start = [], None
+    for line in sys.stdin:
+        m = re.search(r"silence_(start|end): *([\d.]+)", line)
+        if m and m.group(1) == "start":
+            start = float(m.group(2)) * 1000
+        elif m and start is not None:
+            sil.append((start, float(m.group(2)) * 1000))
+            start = None
+    n = max(2, round(length / part))
+    out = [0]
+    for k in range(1, n):
+        t = k * length / n
+        near = [s for s in sil if abs((s[0] + s[1]) / 2 - t) < 150000]
+        best = max(near, key=lambda s: (round((s[1] - s[0]) / 250), -abs((s[0] + s[1]) / 2 - t))) if near else None
+        c = int((best[0] + best[1]) / 2) if best else int(t)
+        if c - out[-1] > 60000 and length - c > 60000:
+            out.append(c)
+    print(" ".join(map(str, out)))
+
+ENDS = ".!?…。！？"
+ABBR = re.compile(r"\b(Mr|Mrs|Ms|Dr|St|Prof|Sr|Jr|vs|etc|e\.g|i\.e|No|Mt)\.$")
+SPLIT = re.compile(r"(?:(?<=[.!?…。！？])|(?<=[.!?…。！？][\"”’»)\]]))\s+")
+JUNK = re.compile(r"\[[^\]]*\]|♪+|^\s*\([^)]*\)\s*$|^\s*\*[^*]*\*\s*$|^\s*>>\s*")
+
+def ends(s):
+    s = s.rstrip("\"”’»)] ")
+    return bool(s) and s[-1] in ENDS and not ABBR.search(s)
+
+def para(out, pause, *pairs):
+    pause = float(pause)
+    segs = []
+    for off, path in zip(pairs[::2], pairs[1::2]):
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            d = json.loads(fh.read(), strict=False)
+        for s in d.get("transcription") or []:
+            o = s.get("offsets") or {}
+            segs.append((int(off) + o.get("from", 0), int(off) + o.get("to", 0), s.get("text") or ""))
+    paras, cur, n, last, prev, rep = [], [], 0, None, None, 0
+    def flush():
+        nonlocal cur, n
+        if cur:
+            paras.append(esc(" ".join(" ".join(cur).split())))
+        cur, n = [], 0
+    for t0, t1, text in segs:
+        text = " ".join(JUNK.sub(" ", text).split())
+        gap = (t0 - last) / 1000 if last is not None else 0
+        last = t1
+        if not text:
+            continue
+        rep = rep + 1 if text == prev else 0
+        prev = text
+        if rep >= 2:
+            continue
+        if cur and ((gap >= pause and ends(cur[-1])) or len(" ".join(cur)) > 1500):
+            flush()
+        for piece in SPLIT.split(text):
+            if not piece:
+                continue
+            cur.append(piece)
+            if ends(piece):
+                n += 1
+                if n >= 6 or (n >= 3 and len(" ".join(cur)) > 900):
+                    flush()
+    flush()
+    put(out, "\n\n".join(paras) + ("\n" if paras else ""))
+
+def md(out, title, author, date, *pairs):
+    y = ["---"]
+    for k, v in (("title", title), ("author", author), ("date", date)):
+        if v:
+            y.append(f"{k}: {json.dumps(esc(v), ensure_ascii=False)}")
+    y.append("---")
+    body = []
+    for head, path in zip(pairs[::2], pairs[1::2]):
+        if head:
+            body.append("# " + esc(head))
+        text = open(path, encoding="utf-8").read().strip()
+        if text:
+            body.append(text)
+    put(out, "\n".join(y) + "\n\n" + "\n\n".join(body) + "\n")
+
+{"probe": probe, "cuts": cuts, "para": para, "md": md}[sys.argv[1]](*sys.argv[2:])
+EOF
+)
+
+tty=false; [[ $(readlink /proc/$$/fd/2) == /dev/pts/* ]] && tty=true
+nid='' tmp='' pid='' last_note=0
+note() {
+    $tty && return 0
+    local id
+    id=$(notify-send -a transcribe -p ${nid:+-r "$nid"} -h string:x-canonical-private-synchronous:transcribe "$@" 2>/dev/null) && nid=$id
+    last_note=$SECONDS
+}
+fail() {
+    $tty && printf '\r\033[K' >&2
+    echo "transcribe: $1" >&2
+    $tty || notify-send -u critical -a transcribe "Couldn't transcribe" "$1" 2>/dev/null
+    exit 1
+}
+bad() {
+    $tty && printf '\r\033[K' >&2
+    echo "transcribe: $1" >&2
+    why+=("$1")
+}
+short() { printf '%s' "${1/#$HOME/\~}"; }
+fmt() {
+    local s=$(($1 / 1000))
+    if [ "$s" -ge 3600 ]; then printf '%d:%02d:%02d' $((s / 3600)) $((s / 60 % 60)) $((s % 60))
+    else printf '%d:%02d' $((s / 60)) $((s % 60)); fi
+}
+secs() { printf '%d.%03d' $(($1 / 1000)) $(($1 % 1000)); }
+run() { "$@" & pid=$!; wait "$pid"; local r=$?; pid=''; return $r; }
+pause() { sleep "$1" & wait $!; }
+cleanup() {
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null
+    [ -n "$tmp" ] && rm -rf -- "$tmp"
+}
+stopped() {
+    $tty && printf '\r\033[K' >&2
+    echo "transcribe: stopped. Run the same command again to carry on from here." >&2
+    $tty || notify-send -a transcribe "Transcribing stopped" "Run it again on the same file to carry on." 2>/dev/null
+    exit "$1"
+}
+trap cleanup EXIT
+trap 'stopped 130' INT
+trap 'stopped 143' TERM
+trap 'stopped 129' HUP
+
+size=base lang=en keep=false files=()
+while [ $# -gt 0 ]; do
+    case $1 in
+        -m) size=${2:-}; shift ;;
+        -m?*) size=${1#-m} ;;
+        -l) lang=${2:-}; shift ;;
+        -l?*) lang=${1#-l} ;;
+        -k|--keep) keep=true ;;
+        -h|--help) usage ;;
+        --) shift; files+=("$@"); break ;;
+        -*) usage ;;
+        *) files+=("$1") ;;
+    esac
+    shift
+done
+[ ${#files[@]} -gt 0 ] || usage
+case $size in tiny|base|small|medium) ;; *) echo "transcribe: -m takes tiny, base, small or medium" >&2; exit 2 ;; esac
+lang=${lang,,}
+[[ $lang =~ ^([a-z]{2,3}|auto)$ ]] || { echo "transcribe: -l takes a language code like fr, de or es (or auto)" >&2; exit 2; }
+model=$size; [ "$lang" = en ] && model=$size.en
+case $model in
+    tiny) sha=bd577a113a864445d4c299885e0cb97d4ba92b5f mb="78 MB" ;;
+    tiny.en) sha=c78c86eb1a8faa21b369bcd33207cc90d64ae9df mb="78 MB" ;;
+    base) sha=465707469ff3a37a2b9b8d8f89f2f99de7299dac mb="148 MB" ;;
+    base.en) sha=137c40403d78fd54d454da0f9bd998f78703390c mb="148 MB" ;;
+    small) sha=55356645c2b361a969dfd0ef2c5a50d530afd8d5 mb="488 MB" ;;
+    small.en) sha=db8a495a91d927739e50b3fc1cc4c6b8f6c2d022 mb="488 MB" ;;
+    medium) sha=fd9727b6e1217c2f614f9b698455c4ffd82463b4 mb="1.5 GB" ;;
+    medium.en) sha=8c30f0e44ce9560643ebd10bbe50cd20eafd3723 mb="1.5 GB" ;;
+esac
+
+command -v whisper-cli >/dev/null || fail "whisper-cpp isn't installed (sudo pacman -S whisper-cpp)"
+for p in ffmpeg ffprobe python3 pandoc; do command -v "$p" >/dev/null || fail "$p isn't installed (sys-setup installs it)"; done
+DOC=$(command -v doc || echo "$HOME/.local/bin/doc")
+[ -x "$DOC" ] || fail "doc is missing from ~/.local/bin"
+pdf=-p; command -v soffice >/dev/null || pdf=
+
+renice -n 10 -p $$ >/dev/null 2>&1
+mkdir -p "$C" "$M" || fail "can't write to $(short "$C")"
+find "$C" -mindepth 1 -maxdepth 1 -type d -mtime +60 -exec rm -rf {} + 2>/dev/null
+exec 9>"$C/.lock"
+if ! flock -n 9; then
+    $tty && echo "Waiting for the other transcription to finish…" >&2
+    note "Transcribe: waiting" "Another transcription is running; this one starts after it."
+    run flock 9
+fi
+
+W=$M/ggml-$model.bin
+if [ ! -s "$W" ]; then
+    if $tty; then echo "First use of the $model model: downloading it ($mb) to $(short "$M")…" >&2
+    else note "Transcribe: downloading the $model model" "$mb, once. Transcribing starts after."; fi
+    prog=-sS; $tty && prog=--progress-bar
+    run curl -fL $prog -C - -o "$W.part" "$U/ggml-$model.bin"; r=$?
+    if [ "$(sha1sum < "$W.part" 2>/dev/null | cut -c1-40)" = "$sha" ]; then
+        mv -f -- "$W.part" "$W"
+    elif [ "$r" = 0 ]; then
+        rm -f -- "$W.part"; fail "the $model model download was damaged: run it again"
+    else
+        fail "couldn't download the $model model from huggingface.co (run it again to carry on)"
+    fi
+fi
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/transcribe.XXXXXX") || fail "can't make a temp folder"
+T=$(nproc 2>/dev/null || echo 4)
+
+bar() {
+    local w=24 full=$(($1 * 24 / 100)) a b
+    printf -v a '%*s' "$full" ''; printf -v b '%*s' $((w - full)) ''
+    printf '\033[34m%s\033[2m%s\033[0m' "${a// /█}" "${b// /░}"
+}
+
+progress() {
+    local now=$1 run_ms=$2 force=${3:-} pct=$(($1 * 100 / total)) left where
+    [ "$pct" -gt 100 ] && pct=100
+    if [ "$run_ms" -gt 30000 ] && [ $((SECONDS - t0)) -ge 10 ]; then
+        left="about $(fmt $(((total - now) * (SECONDS - t0) * 1000 / run_ms))) left"
+    else
+        left="working out time left…"
+    fi
+    where="$pct%"; [ "$nsec" -gt 1 ] && where="chapter $i/$nsec, $pct%"
+    if $tty; then
+        printf '\r\033[K  %s %s  \033[2m· %s\033[0m' "$(bar "$pct")" "$where" "$left" >&2
+    elif [ "$pct" -lt 100 ] && { [ -n "$force" ] || [ $((pct / 10)) -gt "$tenth" ]; }; then
+        tenth=$((pct / 10))
+        note -h "int:value:$pct" "Transcribing $title" "$where · $left"
+    fi
+}
+
+one() {
+    local f=$1 name base info author date sec dir key line s e ct len cuts j ps pe pl d0 made p r md out pairs heads
+    name=${f##*/}
+    case $name in ?*.*) base=${f%.*} ;; *) base=$f ;; esac
+    [ -f "$f" ] || { bad "no such file: $f"; return 1; }
+    info=$(ffprobe -v error -select_streams a:0 -show_format -show_streams -show_chapters -of json -i "file:$f" 2>/dev/null |
+        python3 -I -c "$PY" probe "$name") || { bad "$name has no sound ffmpeg can read"; return 1; }
+    IFS=$'\x1f' read -r title author date total <<< "${info%%$'\n'*}"
+    mapfile -t sec < <(tail -n +2 <<< "$info")
+    nsec=${#sec[@]}
+    [ "$total" -gt 0 ] || { bad "$name: can't tell how long it is"; return 1; }
+    key=$({ printf '%s %s %s\n' "$(stat -c %s -- "$f")" "$model" "$lang"; head -c 1048576 -- "$f"; tail -c 1048576 -- "$f"; } | sha1sum | cut -c1-16)
+    dir=$C/$key
+    mkdir -p "$dir" || return 1
+    touch "$dir"
+    d0=0 made=0 t0=$SECONDS tenth=0 i=0
+    for line in "${sec[@]}"; do
+        IFS=$'\x1f' read -r s e ct <<< "$line"
+        i=$((i + 1))
+        [ -e "$dir/$i.txt" ] && d0=$((d0 + e - s))
+    done
+    if $tty; then
+        printf '%s\n' "$title$([ -n "$author" ] && printf ' · %s' "$author")  ($(fmt "$total")$([ "$nsec" -gt 1 ] && printf ', %d chapters' "$nsec"), $model)" >&2
+        [ "$d0" -gt 0 ] && echo "  carrying on from where it stopped" >&2
+    else
+        note "Transcribing $title" "$([ "$nsec" -gt 1 ] && printf '%d chapters · ' "$nsec")$(fmt "$total") of audio$([ "$d0" -gt 0 ] && printf ' · carrying on')"
+    fi
+    i=0
+    tenth=$((d0 * 10 / total))
+    for line in "${sec[@]}"; do
+        IFS=$'\x1f' read -r s e ct <<< "$line"
+        i=$((i + 1)) len=$((e - s))
+        [ -e "$dir/$i.txt" ] && continue
+        progress "$d0" "$made"
+        if [ "$len" -gt "$LONG" ] && [ ! -s "$dir/$i.cuts" ]; then
+            run ffmpeg -nostdin -v info -hide_banner -ss "$(secs "$s")" -i "file:$f" -t "$(secs "$len")" -map 0:a:0 -ac 1 -ar 8000 \
+                -af silencedetect=noise=-35dB:d=0.4 -f null - 2>"$tmp/sil" || { bad "ffmpeg couldn't read $name"; return 1; }
+            python3 -I -c "$PY" cuts "$len" "$LONG" "$PART" < "$tmp/sil" > "$dir/$i.cuts.part" && mv -f -- "$dir/$i.cuts.part" "$dir/$i.cuts" || return 1
+        fi
+        cuts=(0); [ -s "$dir/$i.cuts" ] && read -r -a cuts < "$dir/$i.cuts"
+        pairs=()
+        for ((j = 0; j < ${#cuts[@]}; j++)); do
+            ps=${cuts[j]} pe=${cuts[j + 1]:-$len}
+            pl=$((pe - ps))
+            pairs+=("$ps" "$dir/$i.$j.json")
+            if [ -s "$dir/$i.$j.json" ]; then d0=$((d0 + pl)); continue; fi
+            run ffmpeg -nostdin -v error -y -ss "$(secs $((s + ps)))" -i "file:$f" -t "$(secs "$pl")" -map 0:a:0 -ac 1 -ar 16000 \
+                -c:a pcm_s16le "$tmp/a.wav" 2>"$tmp/log" || { bad "ffmpeg couldn't read $name: $(tail -n 1 "$tmp/log")"; return 1; }
+            rm -f -- "$tmp/a.json"
+            whisper-cli -m "$W" -f "$tmp/a.wav" -t "$T" -l "$lang" -oj -of "$tmp/a" -np -pp >/dev/null 2>"$tmp/log" & pid=$!
+            while kill -0 "$pid" 2>/dev/null; do
+                p=$(grep -o 'progress = *[0-9]*' "$tmp/log" | tail -n 1); p=${p##* }; p=${p:-0}
+                [ "$p" -gt 100 ] && p=100
+                progress $((d0 + pl * p / 100)) $((made + pl * p / 100))
+                pause 1
+            done
+            wait "$pid"; r=$?; pid=
+            [ "$r" = 0 ] && [ -s "$tmp/a.json" ] ||
+                { bad "whisper-cli failed on $name: $(grep -v 'progress =' "$tmp/log" | tail -n 1)"; return 1; }
+            mv -f -- "$tmp/a.json" "$dir/$i.$j.part" && mv -f -- "$dir/$i.$j.part" "$dir/$i.$j.json" || return 1
+            d0=$((d0 + pl)) made=$((made + pl))
+        done
+        python3 -I -c "$PY" para "$dir/$i.txt" "$PAUSE" "${pairs[@]}" || { bad "couldn't read whisper's output for $name"; return 1; }
+        progress "$d0" "$made" "$([ $((SECONDS - last_note)) -ge 120 ] && echo force)"
+    done
+    $tty && printf '\r\033[K' >&2
+    heads=()
+    i=0
+    for line in "${sec[@]}"; do
+        IFS=$'\x1f' read -r s e ct <<< "$line"
+        i=$((i + 1))
+        heads+=("$ct" "$dir/$i.txt")
+    done
+    if $keep; then md=$base.md; else md=$tmp/${name%.*}.md; fi
+    python3 -I -c "$PY" md "$md" "$title" "$author" "$date" "${heads[@]}" || { bad "couldn't write $(short "$md")"; return 1; }
+    $keep && { short "$md"; echo; }
+    out=$("$DOC" $pdf -o "$base.docx" "$md" 2>&1); r=$?
+    [ -n "$out" ] && printf '%s\n' "$out"
+    [ "$r" = 0 ] || { bad "$name: ${out##*$'\n'} (the text is kept: run it again to retry)"; return 1; }
+    [ -z "$pdf" ] && echo "transcribe: no PDF: LibreOffice isn't installed" >&2
+    rm -rf -- "$dir"
+    $tty || { note "Transcript ready" "$(short "$(realpath -m -- "$base")").docx$([ -n "$pdf" ] && echo " and .pdf")"; nid=''; }
+    return 0
+}
+
+why=()
+for f in "${files[@]}"; do
+    n=${#why[@]}
+    one "$f" || [ ${#why[@]} -gt "$n" ] || why+=("${f##*/}: failed")
+    rm -f -- "$tmp"/*
+done
+if [ ${#why[@]} -gt 0 ]; then
+    $tty || notify-send -u critical -a transcribe "Couldn't transcribe" "$(printf '%s\n' "${why[@]}")" 2>/dev/null
+    exit 1
+fi
+exit 0

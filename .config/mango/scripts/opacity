@@ -1,0 +1,19 @@
+#!/bin/sh
+# SUPER+= (or +): terminals fully opaque. SUPER+-: back to the default see-through (kitty.conf's background_opacity 0.8).
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/mango-opacity.lock"
+flock -n 9 || exit 0
+
+case $1 in
+    up) p=100; o=1 ;;
+    reset) p=80; o=0.8 ;;
+    *) echo "usage: opacity up|reset" >&2; exit 1 ;;
+esac
+
+echo "background_opacity $o" > "${XDG_CACHE_HOME:-$HOME/.cache}/kitty-opacity.conf"
+for k in "${XDG_RUNTIME_DIR:-/tmp}"/kitty-*; do
+    [ -S "$k" ] || continue
+    timeout 1 kitty @ --to "unix:$k" load-config >/dev/null 2>&1
+    timeout 1 kitty @ --to "unix:$k" set-background-opacity --all "$o" >/dev/null 2>&1
+done
+
+notify-send --app-name=Opacity -t 1500 -h string:x-canonical-private-synchronous:opacity "Opacity" "$p%" 2>/dev/null

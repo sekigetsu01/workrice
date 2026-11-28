@@ -1,0 +1,782 @@
+#!/usr/bin/env python3
+# bookset: a book (sioyek), its audiobook (Books) and its wiki note, linked by name and opened together side by side
+#   Shift+O in yazi, Alt+Shift+s (the book sioyek opened last), Alt+l in sioyek links them by hand; bookset -h for the rest
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+LIBRARY = os.path.join(HOME, "Library")
+AUDIO = os.environ.get("BOOKS_DIR") or os.path.join(HOME, "Audiobooks")
+WIKI = os.path.join(HOME, "sync/notes/vimwiki")
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "bookset")
+LINKS = os.path.join(STATE, "links.json")
+RUN = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "bookset")
+BIN = os.path.join(HOME, ".local/bin")
+SELF = os.path.realpath(__file__)
+
+KINDS = ("book", "audio", "note")
+NAMES = {"book": "book", "audio": "audiobook", "note": "note"}
+BOOK_EXT = {".pdf", ".epub", ".djvu", ".mobi", ".fb2", ".cbz", ".xps"}
+AUDIO_EXT = {".mp3", ".m4a", ".m4b", ".opus", ".ogg", ".oga", ".flac", ".wav", ".aac", ".wma", ".mka", ".webm", ".aiff", ".aif"}
+FILLER = {"the", "original", "full", "audiobook", "audiobooks", "audio", "ebook", "unabridged", "abridged",
+          "complete", "edition", "pdf", "epub", "summary"}
+AUTHOR = re.compile(r"^(.+?)[\s_]+[-–—][\s_]+(.+)$")
+
+
+def real(p):
+    return os.path.realpath(os.path.expanduser(p))
+
+
+_files = {}
+
+
+def files(kind):
+    if kind not in _files:
+        _files[kind] = _list(kind)
+    return _files[kind]
+
+
+def _list(kind):
+    if kind == "book":
+        out = []
+        for d, _, fs in os.walk(LIBRARY):
+            out += [os.path.join(d, f) for f in fs if os.path.splitext(f)[1].lower() in BOOK_EXT]
+        return out
+    if kind == "audio":
+        return [b["key"] for b in audiobooks()]
+    out = []
+    for d, ds, fs in os.walk(WIKI):
+        ds[:] = [x for x in ds if not x.startswith(".") and x != "images"]
+        out += [os.path.join(d, f) for f in fs if f.endswith(".md") and f != "index.md"]
+    return out
+
+
+_audiobooks = None
+
+
+def audiobooks():
+    global _audiobooks
+    if _audiobooks is None:
+        try:
+            import importlib.util
+            conf = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+            spec = importlib.util.spec_from_file_location("bookslib", os.path.join(conf, "books", "lib.py"))
+            lib = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(lib)
+            _audiobooks = lib.library()
+        except Exception:
+            _audiobooks = [{"key": os.path.join(AUDIO, n), "parts": []} for n in sorted(os.listdir(AUDIO)) if not n.startswith(".")
+                           and os.path.splitext(n)[1].lower() in AUDIO_EXT] if os.path.isdir(AUDIO) else []
+    return _audiobooks
+
+
+def title(path):
+    n = os.path.basename(path.rstrip("/"))
+    if not os.path.isdir(path):
+        n = os.path.splitext(n)[0]
+    return n.strip("-").strip()
+
+
+def is_audio(path):
+    return os.path.isdir(path) or os.path.splitext(path)[1].lower() in AUDIO_EXT
+
+
+def plain_title(path):
+    t = title(path)
+    m = AUTHOR.match(t) if is_audio(path) else None
+    return m.group(2).strip() if m else t
+
+
+def name_words(s):
+    s = s.lower().replace("_", " ")
+    s = re.sub(r"[(\[{].*?[)\]}]", " ", s)
+    m = re.search(r"\s*[-–—,]\s*by\b", s)
+    if m:
+        s = s[:m.start()]
+    else:
+        for m in re.finditer(r"\bby\b", s):
+            if len(re.findall(r"\w+", s[:m.start()])) >= 2:
+                s = s[:m.start()]
+                break
+    s = re.sub(r"[^\w]+", " ", s)
+    return [w for w in s.split() if w not in FILLER]
+
+
+def words(path):
+    return name_words(title(path))
+
+
+def variants(path):
+    out = [words(path)]
+    if is_audio(path) and plain_title(path) != title(path):
+        out.append(name_words(plain_title(path)))
+    return out
+
+
+def match_words(wa, wb):
+    if not wa or not wb:
+        return 0
+    if wa == wb:
+        return 1
+    short, long_ = (wa, wb) if len(wa) <= len(wb) else (wb, wa)
+    return 0.5 if len(short) >= 2 and set(short) <= set(long_) else 0
+
+
+def matches(a, b):
+    return max(match_words(wa, wb) for wa in variants(a) for wb in variants(b))
+
+
+def best(path, kind):
+    scored = sorted(((matches(path, f), f) for f in files(kind)), reverse=True)
+    scored = [x for x in scored if x[0] > 0]
+    if not scored or (len(scored) > 1 and scored[1][0] == scored[0][0]):
+        return None
+    return scored[0][1]
+
+
+def links():
+    try:
+        with open(LINKS) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_links(ls):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = LINKS + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(ls, fh, indent=1)
+    os.replace(tmp, LINKS)
+
+
+def set_for(kind, path):
+    path = real(path)
+    for e in links():
+        if e.get(kind) and real(e[kind]) == path:
+            s = {k: (real(e[k]) if e.get(k) else None) for k in KINDS}
+            for k in KINDS:
+                if k not in e or (e[k] and not os.path.exists(e[k])):
+                    s[k] = best(path, k)
+            return s
+    s = {k: None for k in KINDS}
+    s[kind] = path
+    for k in KINDS:
+        if k != kind:
+            s[k] = best(path, k)
+    for k in KINDS:
+        if s[k] is None:
+            for other in KINDS:
+                if other not in (k, kind) and s[other]:
+                    s[k] = best(s[other], k)
+                    if s[k]:
+                        break
+    for e in links():
+        for k in KINDS:
+            if k != kind and s[k] and e.get(k) and real(e[k]) == s[k]:
+                s[k] = None
+    return s
+
+
+def set_id(s):
+    return hashlib.sha1("\n".join(s[k] or "" for k in KINDS).encode()).hexdigest()[:12]
+
+
+def mmsg(*args):
+    try:
+        return subprocess.run(["mmsg", *args], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def bring(cid):
+    try:
+        subprocess.run([os.path.expanduser("~/.config/mango/scripts/mm"), "bring", str(cid)], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def clients():
+    try:
+        return json.loads(mmsg("get", "all-clients")).get("clients", [])
+    except ValueError:
+        return []
+
+
+def focused():
+    try:
+        return json.loads(mmsg("get", "focusing-client"))
+    except ValueError:
+        return {}
+
+
+def dispatch(*args):
+    mmsg("dispatch", ",".join(str(a) for a in args))
+
+
+def current_tag(monitor):
+    try:
+        for m in json.loads(mmsg("get", "all-monitors")).get("monitors", []):
+            if m.get("name") == monitor:
+                return next((t["index"] for t in m.get("tags", []) if t.get("is_active")), None)
+    except ValueError:
+        pass
+    return None
+
+
+def empty_tags(cs, monitor, n, moving=()):
+    used = set()
+    for c in cs:
+        if c.get("monitor") == monitor and c["id"] not in moving:
+            used.update(c.get("tags") or [])
+    free = [t for t in range(1, 10) if t not in used]
+    cur = current_tag(monitor)
+    starts = ([cur] if cur else []) + free
+    for t in starts:
+        if all(t + i in free for i in range(n)):
+            return [t + i for i in range(n)]
+    return free[:n] if len(free) >= n else []
+
+def notify(*lines):
+    subprocess.run(["notify-send", "--app-name=Books", *lines], stderr=subprocess.DEVNULL)
+
+
+def spawn(cmd, env=None):
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True, env=env)
+
+
+def wait_new(before, want, timeout=20):
+    end = time.time() + timeout
+    while time.time() < end:
+        for c in clients():
+            if c["id"] not in before and want(c):
+                return c["id"]
+        time.sleep(0.2)
+    return None
+
+
+def find_window(kind, path, timeout=4):
+    name = os.path.basename(path)
+    want = (lambda c: (c.get("appid") or "") == "kitty") if kind == "note" else \
+           (lambda c: "sioyek" in (c.get("appid") or "").lower())
+    end = time.time() + timeout
+    while True:
+        cs = [c for c in clients() if want(c) and name in (c.get("title") or "")]
+        if cs:
+            return sorted(cs, key=lambda c: not c.get("is_focused"))[0]["id"]
+        if time.time() >= end:
+            return None
+        time.sleep(0.25)
+
+
+def run_file(rid):
+    return os.path.join(RUN, rid + ".json")
+
+
+def running(rid):
+    try:
+        with open(run_file(rid)) as fh:
+            r = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    ids = {c["id"] for c in clients()}
+    return r if any(r.get(k) in ids for k in KINDS) else None
+
+
+def from_yazi():
+    yid = os.environ.get("YAZI_ID")
+    if not yid:
+        return None, False
+    if os.environ.get("KITTY_WINDOW_ID"):
+        return yid, True
+    pid = os.getppid()
+    for _ in range(12):
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                st = fh.read()
+        except OSError:
+            break
+        comm = st[st.index("(") + 1:st.rindex(")")]
+        ppid = int(st[st.rindex(")") + 2:].split()[1])
+        if comm == "yazi":
+            try:
+                with open(f"/proc/{ppid}/comm") as fh:
+                    parent = fh.read().strip()
+            except OSError:
+                parent = ""
+            return yid, parent not in ("zsh", "bash", "sh", "fish", "dash")
+        pid = ppid
+    return yid, False
+
+
+def new_note(src):
+    name = f"--{plain_title(src)}--"
+    path = os.path.join(WIKI, name + ".md")
+    if not os.path.exists(path):
+        os.makedirs(WIKI, exist_ok=True)
+        open(path, "a").close()
+        index = os.path.join(WIKI, "index.md")
+        try:
+            with open(index) as fh:
+                text = fh.read()
+            if f"]({name})" not in text and f"[[{name}" not in text:
+                link = f"[{name}]({name})" if "](" in text or "[[" not in text else f"[[{name}]]"
+                with open(index, "a") as fh:
+                    fh.write(("" if text.endswith("\n\n") or not text else "\n" if text.endswith("\n") else "\n\n") + link + "\n")
+        except OSError:
+            pass
+    return path
+
+
+def open_set(kind, path, this_window=False, parts=None, via_yazi=False):
+    path = real(path)
+    s = set_for(kind, path)
+    for k in KINDS:
+        if parts is not None and k not in parts and k != kind:
+            s[k] = None
+    if not s["note"] and parts is not None and "note" in parts:
+        s["note"] = new_note(s["book"] or s["audio"])
+    if sum(1 for k in KINDS if s[k]) < 2:
+        if kind == "book" and not this_window:
+            os.execvp("sioyek", ["sioyek", "--new-window", path])
+        return 0
+    rid = set_id(s)
+    r = running(rid)
+    if r:
+        t = (r.get("tags") or {}).get(kind) or (r.get("tags") or {}).get("book")
+        if t:
+            dispatch("view", t)
+        if r.get(kind):
+            bring(r[kind])
+        return 0
+
+    cs = clients()
+    yazi, yazi_alone = from_yazi() if (kind == "book" or via_yazi) and not this_window else (None, False)
+    yazi_win = None
+    if yazi and yazi_alone:
+        f = focused()
+        if (f.get("title") or "").startswith("Yazi"):
+            yazi_win = f.get("id")
+    mine = find_window(kind, path) if this_window and kind in ("book", "note") else None
+    me = next((c for c in cs if c["id"] == mine), {}) if mine else (focused() if kind == "audio" else {})
+    mon = me.get("monitor") or next((c.get("monitor") for c in cs if c.get("is_focused")), None)
+    if not mon:
+        try:
+            mon = next(m["name"] for m in json.loads(mmsg("get", "all-monitors")).get("monitors", []) if m.get("active"))
+        except (ValueError, StopIteration, KeyError):
+            mon = None
+    have = [k for k in ("book", "note", "audio") if s[k]]
+    books_win = next((c["id"] for c in cs if c.get("appid") == "books"), None)
+    free = empty_tags(cs, mon, len(have), moving={x for x in (mine, yazi_win, books_win if s["audio"] else None) if x}) if mon else []
+    tags = dict(zip(have, free))
+    ids = {}
+
+    def go(k):
+        if tags.get(k):
+            dispatch("view", tags[k])
+
+    if s["audio"]:
+        go("audio")
+        if kind == "audio" and books_win and not via_yazi:
+            bring(books_win)
+            ids["audio"] = books_win
+        else:
+            before = {c["id"] for c in clients()}
+            p = subprocess.Popen([os.path.join(BIN, "books"), "--paused", s["audio"]], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            ids["audio"] = books_win or wait_new(before, lambda c: c.get("appid") == "books")
+            if books_win:
+                try:
+                    p.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    pass
+                bring(books_win)
+    if s["note"]:
+        go("note")
+        if kind == "note" and mine:
+            bring(mine)
+            ids["note"] = mine
+        else:
+            before = {c["id"] for c in clients()}
+            spawn(["kitty", "nvim", "--cmd", "let g:bookset = 1", s["note"]])
+            ids["note"] = wait_new(before, lambda c: c.get("appid") == "kitty")
+    if s["book"]:
+        go("book")
+        if kind == "book" and mine:
+            bring(mine)
+            ids["book"] = mine
+        else:
+            before = {c["id"] for c in clients()}
+            spawn(["sioyek", "--new-window", s["book"]])
+            ids["book"] = wait_new(before, lambda c: "sioyek" in (c.get("appid") or "").lower())
+
+    if yazi:
+        win = os.environ.get("KITTY_WINDOW_ID")
+        cmd = ["/usr/bin/kitty", "@", "close-window", "--match", f"id:{win}"] if win else ["ya", "emit-to", yazi, "quit"]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        t = tags.get("book") or tags.get("note") or tags.get("audio")
+        if t:
+            dispatch("view", t)
+    os.makedirs(RUN, exist_ok=True)
+    for f in os.listdir(RUN):
+        if f.endswith(".json") and f != rid + ".json":
+            try:
+                with open(os.path.join(RUN, f)) as fh:
+                    old = (json.load(fh).get("paths") or {}).values()
+            except (OSError, ValueError, AttributeError):
+                continue
+            if any(x and x in old for x in (s[k] for k in KINDS)):
+                try:
+                    os.remove(os.path.join(RUN, f))
+                except OSError:
+                    pass
+    with open(run_file(rid), "w") as fh:
+        json.dump(dict(ids, tags=tags, monitor=mon, title=title(s["book"] or s["audio"] or s["note"]),
+                       paths={k: s[k] for k in KINDS if ids.get(k)}), fh)
+    spawn([sys.executable, "-I", SELF, "hold", rid])
+    return 0
+
+
+def the(kinds):
+    return " and the ".join(NAMES[k] for k in kinds)
+
+
+def ask_close(name, gone, left, still=None):
+    opts = [("all", f"Close the {the(left)} too")]
+    if len(left) == 2:
+        a, b = left
+        opts += [(a, f"Close the {NAMES[a]}, keep the {NAMES[b]}"), (b, f"Close the {NAMES[b]}, keep the {NAMES[a]}")]
+    opts.append(("none", f"Keep the {the(left)} open"))
+    pick_ = ask(f"Closed {(name + chr(39) + 's ') if name else 'the '}{the(gone)}. And…", opts, still)
+    if pick_ is CHANGED:
+        return None
+    return left if pick_ == "all" else [pick_] if pick_ in left else []
+
+
+def focus_nvim(cid):
+    focused_file = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "nvim-focused")
+    try:
+        was = os.stat(focused_file).st_mtime_ns
+    except OSError:
+        was = None
+    bring(cid)
+    end = time.time() + 1.5
+    while time.time() < end:
+        try:
+            if os.stat(focused_file).st_mtime_ns != was:
+                return
+        except OSError:
+            pass
+        time.sleep(0.05)
+
+
+def is_kind(c, k):
+    app = (c.get("appid") or "").lower()
+    return "sioyek" in app if k == "book" else app == "kitty" if k == "note" else app == "books"
+
+
+def hold(rid):
+    try:
+        with open(run_file(rid)) as fh:
+            r = json.load(fh)
+    except (OSError, ValueError):
+        return 0
+    members = {k: r[k] for k in KINDS if r.get(k)}
+
+    def open_now():
+        cs = {c["id"]: c for c in clients()}
+        return cs, {k for k, cid in members.items() if cid in cs and is_kind(cs[cid], k)}
+
+    while len(members) > 1:
+        time.sleep(1)
+        if not os.path.exists(run_file(rid)):
+            return 0
+        cs, alive = open_now()
+        if not cs:
+            continue
+        gone = [k for k in ("book", "note", "audio") if k in members and k not in alive]
+        if not gone:
+            continue
+        for k in gone:
+            del members[k]
+        left = [k for k in ("book", "note", "audio") if k in members]
+        if not left:
+            break
+        def still(left=left):
+            cs, alive = open_now()
+            return not cs or set(left) <= alive
+
+        close = ask_close(r.get("title") or "", gone, left, still)
+        if not os.path.exists(run_file(rid)):
+            return 0
+        if close is None:
+            continue
+        cs, alive = open_now()
+        for k in close:
+            if k in alive:
+                if k == "note":
+                    focus_nvim(members[k])
+                subprocess.run([os.path.expanduser("~/.config/mango/scripts/close"), "--id", str(members[k])])
+            del members[k]
+    try:
+        os.remove(run_file(rid))
+    except OSError:
+        pass
+    return 0
+
+
+def in_terminal():
+    try:
+        return os.ttyname(0).startswith("/dev/pts/") and os.isatty(1)
+    except OSError:
+        return False
+
+
+def pick(header, options, current):
+    rows = []
+    for label, value in options:
+        mark = "● " if value == current else "  "
+        rows.append(f"{value}\t{mark}{label}")
+    r = subprocess.run(["fzf", "--delimiter=\t", "--with-nth=2", "--header", header, "--reverse", "--no-sort",
+                        "--prompt", "  ", "--height=100%"], input="\n".join(rows), capture_output=False,
+                       stdout=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        return False
+    return r.stdout.split("\t", 1)[0]
+
+
+def link(kind, path):
+    path = real(path)
+    if not os.path.exists(path):
+        return 0
+    if not in_terminal():
+        os.execvp("kitty", ["kitty", "--class=bookset-link", SELF, "link", kind, path])
+    s = set_for(kind, path)
+    chosen = {kind: path}
+    for k in KINDS:
+        if k == kind:
+            continue
+        opts = [("(none)", "")]
+        if s[k]:
+            opts.append((title(s[k]) + "   (matched by name)", s[k]))
+        if k == "note":
+            t = plain_title(chosen.get("book") or path)
+            new = os.path.join(WIKI, f"--{t}--.md")
+            if not os.path.exists(new):
+                opts.append((f"+ a new note: {t}", new))
+        for f in sorted(files(k), key=lambda p: title(p).lower()):
+            if f != s[k]:
+                opts.append((title(f), f))
+        v = pick(f"The {NAMES[k]} for {title(path)}", opts, s[k] or "")
+        if v is False:
+            v = s[k] or ""
+        chosen[k] = v
+    if chosen.get("note") and not os.path.exists(chosen["note"]):
+        chosen["note"] = new_note(chosen.get("book") or path)
+    ls = [e for e in links() if not any(e.get(k) and chosen.get(k) and real(e[k]) == real(chosen[k]) for k in KINDS)]
+    ls.append({k: chosen.get(k) or "" for k in KINDS})
+    save_links(ls)
+    have = [NAMES[k] for k in KINDS if chosen.get(k)]
+    notify("Linked: " + title(path), ", ".join(have) if len(have) > 1 else "Nothing else: it opens on its own")
+    return 0
+
+
+def choose(out, header, *pairs):
+    rows = [f"{pairs[i]}\t{pairs[i + 1]}" for i in range(0, len(pairs) - 1, 2)]
+    r = subprocess.run(["fzf", "--delimiter=\t", "--with-nth=2", "--header", header + "\nj/k move · Enter picks · q: none",
+                        "--reverse", "--no-sort", "--no-info", "--no-input", "--height=100%", "--pointer=▶", "--highlight-line",
+                        "--color=bg+:8,fg+:15:bold,pointer:4", "--bind=j:down,k:up,g:first,G:last,q:abort"],
+                       input="\n".join(rows),
+                       stdout=subprocess.PIPE, text=True)
+    with open(out, "w") as fh:
+        fh.write(r.stdout.split("\t", 1)[0] if r.returncode == 0 else "")
+    return 0
+
+
+CHANGED = object()
+
+
+def stop_choosing(out):
+    me = os.getpgid(0)
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/cmdline", "rb") as fh:
+                a = fh.read().split(b"\0")
+            if b"choose" in a and out.encode() in a:
+                g = os.getpgid(int(d))
+                os.killpg(g, signal.SIGTERM) if g != me else os.kill(int(d), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+
+
+def ask(header, options, still=None):
+    os.makedirs(RUN, exist_ok=True)
+    out = os.path.join(RUN, f"ask.{os.getpid()}")
+    args = [SELF, "choose", out, header] + [x for o in options for x in o]
+    try:
+        if in_terminal():
+            p = subprocess.Popen([sys.executable, "-I", *args])
+        else:
+            p = subprocess.Popen(["kitty", "--class=bookset-ask", sys.executable, "-I", *args],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        while p.poll() is None:
+            time.sleep(0.5)
+            if still and p.poll() is None and not still():
+                stop_choosing(out)
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                return CHANGED
+        with open(out) as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+
+def open_asking(path, this_window=False, kind="book", via_yazi=False):
+    path = real(path)
+    s = set_for(kind, path)
+    others = [k for k in ("note", "book", "audio") if k != kind and (s[k] or k == "note")]
+    opts = []
+    if len(others) == 2:
+        opts.append(("all", f"The {NAMES[kind]}, its {NAMES[others[0]]} and its {NAMES[others[1]]}"))
+    for k in others:
+        opts.append((k, f"The {NAMES[kind]} and its {NAMES[k]}" + ("  (a new note)" if k == "note" and not s[k] else "")))
+    if not opts:
+        notify(f"Nothing linked to {title(path)}", "Space B links it to a book and an audiobook")
+        return 0
+    only = len(opts) == 1 and not (opts[0][0] == "note" and not s["note"])
+    pick_ = opts[0][0] if only else ask(f"Open {title(path)} with…", opts)
+    if not pick_:
+        return 0
+    parts = {kind} | (set(KINDS) if pick_ == "all" else {pick_})
+    return open_set(kind, path, this_window, parts, via_yazi)
+
+
+def audiobook(path):
+    for b in audiobooks():
+        if real(b["key"]) == path or any(real(p["path"]) == path for p in b.get("parts", [])):
+            return b["key"]
+    inside = [b["key"] for b in audiobooks() if real(b["key"]).startswith(path + os.sep)]
+    if len(inside) == 1:
+        return inside[0]
+    return path if os.path.isfile(path) and os.path.splitext(path)[1].lower() in AUDIO_EXT else None
+
+
+def yazi_key(path):
+    if os.path.splitext(path)[1].lower() not in BOOK_EXT:
+        a = audiobook(path)
+        return open_asking(a, kind="audio", via_yazi=True) if a and not os.environ.get("YAZI_PICKER") else 0
+    if os.environ.get("YAZI_PICKER"):
+        os.makedirs(RUN, exist_ok=True)
+        open(os.path.join(RUN, "pick-set"), "w").close()
+        subprocess.run(["ya", "emit-to", os.environ.get("YAZI_ID", ""), "open"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 0
+    return open_asking(path, via_yazi=True)
+
+
+def in_library(path):
+    lib = real(LIBRARY)
+    return bool(path) and real(path).startswith(lib + os.sep) and os.path.isfile(path)
+
+
+def recent_book():
+    data = os.path.join(HOME, ".local/share/sioyek")
+    try:
+        with open(os.path.join(data, "last_document_path.txt")) as fh:
+            lasts = fh.read().splitlines()
+    except OSError:
+        lasts = []
+    for last in lasts:
+        if in_library(last.strip()):
+            return last.strip()
+    import sqlite3
+    try:
+        shared = sqlite3.connect(f"file:{os.path.join(data, 'shared.db')}?mode=ro", uri=True)
+        local = sqlite3.connect(f"file:{os.path.join(data, 'local.db')}?mode=ro", uri=True)
+        paths = {}
+        for p, h in local.execute("SELECT path, hash FROM document_hash"):
+            paths.setdefault(h, []).append(p)
+        for (h,) in shared.execute("SELECT path FROM opened_books ORDER BY last_access_time DESC"):
+            for p in paths.get(h, []):
+                if in_library(p):
+                    return p
+    except sqlite3.Error:
+        pass
+    return None
+
+
+def recent():
+    w = next((c for c in clients() if c.get("appid") == "bookset-ask"), None)
+    if w:
+        if w.get("is_focused"):
+            mmsg("dispatch", "killclient", f"client,{w['id']}")
+        else:
+            bring(w["id"])
+        return 0
+    path = recent_book()
+    if not path:
+        notify("No recent book", "sioyek hasn't opened a book in ~/Library yet")
+        return 0
+    return open_asking(path)
+
+
+def which(kind, path):
+    s = set_for(kind, path)
+    if sum(1 for k in KINDS if s[k]) < 2:
+        return 0
+    s["running"] = bool(running(set_id(s)))
+    print(json.dumps(s))
+    return 0
+
+
+def main(a):
+    if a == ["open", "book"]:
+        os.execvp("sioyek", ["sioyek", "--new-window"])
+    if len(a) >= 3 and a[0] == "open" and a[1] in KINDS:
+        if a[1] in ("book", "note") and "--ask" in a[3:]:
+            return open_asking(a[2], "--this-window" in a[3:], a[1])
+        return open_set(a[1], a[2], "--this-window" in a[3:])
+    if len(a) == 2 and a[0] == "yazi":
+        return yazi_key(real(a[1]))
+    if a == ["recent"]:
+        return recent()
+    if len(a) >= 3 and a[0] == "choose":
+        return choose(*a[1:])
+    if len(a) >= 3 and a[0] == "which" and a[1] in KINDS:
+        return which(a[1], a[2])
+    if len(a) >= 3 and a[0] == "link" and a[1] in KINDS:
+        return link(a[1], a[2])
+    if len(a) == 2 and a[0] == "hold":
+        return hold(a[1])
+    print("bookset open book|audio|note PATH [--this-window] [--ask] | open book | recent | yazi PATH\n"
+          "        which KIND PATH | link KIND PATH | choose OUT HEADER PAIRS… | hold ID")
+    return 0 if a[:1] in (["-h"], ["--help"]) else 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception:
+        import traceback
+        with open(os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "bookset.log"), "a") as fh:
+            fh.write(time.strftime("%F %T ") + " ".join(sys.argv[1:]) + "\n" + traceback.format_exc())
+        notify("Couldn't open the book's set", "What went wrong is in ~/.cache/bookset.log")
+        sys.exit(1)

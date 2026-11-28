@@ -1,0 +1,542 @@
+#!/bin/bash
+# send: copies files and folders to another computer over SSH (rsync), asking where each time.
+#   send FILE|FOLDER…        asks which computer (a list, with more than one saved) and where on it, then sends
+#                            them there (S in yazi)
+#   send setup [USER@ADDRESS [NAME]]   once, on either computer: then both can send to each other
+#   send receive             once, first, on the computer you'll run send setup for
+#   send get [NAME]          copies the files you pick on NAME into the folder you're in (Ctrl+G in yazi)
+#   send forget              one list (computers, addresses, logins, the SSH server), nothing ticked: tick what goes
+# Where to: the computer is picked first, then you edit only the PATH on it (~/Pictures/, ~/inbox/…); ending in / is a folder
+APP=send
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/send
+LAST=$STATE/last
+PATHS=$STATE/paths   # the path last sent to on each computer: NAME<tab>PATH
+mkdir -p "$STATE"
+
+SSHC=(ssh -o ControlMaster=auto -o "ControlPath=${XDG_RUNTIME_DIR:-/tmp}/send-%C" -o ControlPersist=15)
+RSYNC=(rsync -ah --partial --info=progress2 --info=name0 --mkpath -e "${SSHC[*]}")
+
+TICK=(--multi --marker='✓ ' --pointer='▶' --highlight-line
+    --color='bg+:8,fg+:15:bold,pointer:4,marker:green:bold,selected-fg:green:bold')
+
+# shellcheck disable=SC2016
+MDNS_NAME='busctl --system call org.freedesktop.Avahi / org.freedesktop.Avahi.Server GetHostNameFqdn 2>/dev/null | cut -d\" -f2'
+MDNS_SWITCH=$(cat <<'M'
+n=$1 a=$2 m=$3 conf=$HOME/.ssh/config kh=$HOME/.ssh/known_hosts
+[[ $m == *.local && $a != *.local ]] || exit 1
+k=$(ssh-keyscan -T 5 -t ed25519 "$m" 2>/dev/null | awk 'NF >= 3 { print $2, $3; exit }')
+[ -n "$k" ] && ssh-keygen -F "$a" -f "$kh" 2>/dev/null | grep -qF -- "$k" || exit 1
+lines=$(ssh-keygen -F "$a" -f "$kh" | awk -v m="$m" '!/^#/ && NF >= 3 { print m, $2, $3 }')
+ssh-keygen -R "$m" -f "$kh" >/dev/null 2>&1
+printf '%s\n' "$lines" >> "$kh"
+umask 077
+awk -v n="$n" -v m="$m" '/^[ \t]*[Hh]ost[ \t]/ { b = (NF == 2 && $2 == n) } b && tolower($1) == "hostname" { sub(/[^ \t]+[ \t]*$/, m) } { print }' \
+    "$conf" > "$conf.new" && mv -f "$conf.new" "$conf"
+M
+)
+
+# the computers saved in ~/.ssh/config, FIRST (the one used last) on top: NAME<tab>name and address
+saved() {
+    [ -f "$HOME/.ssh/config" ] || return 0
+    awk 'tolower($1) == "host" && NF == 2 && $2 !~ /[*?!]/ { print $2 }' "$HOME/.ssh/config" |
+        awk -v f="$1" '$0 == f { print; next } { r[++n] = $0 } END { for (i = 1; i <= n; i++) print r[i] }' |
+        while read -r n; do printf '%s\t%-12s %s\n' "$n" "$n" "$(ssh -G "$n" 2>/dev/null </dev/null | awk '$1 == "hostname" { print $2 }')"; done
+}
+# which computer, with HEADER on top: a list when more than one is saved (Enter picks, q cancels: returns 1), the
+# only one when there's one. Prints its name, ? for "other" (you type it), nothing when there's no list to show
+choose() {
+    local lines=() c
+    command -v fzf >/dev/null || return 0
+    mapfile -t lines < <(saved "$2")
+    ((${#lines[@]})) || return 0
+    ((${#lines[@]} == 1)) && { echo "${lines[0]%%$'\t'*}"; return 0; }
+    c=$({ printf '%s\n' "${lines[@]}"; printf '?\t%-12s %s\n' "other…" "type user@address"; } |
+        fzf --no-input --delimiter=$'\t' --with-nth=2 --layout=reverse --height=~50% --pointer='▶' --highlight-line \
+            --color='bg+:8,fg+:15:bold,pointer:4' --header="$1"$'\n'"j/k move · Enter picks · q cancels" \
+            --bind 'j:down,k:up,g:first,G:last,q:abort') || return 1
+    echo "${c%%$'\t'*}"
+}
+# the path last sent to on NAME / remember PATH as it
+lastpath() { [ -f "$PATHS" ] && awk -F'\t' -v h="$1" '$1 == h { p = $2 } END { print p }' "$PATHS"; }
+savepath() {
+    { [ -f "$PATHS" ] && awk -F'\t' -v h="$1" '$1 != h' "$PATHS"; printf '%s\t%s\n' "$1" "$2"; } > "$PATHS.new" &&
+        mv -f "$PATHS.new" "$PATHS"
+}
+
+# The where-to prompt runs in zsh with your ~/.zshrc, so it's the same as your shell (keys, vi mode, menu,
+# colours), and Tab completes from the files on that computer ($SEND_HOST): its folders are mirrored as empty
+# stand-ins in a temporary folder, so zsh colours them by type as it does yours. No syntax highlighting or
+# suggestions (they'd judge the path by this computer). Needs no password (its key set up): otherwise Tab does nothing
+# shellcheck disable=SC2016
+LIST_REMOTE='d=$1
+case $d in "" | "~/") d=$HOME ;; "~/"*) d=$HOME/${d#"~/"} ;; /*) ;; *) d=$HOME/$d ;; esac
+cd -- "$d" 2>/dev/null && find . -mindepth 1 -maxdepth 1 -printf "%y%Y %m %P\0"'
+# shellcheck disable=SC2016
+WHERE_ZSH='_plugins_load() { local fd=$1; zle -F $fd; exec {fd}<&-; }
+zmodload zsh/files 2>/dev/null
+mkdir -p $SEND_TMP/td && : > $SEND_TMP/tf
+typeset -gA _send_mirror
+_send_remote() {
+    local dir m rec t tt mode name x
+    local -a expl dirs files
+    if [[ $PREFIX == "~" ]]; then compadd -Q -S "" -- "~/"; return; fi
+    [[ $PREFIX == */* ]] && dir=${PREFIX%/*}/
+    m=$_send_mirror[$dir]
+    if [[ -z $m ]]; then
+        x=$(ssh -o ControlMaster=auto -o ControlPath=$SEND_CP -o ControlPersist=15 -o BatchMode=yes -o ConnectTimeout=5 \
+            $SEND_HOST "bash -c ${(qq)SEND_LIST} _ ${(qq)dir}" 2>/dev/null </dev/null) || return 1
+        m=$SEND_TMP/m$#_send_mirror
+        mkdir -p $m
+        for rec in ${(0)x}; do
+            t=$rec[1] tt=$rec[2] rec=$rec[4,-1] mode=${rec%% *} name=${rec#* }
+            case $t in
+                d) mkdir -- $m/$name && chmod $(( [##8] 8#$mode | 8#700 )) -- $m/$name ;;
+                l) case $tt in d) ln -s $SEND_TMP/td $m/$name ;; f) ln -s $SEND_TMP/tf $m/$name ;; *) ln -s $SEND_TMP/none $m/$name ;; esac ;;
+                p) mkfifo -- $m/$name 2>/dev/null || : > $m/$name ;;
+                *) : > $m/$name && chmod $mode -- $m/$name ;;
+            esac 2>/dev/null
+        done
+        _send_mirror[$dir]=$m
+    fi
+    dirs=( $m/*(ND-/:t) ) files=( $m/*(ND^-/:t) )
+    compset -P "*/"
+    _description files expl file
+    compadd "$expl[@]" -Q -f -W $m/ -S / -r "/ \t\n\-" -a dirs
+    compadd "$expl[@]" -Q -f -W $m/ -a files
+}
+zstyle ":completion:*" completer _send_remote
+bindkey -M viins "^I" complete-word
+bindkey -M vicmd "^I" complete-word
+p=$SEND_PRE
+vared -p "> $SEND_HOST:" p || exit 1
+print -r -- $p > $SEND_TMP/out'
+# asks for the path on $1, starting from $2; prints it (nothing: cancelled)
+where_to() {
+    local t p rc
+    if ! command -v zsh >/dev/null; then read -r -e -i "$2" -p "> $1:" p && printf '%s\n' "$p"; return; fi
+    t=$(mktemp -d) || return 1
+    SEND_HOST=$1 SEND_PRE=$2 SEND_TMP=$t SEND_LIST=$LIST_REMOTE SEND_CP=${XDG_RUNTIME_DIR:-/tmp}/send-%C \
+        zsh -i -c "$WHERE_ZSH" >&2
+    rc=$?
+    (( rc == 0 )) && cat "$t/out"
+    rm -rf "$t"
+    return $rc
+}
+
+hold() { [ -n "${YAZI_ID:-}" ] && { printf '\nPress Enter to go back. '; read -r _; }; }
+fail() { printf '\e[1;31m%s\e[0m\n' "$*" >&2; notify --urgency=critical "Send failed" "$*"; hold; exit 1; }
+
+# shellcheck disable=SC2016
+ENTRY_AWK='
+    /^[ \t]*[Hh]ost[ \t]/ { skip = (NF == 2 && $2 == n) }
+    /^[ \t]*[Hh]ost[ \t]+\*[ \t]*$/ && !done { printf "%s\n", b; done = 1 }
+    !skip { print }
+    END { if (!done) printf "\n%s", b }'
+entry() {
+    local name=$1 to=$2 user="" addr=$2 conf=$HOME/.ssh/config block
+    [[ $to == *@* ]] && { user=${to%%@*}; addr=${to#*@}; }
+    mkdir -p -m 700 "$HOME/.ssh"
+    [ -e "$conf" ] || printf 'Host *\n\tAddKeysToAgent yes\n' > "$conf"
+    block="Host $name"$'\n'"    HostName $addr"$'\n'
+    [ -n "$user" ] && block+="    User $user"$'\n'
+    (umask 077; awk -v n="$name" -v b="$block" "$ENTRY_AWK" "$conf" > "$conf.new") && mv -f "$conf.new" "$conf" ||
+        fail "couldn't write $conf"
+    say "$name = $to (in ~/.ssh/config)"
+}
+
+# takes NAME out of ~/.ssh/config again (and what SSH remembers of it): a setup that didn't work leaves nothing behind
+unentry() {
+    local n=$1 a conf=$HOME/.ssh/config kh=$HOME/.ssh/known_hosts
+    [ -f "$conf" ] || return 0
+    a=$(ssh -G "$n" 2>/dev/null </dev/null | awk '$1 == "hostname" { print $2 }')
+    (umask 077; awk -v n="$n" '/^[ \t]*[Hh]ost[ \t]/ { skip = (NF == 2 && $2 == n) } !skip' "$conf" | cat -s > "$conf.new") &&
+        mv -f "$conf.new" "$conf"
+    [ -f "$kh" ] && for h in "$n" "$a"; do ssh-keygen -R "$h" -f "$kh" >/dev/null 2>&1; done
+    rm -f "$kh.old"
+    [ "$(cut -d: -f1 "$LAST" 2>/dev/null)" = "$n" ] && rm -f "$LAST"
+    return 0
+}
+
+receive_here() {
+    need systemctl
+    step "Turning on the SSH server"
+    # sudo's own prompt ("[sudo] password for user") doesn't say which computer: this one does
+    sudo -v -p "Password of %u on THIS computer ($(uname -n)), for sudo: " || fail "sudo didn't take the password"
+    sudo systemctl enable --now sshd || fail "couldn't turn on sshd (is openssh installed?)"
+    : > "$STATE/receive"
+    local rule='        tcp dport 22 accept                       # SSH: answers only once send receive turned its server on'
+    if sudo nft list chain inet filter input >/dev/null 2>&1 &&
+        ! sudo nft list chain inet filter input | grep -q 'tcp dport 22 accept'; then
+        step "Letting SSH through the firewall"
+        sudo nft add rule inet filter input tcp dport 22 accept || fail "couldn't let SSH through the firewall"
+    fi
+    if [ -f /etc/nftables.conf ] && grep -q 'iifname "virbr\*" accept' /etc/nftables.conf &&
+        ! grep -q 'tcp dport 22 accept' /etc/nftables.conf; then
+        sudo sed -i "/iifname \"virbr\\*\" accept/a\\$rule" /etc/nftables.conf || fail "couldn't save the firewall change"
+    fi
+    command -v rsync >/dev/null || sudo pacman -S --needed --noconfirm rsync || fail "couldn't install rsync"
+    step "Answering to a name on the network (so an address change doesn't break sending)"
+    [ -e /usr/lib/libnss_mdns_minimal.so.2 ] && command -v avahi-daemon >/dev/null ||
+        sudo pacman -S --needed --noconfirm avahi nss-mdns || { warn "couldn't install avahi: sending goes by address"; return 0; }
+    if ! systemctl is-enabled -q avahi-daemon 2>/dev/null; then
+        sudo systemctl enable --now avahi-daemon && : > "$STATE/avahi" || { warn "couldn't turn on avahi: sending goes by address"; return 0; }
+    fi
+    grep -q '^hosts:.*mdns' /etc/nsswitch.conf ||
+        sudo sed -i '/^hosts:/{/mdns/!s/ \(resolve\|dns\)/ mdns_minimal [NOTFOUND=return] \1/}' /etc/nsswitch.conf
+    local mrule='        udp dport 5353 accept                     # finding computers by name (NAME.local): answers once send receive turned avahi on'
+    if sudo nft list chain inet filter input >/dev/null 2>&1 &&
+        ! sudo nft list chain inet filter input | grep -q 'udp dport 5353 accept'; then
+        sudo nft add rule inet filter input udp dport 5353 accept || warn "couldn't let names through the firewall"
+    fi
+    if [ -f /etc/nftables.conf ] && grep -q 'tcp dport 22 accept' /etc/nftables.conf &&
+        ! grep -q 'udp dport 5353 accept' /etc/nftables.conf; then
+        sudo sed -i "/tcp dport 22 accept/a\\$mrule" /etc/nftables.conf || warn "couldn't save the firewall change"
+    fi
+    say "this computer is $(eval "$MDNS_NAME" || true)"
+}
+
+back() {
+    local to=$1 addr pub hk remote me=''
+    printf '\n\e[1;36m── The other way: %s sending here\e[0m\n' "$to"
+    receive_here
+    addr=$("${SSHC[@]}" "$to" 'echo $SSH_CONNECTION' 2>/dev/null); addr=${addr%% *}
+    [[ $addr =~ ^[0-9A-Fa-f.:]+$ ]] || fail "couldn't tell this computer's address as $to sees it"
+    while [[ -z $me || $me == *[[:space:]@:/*?\'\"\\]* ]]; do
+        read -r -e -i "$(uname -n)" -p "Name for this computer on $to (what you'll type there to send here): " me || exit 1
+    done
+    step "An SSH key on $to"
+    if "${SSHC[@]}" "$to" 'test -e ~/.ssh/id_ed25519.pub'; then
+        say "already there"
+    else
+        say "(it asks you to choose a passphrase for this new key on $to: you'll type it on $to once per login there)"
+        "${SSHC[@]}" -t "$to" 'mkdir -p -m 700 ~/.ssh && ssh-keygen -q -t ed25519 -a 100 -C "$USER@$(uname -n)" -f ~/.ssh/id_ed25519' ||
+            fail "couldn't make an SSH key on $to"
+    fi
+    pub=$("${SSHC[@]}" "$to" 'cat ~/.ssh/id_ed25519.pub'); pub=${pub%%$'\n'*}
+    [[ $pub == ssh-ed25519\ * ]] || fail "couldn't read $to's SSH key"
+    step "Letting $to's key in here"
+    (umask 077; mkdir -p "$HOME/.ssh" && touch "$HOME/.ssh/authorized_keys") || fail "couldn't write ~/.ssh/authorized_keys"
+    if grep -qxF -- "$pub" "$HOME/.ssh/authorized_keys"; then
+        say "already in"
+    elif printf '%s\n' "$pub" >> "$HOME/.ssh/authorized_keys"; then
+        say "added to ~/.ssh/authorized_keys"
+    else
+        fail "couldn't write ~/.ssh/authorized_keys"
+    fi
+    hk=$(cat /etc/ssh/ssh_host_*_key.pub 2>/dev/null | awk -v a="$addr" 'NF >= 2 { print a, $1, $2 }')
+    [ -n "$hk" ] || fail "no SSH host keys in /etc/ssh (did sshd start?)"
+    step "This computer as $me on $to"
+    remote=$(printf 'name=%q user=%q addr=%q\nhk=%q\nprog=%q\n' "$me" "$USER" "$addr" "$hk" "$ENTRY_AWK"; cat <<'R'
+set -e
+umask 077
+mkdir -p ~/.ssh
+conf=~/.ssh/config kh=~/.ssh/known_hosts
+[ -e "$conf" ] || printf 'Host *\n\tAddKeysToAgent yes\n' > "$conf"
+block="Host $name"$'\n'"    HostName $addr"$'\n'"    User $user"$'\n'
+awk -v n="$name" -v b="$block" "$prog" "$conf" > "$conf.new"
+mv -f "$conf.new" "$conf"
+touch "$kh"
+ssh-keygen -R "$addr" -f "$kh" >/dev/null 2>&1 || true
+printf '%s\n' "$hk" >> "$kh"
+st=${XDG_STATE_HOME:-$HOME/.local/state}/send
+mkdir -p "$st"
+printf '%s\n' "$name:~/" > "$st/last"
+R
+)
+    "${SSHC[@]}" "$to" bash -s <<<"$remote" || fail "couldn't set up $to to send here"
+    say "$me = $USER@$addr (in $to's ~/.ssh/config)"
+    step "Checking $to reaches this computer"
+    say "If it asks \"Enter passphrase for key\" now, that's $to's own SSH key: the passphrase chosen for it on $to."
+    if "${SSHC[@]}" -t "$to" "ssh -o ConnectTimeout=10 -o BatchMode=no $me true"; then
+        say "it does"
+        local mine; mine=$(eval "$MDNS_NAME")
+        if [ -n "$mine" ] && "${SSHC[@]}" "$to" "bash -s -- $(printf '%q ' "$me" "$addr" "$mine")" <<<"$MDNS_SWITCH" 2>/dev/null; then
+            say "$me on $to is now $mine: keeps working when this computer's address changes"
+        fi
+    else
+        # it doesn't work, so $to doesn't keep it: no $me in its list of computers to send to
+        "${SSHC[@]}" "$to" "bash -s -- $(printf '%q ' "$me" "$addr")" <<'R' >/dev/null 2>&1
+n=$1 a=$2 conf=~/.ssh/config kh=~/.ssh/known_hosts st=${XDG_STATE_HOME:-$HOME/.local/state}/send
+umask 077
+awk -v n="$n" '/^[ \t]*[Hh]ost[ \t]/ { skip = (NF == 2 && $2 == n) } !skip' "$conf" | cat -s > "$conf.new" && mv -f "$conf.new" "$conf"
+ssh-keygen -R "$a" -f "$kh" >/dev/null 2>&1; rm -f "$kh.old"
+[ "$(cut -d: -f1 "$st/last" 2>/dev/null)" = "$n" ] && rm -f "$st/last"
+R
+        warn "$to couldn't reach this computer at $addr (a firewall, another network, or behind a router): not saved on $to."
+        warn "send receive here shows this computer's addresses; send setup on $to sets it up from there."
+        return 1
+    fi
+}
+
+case ${1:-} in receive | setup | forget | get) [ -e "$1" ] && set -- "./$1" "${@:2}" ;; esac
+
+case ${1:-} in
+setup)
+    need ssh ssh-copy-id
+    # every step below talks to the other computer over one connection, so your key's passphrase is asked once,
+    # not at each step; it closes when setup ends (or after 10 minutes)
+    SSHC=(ssh -o ControlMaster=auto -o "ControlPath=${XDG_RUNTIME_DIR:-/tmp}/send-%C" -o ControlPersist=10m)
+    # a computer saved by this setup is taken out again if setup stops before sending there works
+    trap '[ -n "${to:-}" ] && "${SSHC[@]}" -O exit "$to" 2>/dev/null; [ -n "${unsave:-}" ] && unentry "$unsave"' EXIT
+    unsave=
+    to=${2:-}
+    [ -n "$to" ] || { read -r -e -p "Computer to send to (user@address, or a name in ~/.ssh/config): " to || exit 1; }
+    [ -n "$to" ] || exit 1
+    key=$HOME/.ssh/id_ed25519
+    if [ ! -e "$key" ]; then
+        step "Making your SSH key (choose its passphrase: you type it once per login)"
+        ssh-keygen -q -t ed25519 -a 100 -C "$USER@$(uname -n)" -f "$key" || fail "couldn't make the SSH key"
+    fi
+    name=${3:-}
+    while :; do
+        if [[ $to == *@* || $to == *.* || $to == *:* ]]; then
+            while [[ -z $name || $name == *[[:space:]@:/*?]* ]]; do
+                read -r -e -p "Name for it (what you'll type to send there, e.g. laptop): " name || exit 1
+            done
+            [ -n "$unsave" ] || [ -n "$(saved | awk -F'\t' -v n="$name" '$1 == n')" ] || unsave=$name
+            entry "$name" "$to"
+            to=$name
+        fi
+        step "Putting your key on $to"
+        u=$(ssh -G "$to" 2>/dev/null </dev/null | awk '$1 == "user" { print $2 }')
+        say "If it asks \"Are you sure you want to continue connecting\", type yes (it's the first time this computer sees $to)."
+        say "Then \"password\": the password $u logs in with on $to (that computer's password, not this one's). Only this once."
+        ssh-copy-id -o ConnectTimeout=10 -i "$key.pub" "$to" && break
+        cf=(); [ -f "$HOME/.ssh/config" ] && cf=(-F "$HOME/.ssh/config")
+        read -r addr port < <(ssh "${cf[@]}" -G "$to" 2>/dev/null | awk '$1 == "hostname" { h = $2 } $1 == "port" { p = $2 } END { print h, p }')
+        why=$(timeout 4 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$addr" "${port:-22}" 2>&1)
+        case $? in
+            0) fail "$to ($addr) answered, but the key couldn't be put there (wrong user or password?)" ;;
+        esac
+        [[ $why == *refused* ]] && fail "$to ($addr) is there, but its SSH server is off: run send receive on it"
+        ping -c1 -W2 "$addr" >/dev/null 2>&1 &&
+            fail "$to ($addr) is there, but its firewall blocks SSH: run send receive on it (it lets SSH in)"
+        printf '\n\e[1;33mCan'"'"'t reach %s at %s from here: wrong address, or it'"'"'s on another network.\e[0m\n' "$to" "$addr"
+        say "send receive on that computer shows its address."
+        if systemd-detect-virt -q --vm 2>/dev/null; then
+            gw=$(ip route 2>/dev/null | awk '/^default/ { print $3; exit }')
+            [ -n "$gw" ] && say "This is a virtual machine: the computer it runs on is $gw from here."
+        fi
+        read -r -e -p "New address for $to (user@address; empty stops): " new || exit 1
+        [ -n "$new" ] || exit 1
+        name=$to to=$new
+    done
+    step "Connecting to $to with your key"
+    say "If it asks \"Enter passphrase for key\": your SSH key's passphrase (the one chosen when the key was made),"
+    say "not a computer's password. Once, for the rest of setup."
+    "${SSHC[@]}" -o ConnectTimeout=10 "$to" true || fail "couldn't log in to $to with your key"
+    step "rsync on $to"
+    if "${SSHC[@]}" "$to" 'command -v rsync >/dev/null'; then
+        say "already there"
+    else
+        "${SSHC[@]}" -t "$to" "sudo -p 'Password of %u on $to, for sudo (to install rsync there): ' pacman -S --needed --noconfirm rsync" || fail "couldn't install rsync on $to"
+    fi
+    unsave=''   # sending there works: it stays
+    printf '%s\n' "$to:~/" > "$LAST"
+    say "send FILE… (or S in yazi) now offers $to:~/"
+    back "$to"; ok=$?
+    addr=$(ssh -G "$to" 2>/dev/null </dev/null | awk '$1 == "hostname" { print $2 }')
+    theirs=$("${SSHC[@]}" "$to" "$MDNS_NAME" 2>/dev/null </dev/null)
+    if [ -n "$theirs" ] && bash -c "$MDNS_SWITCH" _ "$to" "$addr" "$theirs"; then
+        say "$to is now $theirs here: keeps working when its address changes"
+    elif [[ $addr != *.local ]]; then
+        say "$to stays $addr here (it doesn't answer to a name: send receive on it, then send setup $to again)"
+    fi
+    if ((ok == 0)); then
+        step "Done: both ways"
+        say "here: send FILE… offers $to:~/   on $to: send FILE… offers the name you gave this computer"
+    else
+        step "Done: this way only (sending to $to works; see above for back)"
+    fi
+    exit 0 ;;
+receive)
+    receive_here
+    step "Done. On the other computer, run the one line for where it is (it sets up sending both ways):"
+    declare -A vmnet=()
+    while read -r n; do
+        [ -n "$n" ] || continue
+        b=$(virsh -c qemu:///system net-info "$n" 2>/dev/null | awk '$1 == "Bridge:" { print $2 }')
+        # Whonix's networks aren't for sending: left out
+        [[ ${n,,} == *whonix* ]] && n=-
+        [ -n "$b" ] && vmnet[$b]=$n
+    done < <(virsh -c qemu:///system net-list --name 2>/dev/null)
+    while read -r dev cidr; do
+        a=${cidr%/*}
+        [ "${vmnet[$dev]:-}" = - ] && continue
+        if [ -n "${vmnet[$dev]:-}" ]; then where="a VM on the ${vmnet[$dev]} network"
+        elif [[ $dev == virbr* || $dev == docker* || $dev == br-* ]]; then where="a VM or container on $dev"
+        else
+            ssid=$(nmcli -t -f DEVICE,CONNECTION dev 2>/dev/null | awk -F: -v d="$dev" '$1 == d { print $2 }')
+            where="another computer on your network${ssid:+ ($ssid)}"
+        fi
+        printf '  %-36s from %s\n' "send setup $USER@$a" "$where"
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{ print $2, $4 }')
+    echo
+    say "Just one of them, once: both computers can then send to each other. The address can change (a reboot, the router restarting, another network): if"
+    say "sending stops working, send asks for the new one; send receive here shows it."
+    exit 0 ;;
+forget)
+    # one list of everything send set up, nothing ticked: tick what goes (or just Enter on one line) and it's gone
+    conf=$HOME/.ssh/config kh=$HOME/.ssh/known_hosts ak=$HOME/.ssh/authorized_keys
+    rows=() named=' '
+    if [ -f "$conf" ]; then
+        while read -r n; do
+            a=$(ssh -G "$n" 2>/dev/null </dev/null | awk '$1 == "hostname" { print $2 }')
+            named+="$a "
+            rows+=("$(printf 'host\t%s\t%-9s %-18s %s' "$n" computer "$n" "$a")")
+        done < <(awk 'tolower($1) == "host" && NF == 2 && $2 !~ /[*?!]/ { print $2 }' "$conf")
+    fi
+    if [ -f "$kh" ]; then
+        gw=$(ip route 2>/dev/null | awk '/^default/ { print $3; exit }')
+        vm=; systemd-detect-virt -q --vm 2>/dev/null && vm=1
+        while read -r h; do
+            [[ $named == *" $h "* ]] && continue   # a named computer's address goes with it
+            what="a computer you connected to before"
+            [ -n "$vm" ] && [ "$h" = "$gw" ] && what="the computer this VM runs on"
+            [[ $h == *.local ]] && what="a computer on your network, by its name"
+            rows+=("$(printf 'addr\t%s\t%-9s %-18s %s' "$h" address "$h" "$what")")
+        done < <(awk '$1 !~ /^\|/ && $1 !~ /^#/ { n = split($1, h, ","); for (i = 1; i <= n; i++) print h[i] }' "$kh" |
+            sed 's/^\[\(.*\)\]:[0-9]*$/\1/' | LC_ALL=C sort -u | grep -v -E '[A-Za-z].*\.[A-Za-z]')
+    fi
+    if [ -s "$ak" ]; then
+        while IFS=$'\t' read -r nr label; do
+            rows+=("$(printf 'key\t%s\t%-9s %-18s %s' "$nr" login "$label" "can log in and send here")")
+        done < <(awk 'NF >= 2 && $1 !~ /^#/ { print NR "\t" ($3 != "" ? $3 : substr($2, 1, 16) "…") }' "$ak")
+    fi
+    if [ -z "${SSH_CONNECTION:-}" ] && { [ -e "$STATE/receive" ] || systemctl is-enabled -q sshd 2>/dev/null; }; then
+        rows+=("$(printf 'sshd\t-\t%-9s %-18s %s' server "SSH server" "on this computer (send receive turns it on again)")")
+    fi
+    ((${#rows[@]})) || { say "nothing to forget"; exit 0; }
+    if command -v fzf >/dev/null; then
+        export PICK_KEYS="j/k move · Space ticks · a all · Enter forgets the ticked (none ticked: the one you're on) · q cancels"
+        # shellcheck disable=SC2016
+        all='transform([ "$FZF_SELECT_COUNT" -eq "$FZF_TOTAL_COUNT" ] && echo deselect-all || echo select-all)'
+        # shellcheck disable=SC2016
+        hdr='transform-header[printf "Forget what? (%s ticked)\n%s" "$FZF_SELECT_COUNT" "$PICK_KEYS"]'
+        mapfile -t picked < <(printf '%s\n' "${rows[@]}" | fzf "${TICK[@]}" --no-input --delimiter=$'\t' --with-nth=3 \
+            --layout=reverse --height=~50% --header="Forget what? (0 ticked)"$'\n'"$PICK_KEYS" \
+            --bind "space:toggle+down+$hdr,tab:toggle+down+$hdr,btab:toggle+up+$hdr,a:$all+$hdr" \
+            --bind 'j:down,k:up,g:first,G:last,q:abort')
+    else
+        picked=()
+        for l in "${rows[@]}"; do
+            read -r -p "Forget ${l#*$'\t'*$'\t'}? [y/N] " a </dev/tty
+            [[ $a == [yY]* ]] && picked+=("$l")
+        done
+    fi
+    ((${#picked[@]})) || exit 0
+    keys=() off=
+    for l in "${picked[@]}"; do
+        IFS=$'\t' read -r kind id _ <<<"$l"
+        case $kind in
+        host)
+            addr=$(ssh -G "$id" 2>/dev/null </dev/null | awk '$1 == "hostname" { print $2 }')
+            (umask 077; awk -v n="$id" '/^[ \t]*[Hh]ost[ \t]/ { skip = (NF == 2 && $2 == n) } !skip' "$conf" | cat -s > "$conf.new") &&
+                mv -f "$conf.new" "$conf" || fail "couldn't write $conf"
+            [ -f "$kh" ] && for h in "$id" "$addr"; do ssh-keygen -R "$h" -f "$kh" >/dev/null 2>&1; done
+            [ -f "$PATHS" ] && awk -F'\t' -v h="$id" '$1 != h' "$PATHS" > "$PATHS.new" && mv -f "$PATHS.new" "$PATHS"
+            [ "$(cut -d: -f1 "$LAST" 2>/dev/null)" = "$id" ] && rm -f "$LAST"
+            say "forgot $id${addr:+ ($addr)}" ;;
+        addr) ssh-keygen -R "$id" -f "$kh" >/dev/null 2>&1 && say "forgot $id" ;;
+        key) keys+=("$id") ;;
+        sshd) off=1 ;;
+        esac
+    done
+    if ((${#keys[@]})); then
+        (umask 077; awk -v drop=" ${keys[*]} " 'index(drop, " " NR " ") == 0' "$ak" > "$ak.new") && mv -f "$ak.new" "$ak" ||
+            fail "couldn't write $ak"
+        say "${#keys[@]} login(s) taken out: they can't send here any more"
+    fi
+    if [ -n "$off" ]; then
+        sudo systemctl disable --now sshd && rm -f "$STATE/receive" && say "SSH server off"
+        [ -e "$STATE/avahi" ] && sudo systemctl disable --now avahi-daemon && rm -f "$STATE/avahi" && say "network name off"
+    fi
+    exit 0 ;;
+get)
+    need rsync ssh fzf
+    host=${2:-}
+    last=$(cat "$LAST" 2>/dev/null)
+    if [ -z "$host" ]; then
+        host=$(choose "Get files from" "${last%%:*}") || exit 0
+        if [ "$host" = '?' ]; then read -r -e -p "Get files from (user@address): " host || exit 0
+        elif [ -z "$host" ]; then read -r -e -i "${last%%:*}" -p "Get files from (a name in ~/.ssh/config, or user@address): " host || exit 0; fi
+    fi
+    host=${host%%:*}
+    [ -n "$host" ] || exit 0
+    "${SSHC[@]}" -o ConnectTimeout=10 "$host" true || fail "can't reach $host (send setup $host sets it up)"
+    mapfile -t picked < <("${SSHC[@]}" "$host" 'cd && find . -mindepth 1 -name ".*" -prune -o -type d -printf "%P/\n" -o -printf "%P\n"' |
+        fzf "${TICK[@]}" --layout=reverse --scheme=path --prompt="$host:~/ " \
+            --header="Type to search · Ctrl+J/K move · Tab ticks several (green ✓) or just Enter on one · Enter copies them into $(short "$PWD") · folders end in /")
+    ((${#picked[@]})) || exit 0
+    srcs=()
+    for f in "${picked[@]}"; do srcs+=("$host:${f%/}"); done
+    if ((${#picked[@]} == 1)); then what=${picked[0]%/}; what=${what##*/}; else what="${#picked[@]} items"; fi
+    echo
+    if "${RSYNC[@]}" -- "${srcs[@]}" ./; then
+        notify "Got" "$what ← $host (in $(short "$PWD"))"
+    else
+        fail "$what ← $host didn't finish (get it again to pick up where it stopped)"
+    fi
+    exit 0 ;;
+-h|--help|"")
+    cat <<'EOF'
+send FILE…                       copy files or folders to another computer over SSH (pick the computer, then the path; S in yazi)
+send setup [USER@ADDR [NAME]]    on either computer, once: SSH keys, names in ~/.ssh/config and rsync, so both send to each other
+send receive                     first, on the computer you'll set up for: turns its SSH server on, makes it answer to NAME.local, lets both through the firewall
+send get [NAME]                  copy files or folders from another computer into this folder (picked from a list; Ctrl+G in yazi)
+send forget                      one list of computers, addresses, logins and the SSH server: tick what goes (or Enter on one)
+EOF
+    [ -n "${1:-}" ]; exit ;;
+esac
+
+need rsync ssh
+items=()
+for f; do
+    [ -e "$f" ] || fail "no such file: $f"
+    [[ $f == /* ]] || f=./$f   # (a colon in a bare name would make rsync take it for a computer)
+    items+=("${f%/}")
+done
+
+last=$(cat "$LAST" 2>/dev/null)
+n=${#items[@]}
+if (( n == 1 )); then what=${items[0]##*/}; else what="$n items"; fi
+host=$(choose "Send $what to" "${last%%:*}") || exit 0
+[ -z "$host" ] && [[ $last == *:* ]] && host=${last%%:*}   # no list to pick from: the computer used last
+pre=''
+if [ -z "$host" ] || [ "$host" = '?' ]; then
+    read -r -e -p "Computer to send to (user@address, or a name in ~/.ssh/config): " host || exit 0
+    host=${host//[[:space:]]/}
+    [[ $host == *:* ]] && { pre=${host#*:}; host=${host%%:*}; }   # typed with a path: that path, filled in next
+    [ -n "$host" ] || exit 0
+fi
+[ -n "$pre" ] || pre=$(lastpath "$host")
+[ -n "$pre" ] || { [ "${last%%:*}" = "$host" ] && pre=${last#*:}; }
+# the computer is part of the prompt, so only the path can be edited
+printf '\e[1mSend %s to %s\e[0m (Tab completes · empty or Ctrl+C cancels)\n' "$what" "$host"
+"${SSHC[@]}" -o BatchMode=yes -o ConnectTimeout=5 "$host" true >/dev/null 2>&1 </dev/null &   # connects now, so Tab is quick
+path=$(where_to "$host" "${pre:-~/}") || exit 0
+path=${path#"${path%%[![:space:]]*}"}; path=${path%"${path##*[![:space:]]}"}
+[ -n "$path" ] || exit 0
+dest=$host:$path
+(( n > 1 )) && [[ $dest != */ && $dest != *: ]] && dest+=/
+printf '%s\n' "$dest" > "$LAST"
+savepath "${dest%%:*}" "${dest#*:}"
+
+echo
+if "${RSYNC[@]}" -- "${items[@]}" "$dest"; then
+    notify "Sent" "$what → $dest"
+    "${SSHC[@]}" -o ConnectTimeout=5 "${dest%%:*}" "bash -s -- $(printf '%q ' "$what" "$(uname -n)" "${dest#*:}")" <<'R' >/dev/null 2>&1
+p=$3
+case $p in "" | "~") p=$HOME ;; "~/"*) p=$HOME/${p#"~/"} ;; /*) ;; *) p=$HOME/$p ;; esac
+[ -d "$p" ] || p=$(dirname "$p")
+command -v notify-send >/dev/null || exit 0
+eval "$(systemctl --user show-environment 2>/dev/null | grep -E '^(WAYLAND_DISPLAY|DISPLAY|DBUS_SESSION_BUS_ADDRESS)=' | sed 's/^/export /')"
+export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}
+setsid -f bash -c 'a=$(notify-send --app-name=send -A default=Open "Received $1" "from $2 → ${3/#$HOME/\~}"); [ "$a" = default ] && xdg-open "$3"' _ "$1" "$2" "$p" >/dev/null 2>&1 </dev/null
+R
+else
+    fail "$what → $dest didn't finish (send again to pick up where it stopped)"
+fi

@@ -1,0 +1,3 @@
+# FreeTube's sandbox (a flatpak override): none of your files except Downloads
+[Context]
+filesystems=!host-etc;!home;!host-os;xdg-download;!host;

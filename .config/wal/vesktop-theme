@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+# Vesktop's theme in the wallpaper's colours, run by ~/.config/wal/postrun
+import colorsys, json, os, re
+
+HOME = os.path.expanduser("~")
+WAL = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "wal", "colors.json")
+CONF = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+BASE = os.path.join(CONF, "wal", "vesktop-base.css")
+OUT = os.path.join(CONF, "vesktop", "themes", "pywal.theme.css")
+
+STEPS = {"1d2021": -0.08, "1e1914": -0.08, "282828": 0, "32302f": 0.05, "3c3836": 0.1, "504945": 0.18,
+         "665c54": 0.28, "7c6f64": 0.38, "a89984": 0.6, "d5c4a1": 0.85, "ebdbb2": 1, "f9f5d7": 1.15}
+ACCENTS = {"fb4934": "color1", "fabd2f": "color3", "b8bb26": "color2", "8ec07c": "color6", "83a598": "color4",
+           "d3869b": "color5", "9147ff": "color5"}
+
+
+def rgb(h):
+    return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def hexof(c):
+    return "#" + "".join("%02x" % round(max(0, min(1, x)) * 255) for x in c)
+
+
+def mix(a, b, t):
+    return tuple(x + (y - x) * t for x, y in zip(a, b))
+
+
+def main():
+    w = json.load(open(WAL))
+    pal = dict(w["colors"], background=w["special"]["background"], foreground=w["special"]["foreground"])
+    bg, fg = rgb(pal["background"][1:]), rgb(pal["foreground"][1:])
+
+    def step(t):
+        if t < 0:
+            return mix(bg, (0, 0, 0), -t * 3)
+        if t > 1:
+            return mix(fg, (1, 1, 1), (t - 1) * 2)
+        return mix(bg, fg, t)
+
+    def swap(c):
+        h = hexof(c)[1:]
+        if h in ("000000", "ffffff"):
+            return c
+        if h in STEPS:
+            return step(STEPS[h])
+        hh, ll, ss = colorsys.rgb_to_hls(*c)
+        if ss < 0.12:
+            lo, hi = colorsys.rgb_to_hls(*rgb("282828"))[1], colorsys.rgb_to_hls(*rgb("ebdbb2"))[1]
+            return step((ll - lo) / (hi - lo))
+        ref = min(ACCENTS, key=lambda r: min(abs(colorsys.rgb_to_hls(*rgb(r))[0] - hh), 1 - abs(colorsys.rgb_to_hls(*rgb(r))[0] - hh)))
+        rl = colorsys.rgb_to_hls(*rgb(ref))[1]
+        ph, pl, ps = colorsys.rgb_to_hls(*rgb(pal[ACCENTS[ref]][1:]))
+        return colorsys.hls_to_rgb(ph, max(0.04, min(0.96, pl + ll - rl)), ps)
+
+    css = open(BASE).read()
+
+    def hex_sub(m):
+        h = m.group(1).lower()
+        if len(h) == 3:
+            h = "".join(x * 2 for x in h)
+        return hexof(swap(rgb(h)))
+
+    def rgba_sub(m):
+        c = swap(tuple(float(x) / 255 for x in m.group(2, 3, 4)))
+        a = m.group(5)
+        r, g, b = (round(x * 255) for x in c)
+        return f"rgba({r}, {g}, {b}, {a})" if a else f"rgb({r}, {g}, {b})"
+
+    css = re.sub(r"#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b", hex_sub, css)
+    css = re.sub(r"(rgba?)\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)", rgba_sub, css)
+
+    lights = [colorsys.rgb_to_hls(*rgb(pal["color%d" % i][1:]))[1] for i in range(1, 7)]
+    red = hexof(colorsys.hls_to_rgb(8 / 360, max(0.44, min(0.56, sum(lights) / len(lights))), 0.68))
+    text = hexof(mix(fg, (1, 1, 1), 0.6))
+    css += f"""
+/* notification badges: a warm red (~/.config/wal/vesktop-theme) */
+:root, .theme-dark, .visual-refresh.theme-dark, .visual-refresh .theme-dark {{
+  --badge-notification-background: {red} !important;
+  --background-feedback-notification: {red} !important;
+}}
+[class*=numberBadge_] {{
+  color: {text} !important;
+}}
+"""
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    tmp = BASE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(css)
+    os.replace(tmp, OUT)
+
+
+if __name__ == "__main__":
+    main()

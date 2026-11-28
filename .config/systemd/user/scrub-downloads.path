@@ -1,0 +1,9 @@
+[Unit]
+Description=Clean hidden data from new downloads
+
+[Path]
+PathChanged=%h/Downloads
+Unit=scrub-downloads.service
+
+[Install]
+WantedBy=default.target

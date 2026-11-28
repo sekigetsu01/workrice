@@ -1,0 +1,126 @@
+#!/bin/sh
+# The VPN's root half: the kill switch and openvpn.
+# This is the source; after changing it, install it again: sudo sh ~/.local/lib/vpn-install
+PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
+dev=tun-riseup
+
+case ${SUDO_UID:-} in '' | *[!0-9]*) echo "vpn run runs this." >&2; exit 2 ;; esac
+[ "$(id -u)" = 0 ] && [ $# = 0 ] || { echo "vpn run runs this." >&2; exit 2; }
+home=$(getent passwd "$SUDO_UID" | cut -d: -f6)
+conf=$home/RiseupVPN-OpenVPN/riseup-ovpn.conf
+bus=unix:path=/run/user/$SUDO_UID/bus
+run=/run/riseup-vpn
+run_conf=$run/openvpn.conf
+umask 077
+mkdir -p "$run"
+
+say() {
+    { printf '%s: %s\n' "$2" "$3" >&5; } 5>&2 2>/dev/null
+    setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --init-groups \
+        env DBUS_SESSION_BUS_ADDRESS="$bus" notify-send --app-name=VPN --urgency="$1" "$2" "$3" 2>/dev/null
+}
+
+exec 9>"$run/lock"
+flock -n 9 || { echo "The VPN is already on." >&2; exit 1; }
+
+started() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20; }
+user_pid=$PPID
+while [ "$(stat -c %u "/proc/$user_pid" 2>/dev/null)" = 0 ]; do
+    user_pid=$(sed 's/.*) //' "/proc/$user_pid/stat" | cut -d' ' -f2)
+done
+user_start=$(started "$user_pid")
+[ -n "$user_start" ] && [ "$(stat -c %u "/proc/$user_pid")" = "$SUDO_UID" ] || { echo "vpn run runs this." >&2; exit 2; }
+
+remotes=$(awk '{ sub(/[#;].*/, "") } $1 == "remote" { print $2, $3, $4 }' "$conf" 2>/dev/null | while read -r host port proto; do
+    case $port in '' | *[!0-9]*) continue ;; esac
+    case $proto in '' | tcp | udp | tcp4 | tcp6 | udp4 | udp6 | tcp-client) ;; *) continue ;; esac
+    case $host in
+        *[!0-9a-fA-F:.]*) ips=$(getent ahosts "$host" | awk '!s[$1]++ { print $1 }') ;;
+        *) ips=$host ;;
+    esac
+    for ip in $ips; do
+        case $ip in *[!0-9a-fA-F:.]* | '') continue ;; esac
+        printf 'remote %s %s %s\n' "$ip" "$port" "$proto"
+    done
+done)
+[ -n "$remotes" ] || { say critical "VPN not started" "Couldn't find the VPN's servers (no internet yet?), and it won't connect without the kill switch."; exit 3; }
+{
+    awk '
+        BEGIN {
+            split("client tls-client nobind persist-key persist-tun remote-random cipher data-ciphers data-ciphers-fallback auth keepalive connect-retry server-poll-timeout resolv-retry remote-cert-tls verify-x509-name tls-version-min tls-cipher tls-ciphersuites verb mute pull-filter proto auth-nocache explicit-exit-notify", w, " ")
+            for (i in w) ok[w[i]] = 1
+        }
+        block != "" {
+            if ($0 == "</" block ">") { print; block = ""; next }
+            if ($0 ~ /^[A-Za-z0-9+\/=]*$/ || $0 ~ /^-----(BEGIN|END) [A-Za-z0-9 ]+-----$/) print
+            next
+        }
+        /^<(ca|cert|key|tls-auth|tls-crypt)>$/ { block = substr($0, 2, length($0) - 2); print; next }
+        { sub(/[#;].*/, "") }
+        NF && ok[$1] && $0 ~ /^[A-Za-z0-9 ._:"-]*$/ { print }
+    ' "$conf"
+    printf '%s\ndev %s\nscript-security 1\n' "$remotes" "$dev"
+} > "$run_conf"
+
+trap 'stop=1; kill $vpn 2>/dev/null' INT HUP TERM
+while [ "$(started "$user_pid")" = "$user_start" ]; do sleep 1; done && kill $$ & watch=$!
+lan4='10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16'
+servers() {
+    awk -v then="$1" '$1 == "remote" && !s[$2]++ { if ($2 ~ /:/) v6 = v6 (v6 ? ", " : "") $2; else v4 = v4 (v4 ? ", " : "") $2 }
+        END { if (v4) print "ip daddr { " v4 " } " then; if (v6) print "ip6 daddr { " v6 " } " then }' "$run_conf"
+}
+if nft -f - <<EOF
+table inet vpnkill
+delete table inet vpnkill
+table inet vpnkill {
+    chain leaving {
+        type filter hook postrouting priority filter; policy drop;
+        oif lo accept
+        oifname "$dev" accept
+        $(servers accept)
+        meta l4proto { tcp, udp } th dport { 53, 853 } drop
+        ip daddr { $lan4 } accept
+        ip6 daddr { fe80::/10, fc00::/7 } accept
+        ip daddr { 224.0.0.0/4, 255.255.255.255 } accept
+        ip6 daddr ff02::/16 accept
+        udp sport 68 udp dport 67 accept
+        icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+        oifname "virbr*" accept
+    }
+    chain vm_dns { type filter hook forward priority filter; meta l4proto { tcp, udp } th dport { 53, 853 } oifname != "$dev" reject; }
+    chain dns_out { type nat hook output priority dstnat; jump dns; }
+    chain dns_fwd { type nat hook prerouting priority dstnat; jump dns; }
+    chain dns {
+        fib daddr type local return
+        $(servers return)
+        meta l4proto { tcp, udp } th dport 53 dnat ip to 9.9.9.9
+    }
+    chain dns_src { type nat hook postrouting priority srcnat; oifname "$dev" ct status dnat masquerade; }
+}
+EOF
+then
+    if [ -z "$stop" ]; then
+        openvpn --config "$run_conf" 9>&- & vpn=$!
+        [ -z "$stop" ] || kill $vpn
+        while kill -0 $vpn 2>/dev/null; do wait $vpn 2>/dev/null; done
+        if [ -z "$stop" ]; then
+            failed=1
+            say critical "VPN stopped: internet blocked" "openvpn quit (see its window on tag 9). Super+u or Ctrl+C there unblocks."
+            while [ -z "$stop" ] && kill -0 $watch 2>/dev/null; do wait $watch 2>/dev/null; done
+        fi
+    fi
+    trap '' INT HUP TERM
+    if nft delete table inet vpnkill; then
+        say normal "VPN off" "Disconnected."
+    else
+        failed=1
+        say critical "VPN off, but the internet's blocked" "To unblock: sudo nft delete table inet vpnkill"
+    fi
+else
+    failed=1
+    say critical "VPN not started" "The kill switch didn't load, so it didn't connect."
+fi
+kill $watch 2>/dev/null
+rm -f "$run_conf"
+[ -n "$failed" ] && exit 3
+exit 0

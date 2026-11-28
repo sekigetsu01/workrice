@@ -1,0 +1,132 @@
+#!/bin/bash
+# pomo: the pomodoro timer in the bar: work, then a break, in turn (lengths from times.conf: pomo, set with settimes)
+#   pomo starts or pauses (Alt+p) · skip · reset (Alt+Shift+p) · show · status · watch · set WORK [BREAK …] (minutes)
+R=${XDG_RUNTIME_DIR:-/tmp}/pomo
+C=${XDG_CONFIG_HOME:-$HOME/.config}/times.conf
+U=${POMO_UNIT:-60}
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+[ -d "$R" ] || mkdir -p "$R"
+
+load() {
+    IDX=0 RUN=0 PS=0 T=
+    P=()
+    times_load "$C"
+    read -r -a P <<< "${TIMES[pomo]-}"
+    local m ok=()
+    for m in "${P[@]}"; do [[ $m =~ ^[1-9][0-9]*$ ]] && ok+=("$m"); done
+    P=("${ok[@]}"); (( ${#P[@]} )) || P=(40 10)
+    (( ${#P[@]} == 1 )) && P+=(10)
+    N=${#P[@]}
+    (( N % 2 && N > 1 )) && P+=("${P[1]}")
+    [ -f "$R/state" ] && read -r IDX RUN T PS < "$R/state"
+    [ "$PS" = 1 ] || PS=0
+    (( IDX < ${#P[@]} )) || IDX=0
+    [ -n "$T" ] || T=$((P[0] * U))
+    if (( IDX % 2 )); then K='break'; else K='work'; fi
+    NOW=$EPOCHSECONDS
+}
+
+lock() { exec 9>"$R/lock"; flock 9; }
+
+save() {
+    printf '%s %s %s %s\n' "$IDX" "$RUN" "$T" "$PS" > "$R/state.$$" && mv -f "$R/state.$$" "$R/state"
+    local f x
+    for f in "$R"/w.*; do
+        [ -p "$f" ] || continue
+        if kill -0 "${f##*.}" 2>/dev/null; then exec {x}<>"$f"; echo >&"$x"; exec {x}>&-; else rm -f "$f"; fi
+    done
+}
+
+tell() {
+    load
+    local l h n=$(( (IDX + 1) % ${#P[@]} ))
+    if (( RUN )); then l=$((T > NOW ? T - NOW : 0)) h="Pomodoro on"; elif (( PS )); then l=$T h="Pomodoro paused"; else l=$T h="Pomodoro off"; fi
+    notify-send --app-name=pomo -t 3000 "$h" "${K^}: $(printf '%02d:%02d' $((l / 60)) $((l % 60))) left · next: $( ((n % 2)) && echo break || echo work ) ${P[n]} min"
+}
+
+daemon() {
+    local pid a=()
+    [ -f "$R/pid" ] && read -r pid < "$R/pid" && mapfile -d '' -t a < "/proc/$pid/cmdline" 2>/dev/null
+    if [[ ${a[*]: -1} == _run ]]; then kill -USR1 "$pid"
+    elif (( RUN )); then setsid -f "$0" _run >/dev/null 2>&1 9>&-
+    fi
+}
+
+case ${1:-} in
+"")
+    lock; load
+    if (( RUN )); then RUN=0 PS=1 T=$((T > NOW ? T - NOW : 0)); else RUN=1 PS=0 T=$((NOW + T)); fi
+    save; daemon; tell ;;
+skip)
+    lock; load
+    IDX=$(( (IDX + 1) % ${#P[@]} )) T=$((P[IDX] * U))
+    (( RUN )) && T=$((NOW + T))
+    save; daemon; load
+    tell ;;
+reset)
+    lock; load
+    IDX=0 RUN=0 PS=0 T=$((P[0] * U))
+    save; daemon; tell ;;
+set)
+    shift
+    [ $# -gt 0 ] || { load; echo "${P[*]:0:N}"; exit; }
+    for m; do [[ $m =~ ^[1-9][0-9]*$ ]] || { echo "Usage: pomo set WORK [BREAK WORK …] (minutes)" >&2; exit 1; }; done
+    { mkdir -p "${C%/*}" && touch "$C" && awk -v v="$*" '$1 == "pomo" { print "pomo         " v; f = 1; next } 1; END { if (!f) print "pomo         " v }' "$C" 2>/dev/null > "$C.$$" && mv -f "$C.$$" "$C"; } || { rm -f "$C.$$"; echo "pomo: couldn't write $C" >&2; exit 1; }
+    lock; load
+    IDX=0 RUN=0 PS=0 T=$((P[0] * U))
+    save; daemon ;;
+show)
+    tell ;;
+status)
+    load
+    if (( RUN )); then l=$((T > NOW ? T - NOW : 0)) s=running; elif (( PS )); then l=$T s=paused; else l=$T s=off; fi
+    printf '%s %02d:%02d (%s) · phases: %s\n' "$K" $((l / 60)) $((l % 60)) "$s" "${P[*]:0:N}" ;;
+watch)
+    f=$R/w.$BASHPID
+    mkfifo "$f" || exit 1
+    exec {w}<>"$f"
+    trap 'rm -f "$f"' EXIT
+    while :; do
+        load
+        if (( RUN )); then
+            l=$((T > NOW ? T - NOW : 0))
+            printf '{"text":"󰔟","class":"%s","tooltip":"Pomodoro on · %s %d:%02d left"}\n' "$K" "$K" $((l / 60)) $((l % 60)) || exit
+        elif (( PS )); then
+            printf '{"text":"󰔟","class":"paused","tooltip":"Paused · %s %d:%02d left"}\n' "$K" $((T / 60)) $((T % 60)) || exit
+        else
+            printf '{"text":"","class":"off"}\n' || exit
+        fi
+        if (( RUN )); then read -r -t 2 -u "$w" _; else read -r -u "$w" _; fi
+    done ;;
+_run)
+    exec 8>"$R/run.lock"
+    flock 8
+    echo $$ > "$R/pid"
+    woke=0 sp=
+    trap 'woke=1; [ -n "$sp" ] && kill "$sp" 2>/dev/null' USR1
+    while :; do
+        woke=0
+        lock; load
+        if (( ! RUN )); then rm -f "$R/pid"; exit 0; fi
+        left=$((T - NOW))
+        if (( left <= 0 )); then
+            was=$K
+            IDX=$(( (IDX + 1) % ${#P[@]} )) left=$((P[IDX] * U))
+            T=$((NOW + left))
+            save; load
+            if [ "$K" = break ]; then
+                notify-send --app-name=pomo --urgency=critical "Break: ${P[IDX]} min" "Work done."
+            else
+                notify-send --app-name=pomo --urgency=critical "Work: ${P[IDX]} min" "${was^} over."
+            fi
+        fi
+        exec 9>&-
+        sleep "$(( left < 30 ? left : 30 ))" 8>&- & sp=$!
+        (( woke )) || wait "$sp"
+        kill "$sp" 2>/dev/null
+    done ;;
+*)
+    echo "Usage: pomo [skip|reset|show|status|watch|set MIN…]" >&2
+    exit 1 ;;
+esac

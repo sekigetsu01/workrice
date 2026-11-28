@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# ud: publish folders in ~/github to GitHub, each as one fresh commit (its old history is replaced), after a
+# secret scan. Pick several with Tab, or name them: ud workrice SWAI
+set -uo pipefail
+
+GITHUB_DIR="$HOME/github"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ud"
+NAME_FILE="$STATE_DIR/usernames"
+REPO_FILE="$STATE_DIR/repos"
+mkdir -p "$STATE_DIR" "$GITHUB_DIR"
+touch "$NAME_FILE" "$REPO_FILE"
+
+B=$'\e[1m' G=$'\e[32m' R=$'\e[31m' Y=$'\e[33m' N=$'\e[0m'
+say() { printf '%s\n' "$*"; }
+askno() { local a; read -r -p "$1 [y/N] " a; [[ $a == [yY]* ]]; }
+hold() { [ -n "${YAZI_ID:-}" ] && { printf '\nPress Enter to go back. '; read -r _; }; }
+trap hold EXIT
+
+case ${1:-} in
+    -h|--help)
+        cat <<'EOF'
+ud              pick folders in ~/github (j/k move, Space ticks, a ticks all, Enter publishes; u: your GitHub username)
+ud NAME…        publish those folders (names, or their paths: U in yazi publishes the selected ones)
+Each goes to github.com/YOU/NAME as one fresh commit, replacing what's there (the repo must exist on GitHub).
+YOU is the GitHub username you typed (asked the first time; u in the list changes it). gcl uses it too.
+EOF
+        exit 0 ;;
+esac
+
+ask_name() {
+    local n cur
+    cur=$(head -n1 "$NAME_FILE")
+    while :; do
+        read -r -e -i "$cur" -p "Your GitHub username: " n || exit 130
+        n=${n//[[:space:]]/}
+        [[ -z $n ]] && { [[ -n $cur ]] && return 0; exit 130; }
+        [[ $n =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$ ]] && break
+        say "${R}A GitHub username is letters, numbers and hyphens (up to 39).${N}"
+    done
+    printf '%s\n' "$n" > "$NAME_FILE"
+}
+[[ -s $NAME_FILE ]] || ask_name
+
+mapfile -t KNOWN < <(
+    { tac "$REPO_FILE"; for d in "$GITHUB_DIR"/*/; do [[ -d $d ]] && { d=${d%/}; printf '%s\n' "${d##*/}"; }; done; } |
+        awk 'NF && !seen[$0]++' | while IFS= read -r r; do [[ -d $GITHUB_DIR/$r ]] && printf '%s\n' "$r"; done
+)
+if (( $# )); then
+    REPOS=()
+    for a; do
+        a=${a%/}
+        if [[ $a == */* ]]; then
+            [[ $(realpath -m -- "$a/..") == "$(realpath -m -- "$GITHUB_DIR")" ]] ||
+                { say "${R}$a isn't a folder in $GITHUB_DIR.${N}"; exit 1; }
+            a=${a##*/}
+        fi
+        REPOS+=("$a")
+    done
+else
+    (( ${#KNOWN[@]} )) || { say "No folders in $GITHUB_DIR to publish."; exit 1; }
+    keys="ticked (✓ = yes) · j/k move · Space ticks or unticks · a all · Enter publishes · u username · q cancels"
+    # shellcheck disable=SC2016
+    hdr='transform-header[printf "Publish which folders? (to github.com/%s)\n%s of %s %s" "$UD_NAME" "$FZF_SELECT_COUNT" "$FZF_TOTAL_COUNT" "$UD_KEYS"]'
+    # shellcheck disable=SC2016
+    all='transform([ "$FZF_SELECT_COUNT" -eq "$FZF_TOTAL_COUNT" ] && echo deselect-all || echo select-all)'
+    while :; do
+        name=$(head -n1 "$NAME_FILE")
+        mapfile -t out < <(printf '%s\n' "${KNOWN[@]}" | UD_KEYS=$keys UD_NAME=$name \
+            fzf --multi --no-input --marker='✓ ' --pointer='▶' --highlight-line --height=~50% --reverse --expect=u \
+                --color='bg+:8,fg+:15:bold,pointer:4,marker:green:bold,selected-fg:green:bold' \
+                --header="Publish which folders? (to github.com/$name)"$'\n'"0 of ${#KNOWN[@]} $keys" \
+                --bind "space:toggle+down+$hdr,tab:toggle+down+$hdr,btab:toggle+up+$hdr,a:$all+$hdr" \
+                --bind 'j:down,k:up,g:first,G:last,q:abort')
+        (( ${#out[@]} )) || { say "Cancelled."; exit 130; }
+        [[ ${out[0]} == u ]] && { ask_name; continue; }
+        REPOS=("${out[@]:1}")
+        break
+    done
+    (( ${#REPOS[@]} )) || { say "Cancelled."; exit 130; }
+fi
+for r in "${REPOS[@]}"; do
+    if [[ ! $r =~ ^[A-Za-z0-9._-]+$ || $r == . || $r == .. ]]; then say "${R}'$r' isn't a valid repo name.${N}"; exit 1; fi
+    [[ -d $GITHUB_DIR/$r ]] || { say "${R}There's no folder $GITHUB_DIR/$r.${N}"; exit 1; }
+done
+
+CTL=$(mktemp -u "${XDG_RUNTIME_DIR:-/tmp}/ud-ssh.XXXXXX")
+export GIT_SSH_COMMAND="ssh -o ControlMaster=auto -o ControlPath=$CTL -o ControlPersist=300"
+trap 'ssh -o ControlPath="$CTL" -O exit git@github.com >/dev/null 2>&1; hold' EXIT
+ssh-add -l >/dev/null 2>&1
+[[ $? == 1 ]] && ssh-add -q
+hello=$($GIT_SSH_COMMAND -T git@github.com 2>&1)
+if ! grep -q '^Hi [^!]*!' <<< "$hello"; then
+    say "${R}Couldn't sign in to GitHub:${N} $hello"
+    say "Is your SSH key (~/.ssh/id_ed25519.pub) added on GitHub, and are you online?"
+    exit 1
+fi
+GH_NAME=$(head -n1 "$NAME_FILE")
+
+say ""
+say "Publish to ${B}github.com/$GH_NAME${N}, each as one fresh commit (what's on GitHub is replaced):"
+for r in "${REPOS[@]}"; do
+    n=$(cd "$GITHUB_DIR/$r" && find . -name .git -prune -o -type f -print | wc -l)
+    say "  ${B}$r${N}  ($n files)"
+done
+
+OK=() FAILED=()
+publish() {
+    local r=$1 path=$GITHUB_DIR/$1 remote="git@github.com:$GH_NAME/$1.git" probe nested d g scan other
+    say ""
+    say "${B}── $r${N}"
+    nested=""
+    probe=$(mktemp -d "$GITHUB_DIR/.$r.git.XXXXXX")
+    git -C "$path" --git-dir="$probe" --work-tree=. init --quiet
+    [[ -f $path/.git/info/exclude ]] && { mkdir -p "$probe/info"; cp -f -- "$path/.git/info/exclude" "$probe/info/exclude"; }
+    while IFS= read -r d; do
+        g="$path/$d/.git"
+        [[ -f $g || -e $g/HEAD ]] || continue
+        git -C "$path" --git-dir="$probe" --work-tree=. check-ignore -q "$d" || nested+="    $d"$'\n'
+    done < <(cd "$path" && find . -path ./.git -prune -o -name .git -prune -printf '%h\n')
+    if [[ -n $nested ]]; then
+        say "${R}Skipped:${N} these folders inside it are separate git repos (move them out or git-ignore them):"
+        printf '%s' "$nested"
+        rm -rf "$probe"; FAILED+=("$r (repos inside it)"); return
+    fi
+    local NEW=(git -C "$path" --git-dir="$probe" --work-tree=.)
+    if ! { "${NEW[@]}" add . && "${NEW[@]}" commit --quiet -m "Created"; }; then
+        say "${R}Skipped:${N} nothing to commit (is it empty?)"; rm -rf "$probe"; FAILED+=("$r (empty)"); return
+    fi
+    "${NEW[@]}" branch -M main
+    "${NEW[@]}" remote add origin "$remote"
+
+    if command -v gitleaks >/dev/null; then
+        if gitleaks git --help >/dev/null 2>&1; then scan=(gitleaks git --no-banner --redact --log-level warn -v .)
+        else scan=(gitleaks detect --no-banner --redact --log-level warn -v --source .); fi
+        if (cd "$path" && GIT_DIR=$probe GIT_WORK_TREE=. "${scan[@]}" >"$probe/leaks" 2>&1); then
+            say "no secrets found"
+        else
+            cat "$probe/leaks"
+            say "${Y}gitleaks found what looks like a secret (above).${N} Nothing is pushed yet."
+            askno "Push $r anyway?" || { rm -rf "$probe"; FAILED+=("$r (secret found)"); return; }
+        fi
+    else
+        say "${Y}(gitleaks isn't installed: no secret scan)${N}"
+    fi
+
+    say "pushing…"
+    if ! "${NEW[@]}" push --quiet -f -u origin main; then
+        say "${R}The push failed (above).${N} If the repo doesn't exist yet, make it on GitHub (github.com/new), then run ud again."
+        rm -rf "$probe"; FAILED+=("$r (push failed)"); return
+    fi
+    [[ -e $path/.git ]] && rm -rf "$path/.git"
+    mv "$probe" "$path/.git"
+    git -C "$path" config --unset core.worktree
+    if [[ $(git -C "$path" ls-remote origin refs/heads/main | cut -f1) != "$(git -C "$path" rev-parse HEAD)" ]]; then
+        say "${R}GitHub's main isn't the commit just pushed.${N} Check github.com/$GH_NAME/$r"
+        FAILED+=("$r (check GitHub)"); return
+    fi
+    other=$(git -C "$path" ls-remote --refs --heads --tags origin | awk '$2 != "refs/heads/main" { sub("refs/(heads|tags)/", "", $2); print $2 }' | paste -sd' ')
+    [[ -n $other ]] && say "${Y}GitHub also still has:${N} $other (old history; delete them there if you want only this commit)"
+    say "${G}published${N}  github.com/$GH_NAME/$r"
+    { grep -vxF -- "$r" "$REPO_FILE"; printf '%s\n' "$r"; } > "$REPO_FILE.tmp" && mv "$REPO_FILE.tmp" "$REPO_FILE"
+    OK+=("$r")
+}
+for r in "${REPOS[@]}"; do publish "$r"; done
+
+say ""
+(( ${#OK[@]} )) && say "${G}Published:${N} ${OK[*]}"
+(( ${#FAILED[@]} )) && { say "${R}Not published:${N} $(printf '%s, ' "${FAILED[@]}" | sed 's/, $//')"; exit 1; }
+exit 0

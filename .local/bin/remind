@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+# remind: today's reminders (Alt+r): opens them in nvim, one per line, what then when; saving sets each one
+#   remind [edit] · apply · snooze ID [SECS] · done ID (the reminder notification's buttons run snooze and done)
+import fcntl
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time as T
+from datetime import datetime, timedelta
+
+HOME = os.path.expanduser("~")
+STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
+LIST = os.path.join(STATE, "reminders.json")
+SELF = os.path.abspath(__file__)
+RUN = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+SOCK = os.path.join(RUN, "reminders.sock")
+DAY = 86400
+HEADER = "# walk 14:00 · walk 30s · walk 5m · walk 1h"
+
+UNIT = r"(?:seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)"
+DUR = r"(?:\d+(?:\.\d+)?\s*%s(?![a-z])[\s,]*(?:and\s+)?)+" % UNIT
+DUR_PART = re.compile(r"(\d+(?:\.\d+)?)\s*([a-z])", re.I)
+SECS = {"s": 1, "m": 60, "h": 3600}
+CLOCK = r"(\d{1,2})(?:[:.](\d{2}))?(?::(\d{2}))?\s*(am|pm)?"
+TOMORROW = r"(?P<tomorrow>\s+tomorrow)?"
+
+
+class Store:
+
+    def __enter__(self):
+        os.makedirs(STATE, exist_ok=True)
+        self.lock = open(LIST + ".lock", "w")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        try:
+            with open(LIST) as f:
+                d = json.load(f)
+        except OSError:
+            d = {}
+        except ValueError:
+            d = None
+        if not (isinstance(d, dict) and isinstance(d.get("reminders", []), list) and isinstance(d.get("done", []), list)):
+            # unreadable: kept aside (named by the time, so not over an earlier one) instead of being overwritten
+            # with an empty list by the next save
+            os.replace(LIST, LIST + T.strftime(".bad-%Y%m%d-%H%M%S"))
+            d = {}
+        self.rems = [r for r in d.get("reminders", []) if isinstance(r, dict) and "id" in r]
+        now = T.time()
+        self.done = [r for r in d.get("done", []) if isinstance(r, dict) and r.get("due", 0) > now - DAY]
+        self._was = json.dumps(d, sort_keys=True)
+        return self
+
+    def __exit__(self, *exc):
+        if not exc[0]:
+            d = {"reminders": sorted(self.rems, key=lambda r: r["due"]), "done": self.done}
+            if json.dumps(d, sort_keys=True) != self._was:
+                # a new file swapped in whole, so a crash mid-write can't leave the list half written
+                path = os.path.realpath(LIST)
+                tmp = path + ".new"
+                with open(tmp, "w") as f:
+                    f.write(json.dumps(d, ensure_ascii=False, indent=1) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+        self.lock.close()
+
+    def find(self, rid):
+        return next((r for r in self.rems if r["id"] == rid), None)
+
+    def finish(self, rid):
+        r = self.find(rid)
+        if r:
+            self.rems.remove(r)
+            self.done.append({"text": r["text"], "due": r["due"]})
+
+
+def parse(line, now):
+    s = line.strip()
+    for pat, kind in ((r"^(.+?)\s+(?:in\s+)?(%s)$" % DUR, "dur"), (r"^(?:in\s+)?(%s)\s*(.+)$" % DUR, "dur<"),
+                      (r"^(.+?)\s+(?:at\s+)?%s%s$" % (CLOCK, TOMORROW), "clock"),
+                      (r"^(?:at\s+)?%s%s\s+(.+)$" % (CLOCK, TOMORROW), "clock<")):
+        m = re.match(pat, s, re.I)
+        if not m:
+            continue
+        g = m.groups()
+        if kind.startswith("dur"):
+            text, dur = (g[0], g[1]) if kind == "dur" else (g[-1], g[0])
+            secs = sum(float(n) * SECS[u.lower()] for n, u in DUR_PART.findall(dur))
+            if secs <= 0:
+                raise ValueError("a time of 0")
+            if secs >= DAY:
+                raise ValueError("24 hours or more away: add it under Agenda (Alt+a)")
+            return text.strip(), round(now + secs)
+        text, (h, mi, sec, ap) = (g[0], g[1:5]) if kind == "clock" else (g[-1], g[0:4])
+        if mi is None and not ap:
+            continue
+        h, mi, sec = int(h), int(mi or 0), int(sec or 0)
+        if ap:
+            if not 1 <= h <= 12:
+                raise ValueError("%s isn't a time" % m.group(0).split()[-1])
+            h = h % 12 + (12 if ap.lower() == "pm" else 0)
+        if h > 23 or mi > 59 or sec > 59:
+            raise ValueError("that isn't a time")
+        when = datetime.fromtimestamp(now).replace(hour=h, minute=mi, second=sec, microsecond=0)
+        if m.group("tomorrow"):
+            when += timedelta(days=1)
+            if when.timestamp() - now >= DAY:
+                raise ValueError("24 hours or more away: add it under Agenda (Alt+a)")
+        if when.timestamp() <= now:
+            raise ValueError("%s has passed: reminders are for today only" % clock(when.timestamp(), now))
+        return text.strip(), when.timestamp()
+    raise ValueError("no time: add one, like 14:00 or 5 min")
+
+
+def clock(due, now):
+    d = datetime.fromtimestamp(due)
+    s = d.strftime("%H:%M:%S" if d.second else "%H:%M")
+    return s + (" tomorrow" if d.date() > datetime.fromtimestamp(now).date() else "")
+
+
+def listing(rems, now):
+    return [HEADER] + ["%s %s" % (r["text"], clock(r["due"], now)) for r in rems if r["due"] > now]
+
+
+def cmd_apply(args):
+    drop = args[args.index("--drop") + 1] if "--drop" in args else None
+    now = T.time()
+    lines = sys.stdin.read().split("\n")
+    with Store() as st:
+        keep, want, bad, errs = [], [], [], []
+        for line in lines:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            try:
+                text, due = parse(line, now)
+            except ValueError as e:
+                if any("%s %s" % (r["text"], clock(r["due"], r["due"] - 1)) == line.strip() for r in st.done):
+                    continue
+                # a line left as it was listed (its "tomorrow" or its time now stale, after midnight or once it's
+                # come due): that reminder stays as it is
+                plain = re.sub(r"\s+tomorrow$", "", line.strip())
+                same = next((r for r in st.rems if "%s %s" % (r["text"], clock(r["due"], r["due"])) == plain), None)
+                if same:
+                    if same["due"] > now:
+                        want.append((same["text"], same["due"]))
+                    continue
+                bad.append(line)
+                errs.append("%s: %s" % (line.strip(), e))
+                continue
+            want.append((text, due))
+        # a snoozed one (Snooze…) is replaced only once its new time is set; without one it comes back
+        if drop and not errs:
+            st.finish(drop)
+        pending = [r for r in st.rems if r["due"] > now]
+        for text, due in want:
+            r = next((r for r in pending if r["text"] == text and abs(r["due"] - due) < 1), None)
+            if r:
+                pending.remove(r)
+                keep.append(r)
+            else:
+                keep.append({"id": secrets.token_hex(4), "text": text, "due": due})
+        st.rems = [r for r in st.rems if r["due"] <= now] + keep
+        rems = sorted(keep, key=lambda r: r["due"])
+    sys.stdout.write("\n".join(listing(rems, now) + bad) + "\n")
+    if errs:
+        sys.stderr.write("\n".join(errs) + "\n")
+
+
+def window():
+    try:
+        got = subprocess.run(["mmsg", "get", "all-clients"], capture_output=True, text=True, timeout=3).stdout
+        cs = json.loads(got).get("clients", [])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return next(((c["id"], bool(c.get("is_focused"))) for c in cs if c.get("appid") == "reminders"), None)
+
+
+def save_quit():
+    try:
+        subprocess.run(["nvim", "--headless", "--clean", "--server", SOCK, "--remote-expr", "v:lua.SaveQuit()"],
+                       capture_output=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return
+    for _ in range(100):
+        if not os.path.exists(SOCK):
+            break
+        T.sleep(0.02)
+
+
+def cmd_edit(args):
+    again = args[args.index("--again") + 1] if "--again" in args else None
+    w = window()
+    if w and not again:
+        if w[1]:
+            save_quit()
+        else:
+            subprocess.run([os.path.join(HOME, ".config/mango/scripts/mm"), "bring", str(w[0])])
+        return
+    if w:
+        save_quit()
+    lock = open(os.path.join(RUN, "reminders.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    if os.path.exists(SOCK) and not window():
+        os.remove(SOCK)
+    now = T.time()
+    with Store() as st:
+        rems = [r for r in st.rems if r["due"] > now]
+        r = st.find(again) if again else None
+    lines = listing(rems, now)
+    extra = [r["text"] + " "] if r else []
+    path = os.path.join(RUN, "reminders")
+    with open(path, "w") as f:
+        f.write("\n".join(lines + extra) + "\n")
+    drop = (", '--drop', [[%s]]" % again) if r else ""
+    lua = ("+lua vim.api.nvim_create_autocmd('BufWriteCmd', {buffer = 0, callback = function()"
+           " local old = vim.api.nvim_buf_get_lines(0, 0, -1, false)"
+           " local r = vim.system({[[%s]], 'apply'%s}, {stdin = table.concat(old, '\\n') .. '\\n'}):wait()"
+           " if r.code ~= 0 then vim.api.nvim_echo({{'remind: ' .. (r.stderr or ''), 'ErrorMsg'}}, true, {}) return end"
+           " local new = vim.split((r.stdout:gsub('\\n$', '')), '\\n')"
+           " if not vim.deep_equal(new, old) then local v = vim.fn.winsaveview()"
+           " vim.api.nvim_buf_set_lines(0, 0, -1, false, new) vim.fn.winrestview(v) end"
+           " local err = (r.stderr or ''):gsub('\\n$', '')"
+           " if err ~= '' then vim.api.nvim_echo({{err, 'ErrorMsg'}}, true, {}) else vim.bo.modified = false end"
+           " end})") % (SELF, drop)
+    kitty = os.path.join(HOME, ".local/bin/kitty")
+    cmd = [kitty, "--class=reminders", "nvim", "--listen", SOCK, lua]
+    n = len(lines) + len(extra)
+    if extra:
+        cmd += ["+%d" % n, "+startinsert!"]
+    else:
+        cmd += ["+call append(%d, '')" % n, "+%d" % (n + 1), "+set nomodified", "+startinsert"]
+    subprocess.run(cmd + [path])
+    if again:
+        with Store() as st:
+            r = st.find(again)
+            if r and r["due"] <= T.time():
+                r["due"] = T.time()
+
+
+def cmd_snooze(args):
+    if not args:
+        sys.exit("usage: remind snooze ID [SECS]")
+    secs = float(args[1]) if len(args) > 1 else 300
+    with Store() as st:
+        r = st.find(args[0])
+        if r:
+            r["due"] = round(T.time() + secs)
+
+
+def cmd_done(args):
+    if not args:
+        sys.exit("usage: remind done ID")
+    with Store() as st:
+        st.finish(args[0])
+
+
+CMDS = {"edit": cmd_edit, "apply": cmd_apply, "snooze": cmd_snooze, "done": cmd_done}
+
+if __name__ == "__main__":
+    a = sys.argv[1:] or ["edit"]
+    if a[0] not in CMDS:
+        sys.exit("usage: remind [edit] | apply | snooze ID [SECS] | done ID")
+    CMDS[a[0]](a[1:])

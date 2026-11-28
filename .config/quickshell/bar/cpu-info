@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+# CPU details in a terminal (a click on CPU in the bar): use per thread, the busiest processes, temperature and
+# speed, updated every 2 s. q closes.
+import os, re, select, shutil, subprocess, sys, termios, time, tty
+
+CLK = os.sysconf("SC_CLK_TCK")
+REFRESH = 2.0
+B, D, R = "\033[1m", "\033[2m", "\033[0m"
+ACC, OK, WARN, HOT = "\033[34m", "\033[32m", "\033[33m", "\033[31m"
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+def static_info():
+    info = {"model": "", "arch": os.uname().machine}
+    for line in read("/proc/cpuinfo").splitlines():
+        k, _, v = line.partition(":")
+        k = k.strip()
+        if k in ("model name", "Hardware", "Model") and not info["model"]:
+            info["model"] = " ".join(v.split())
+    cpus = sorted(int(m.group(1)) for d in os.listdir("/sys/devices/system/cpu")
+                  if (m := re.fullmatch(r"cpu(\d+)", d)))
+    online = [c for c in cpus if read(f"/sys/devices/system/cpu/cpu{c}/online", "1") == "1"]
+    cores, sockets = set(), set()
+    for c in online:
+        t = f"/sys/devices/system/cpu/cpu{c}/topology"
+        pkg, core = read(f"{t}/physical_package_id", "0"), read(f"{t}/core_id", str(c))
+        sockets.add(pkg)
+        cores.add((pkg, core))
+    info.update(threads=len(online), cores=len(cores) or len(online),
+                sockets=len(sockets) or 1, cpus=online)
+    c0 = f"/sys/devices/system/cpu/cpu{online[0] if online else 0}/cpufreq"
+    lo, hi = read(f"{c0}/cpuinfo_min_freq"), read(f"{c0}/cpuinfo_max_freq")
+    info["fmin"] = int(lo) / 1e6 if lo.isdigit() else None
+    info["fmax"] = int(hi) / 1e6 if hi.isdigit() else None
+    cache = []
+    try:
+        out = subprocess.run(["lscpu"], capture_output=True, text=True,
+                             env={**os.environ, "LC_ALL": "C"}).stdout
+        for line in out.splitlines():
+            m = re.match(r"\s*(L\d\w?) cache:\s*([\d.]+ \w+)", line)
+            if m:
+                cache.append(f"{m.group(1)} {m.group(2)}")
+            if not info["model"] and line.startswith("Model name:"):
+                info["model"] = line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    info["cache"] = " · ".join(cache)
+    info["sensor"] = temp_sensor()
+    return info
+
+def cpu_times():
+    out = {}
+    for line in read("/proc/stat").splitlines():
+        if not line.startswith("cpu"):
+            break
+        name, *vals = line.split()
+        v = list(map(int, vals[:8]))
+        idle = v[3] + v[4]
+        out[name] = (sum(v) - idle, sum(v))
+    return out
+
+_names = {}
+
+def proc_times():
+    global _names
+    out, names = {}, {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        stat = read(f"/proc/{pid}/stat")
+        if not stat:
+            continue
+        comm = stat[stat.find("(") + 1:stat.rfind(")")]
+        fields = stat[stat.rfind(")") + 2:].split()
+        try:
+            jif = int(fields[11]) + int(fields[12])
+        except (IndexError, ValueError):
+            continue
+        name = _names.get((pid, comm))
+        if name is None:
+            cmd = read(f"/proc/{pid}/cmdline").split("\0")[0].split()
+            name = os.path.basename(cmd[0]) if cmd else ""
+            if not name or len(name) > 30:
+                name = comm
+        names[pid, comm] = name
+        out[pid] = (name, jif)
+    _names = names
+    return out
+
+def temp_sensor():
+    best = None
+    hw = "/sys/class/hwmon"
+    for h in sorted(os.listdir(hw)) if os.path.isdir(hw) else []:
+        base = f"{hw}/{h}"
+        if read(f"{base}/name") not in ("k10temp", "zenpower", "coretemp", "cpu_thermal", "acpitz"):
+            continue
+        for f in sorted(os.listdir(base)):
+            if not re.fullmatch(r"temp\d+_input", f) or not read(f"{base}/{f}").lstrip("-").isdigit():
+                continue
+            if read(f"{base}/{f.replace('_input', '_label')}").startswith(("Tctl", "Tdie", "Package")):
+                return f"{base}/{f}"
+            best = best or f"{base}/{f}"
+    return best
+
+def temperature(sensor):
+    val = read(sensor) if sensor else ""
+    return int(val) / 1000 if val.lstrip("-").isdigit() else None
+
+def freqs(cpus):
+    out = {}
+    for c in cpus:
+        v = read(f"/sys/devices/system/cpu/cpu{c}/cpufreq/scaling_cur_freq")
+        if v.isdigit():
+            out[c] = int(v) / 1e6
+    return out
+
+def colour(p):
+    return HOT if p >= 85 else WARN if p >= 50 else OK
+
+def bar(p, width):
+    full = round(p / 100 * width)
+    return colour(p) + "█" * full + R + D + "░" * (width - full) + R
+
+def uptime():
+    s = int(float(read("/proc/uptime", "0").split()[0]))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m = s // 60
+    return (f"{d}d " if d else "") + f"{h}h {m}m"
+
+def draw(info, usage, per, procs_now, procs_total, temp, fq):
+    cols, rows = shutil.get_terminal_size((100, 40))
+    out = []
+    w = out.append
+    w(f" {B}{ACC}{info['model'] or 'CPU'}{R}")
+    w(f" {info['cores']} cores · {info['threads']} threads"
+      + (f" · {info['sockets']} sockets" if info["sockets"] > 1 else "") + f" · {info['arch']}")
+    speed = []
+    if fq:
+        speed.append(f"now {sum(fq.values()) / len(fq):.2f} GHz (fastest thread {max(fq.values()):.2f})")
+    if info["fmin"] and info["fmax"]:
+        speed.append(f"range {info['fmin']:.2f}–{info['fmax']:.2f} GHz")
+    gov = read(f"/sys/devices/system/cpu/cpu{info['cpus'][0]}/cpufreq/scaling_governor")
+    if gov:
+        speed.append(f"governor {gov}")
+    if speed:
+        w(f" {D}Speed{R}   " + " · ".join(speed))
+    if temp is not None:
+        tc = HOT if temp >= 85 else WARN if temp >= 70 else OK
+        w(f" {D}Temp{R}    {tc}{temp:.0f}°C{R}")
+    if info["cache"]:
+        w(f" {D}Cache{R}   {info['cache']}")
+    la = read("/proc/loadavg").split()[:3]
+    w(f" {D}Load{R}    {' '.join(la)}  {D}(1, 5, 15 min; {info['threads']} = every thread busy){R}")
+    w(f" {D}Uptime{R}  {uptime()}")
+    w("")
+
+    bw = max(10, min(40, cols - 20))
+    w(f" {B}Usage{R}   {colour(usage)}{B}{usage:3.0f}%{R}  {bar(usage, bw)}")
+    w("")
+
+    cell = 26
+    ncol = max(1, (cols - 1) // cell)
+    items = list(per.items())
+    nrow = (len(items) + ncol - 1) // ncol
+    for r in range(nrow):
+        line = ""
+        for c in range(ncol):
+            i = c * nrow + r
+            if i >= len(items):
+                break
+            cpu, p = items[i]
+            f = fq.get(cpu)
+            line += f" {D}{cpu:>3}{R} {bar(p, 8)} {p:3.0f}%" + (f" {D}{f:.1f}G{R}" if f else "     ")
+        w(line)
+    w("")
+
+    left = rows - len(out) - 3
+    n = max(3, min(10, left // 2))
+    w(f" {B}Using it now{R}  {D}(% of the whole CPU){R}")
+    for name, (p, count) in procs_now[:n]:
+        many = f" {D}×{count}{R}" if count > 1 else ""
+        w(f"   {colour(p * 2)}{p:5.1f}%{R}  {name}{many}")
+    if not procs_now:
+        w(f"   {D}nothing{R}")
+    w("")
+    w(f" {B}Most CPU time{R}  {D}(programs still running, since they started){R}")
+    for name, (secs, count) in procs_total[:n]:
+        h, m = divmod(int(secs) // 60, 60)
+        t = f"{h}h {m:02d}m" if h else f"{m}m {int(secs) % 60:02d}s"
+        many = f" {D}×{count}{R}" if count > 1 else ""
+        w(f"   {t:>8}  {name}{many}")
+
+    out = out[:rows - 1]
+    w_ = "\033[H" + "\n".join(l + "\033[K" for l in out) + "\033[J"
+    w_ += f"\033[{rows};2H{D}q close · updates every {REFRESH:g}s{R}"
+    sys.stdout.write(w_)
+    sys.stdout.flush()
+
+def main():
+    info = static_info()
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd) if os.isatty(fd) else None
+    if old:
+        tty.setcbreak(fd)
+    sys.stdout.write("\033[?1049h\033[?25l")
+    try:
+        prev_cpu, prev_proc, prev_t = cpu_times(), proc_times(), time.monotonic()
+        wait = 0.5
+        while True:
+            r, _, _ = select.select([sys.stdin], [], [], wait)
+            if r:
+                k = os.read(fd, 16)
+                if k in (b"", b"\x1b") or k[:1] in (b"q", b"Q", b"\x03"):  # Esc on its own: arrows start with it too
+                    break
+                continue
+            wait = REFRESH
+            cur_cpu, cur_proc, now = cpu_times(), proc_times(), time.monotonic()
+            dt = now - prev_t
+
+            def pct(name):
+                b0, t0 = prev_cpu.get(name, (0, 0))
+                b1, t1 = cur_cpu.get(name, (0, 0))
+                return 100 * (b1 - b0) / (t1 - t0) if t1 > t0 else 0.0
+
+            usage = pct("cpu")
+            per = {c: pct(f"cpu{c}") for c in info["cpus"]}
+
+            now_g, tot_g = {}, {}
+            for pid, (name, jif) in cur_proc.items():
+                p = 0.0
+                if pid in prev_proc and prev_proc[pid][0] == name:
+                    p = (jif - prev_proc[pid][1]) / CLK / dt * 100 / max(1, info["threads"])
+                a = now_g.setdefault(name, [0.0, 0])
+                a[0] += p
+                a[1] += 1
+                t = tot_g.setdefault(name, [0.0, 0])
+                t[0] += jif / CLK
+                t[1] += 1
+            procs_now = sorted(((n, v) for n, v in now_g.items() if v[0] >= 0.05),
+                               key=lambda x: -x[1][0])
+            procs_total = sorted(tot_g.items(), key=lambda x: -x[1][0])
+
+            draw(info, usage, per, procs_now, procs_total, temperature(info["sensor"]), freqs(info["cpus"]))
+            prev_cpu, prev_proc, prev_t = cur_cpu, cur_proc, now
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+        if old:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+main()

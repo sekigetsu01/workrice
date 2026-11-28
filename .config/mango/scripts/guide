@@ -1,0 +1,14 @@
+#!/bin/sh
+# SUPER+F9: open the guide to this system (kept in ~/Documents) in sioyek
+# guide build: remake System Guide.pdf from its source, ~/Documents/.system-guide/guide.md
+d=$HOME/Documents
+if [ "${1:-}" = build ]; then
+    exec uv run -q --no-project --with reportlab python -I "$d/.system-guide/build.py"
+fi
+f="$d/System Guide.pdf"
+[ -f "$f" ] || f=$(find "$d" -maxdepth 1 -iname '*guide*.pdf' 2>/dev/null | head -n 1)
+if [ -n "$f" ] && [ -f "$f" ]; then
+    command -v sioyek >/dev/null && exec sioyek --new-window "$f"
+    exec xdg-open "$f"
+fi
+notify-send --app-name=Guide "No guide found" "Put System Guide.pdf in ~/Documents (or run: ~/.config/mango/scripts/guide build)"

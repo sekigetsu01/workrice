@@ -1,0 +1,11 @@
+#!/bin/bash
+# raise APPID CMD…: the app's window comes to the tag you're on (mm bring) if it's open, else CMD starts it
+app=$1
+shift
+id=$(mmsg get all-clients 2>/dev/null | python3 -I -c 'import json, sys
+for c in json.load(sys.stdin).get("clients", []):
+    if (c.get("appid") or "").lower() == sys.argv[1]:
+        print(c["id"])
+        break' "${app,,}")
+if [ -n "$id" ]; then exec ~/.config/mango/scripts/mm bring "$id"; fi
+exec "$@"

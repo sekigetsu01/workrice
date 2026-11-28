@@ -1,0 +1,10 @@
+#!/bin/sh
+# mpv for ani-cli: →, l or k skip the opening/ending
+for a; do
+    shift
+    case $a in
+        --script-opts=*) a=$(printf '%s' "$a" | sed -E 's/(^--script-opts=|,)skip-/\1aniskip-/g') ;;
+    esac
+    set -- "$@" "$a"
+done
+exec mpv "$@"

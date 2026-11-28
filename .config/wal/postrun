@@ -1,0 +1,30 @@
+#!/bin/bash
+# Run by wallpaper after pywal makes the new colours: the open kitty windows, nvim, sioyek, swayimg, btop and Glide
+# (pywalfox) take them straight away, and btop and yazi get their theme files linked
+c=${XDG_CACHE_HOME:-$HOME/.cache}/wal
+d=${XDG_CONFIG_HOME:-$HOME/.config}
+mkdir -p "$d/btop/themes" "$d/yazi"
+ln -sf "$c/btop.theme" "$d/btop/themes/pywal.theme"
+ln -sf "$c/yazi-theme.toml" "$d/yazi/theme.toml"
+
+for sock in "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/kitty-*; do
+    [ -S "$sock" ] && timeout 3 /usr/bin/kitty @ --to "unix:$sock" set-colors --all --configured "$c/kitty-colors.conf" >/dev/null 2>&1 &
+done
+
+for sock in "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/nvim.*.0; do
+    [ -S "$sock" ] && timeout 3 nvim --server "$sock" --remote-expr 'execute("call WalReload()")' >/dev/null 2>&1 &
+done
+
+if pgrep -x sioyek >/dev/null; then
+    touch -c -- "$d/sioyek/prefs_user.config"
+    { sleep 1; timeout 3 sioyek --execute-command _labels --nofocus >/dev/null 2>&1; } &
+fi
+
+pkill -USR1 -x swayimg 2>/dev/null
+
+pkill -USR2 -x btop 2>/dev/null
+
+python3 -I "$d/wal/vesktop-theme" 2>/dev/null &
+
+timeout 5 pywalfox update >/dev/null 2>&1 &
+wait

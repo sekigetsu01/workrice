@@ -1,0 +1,7 @@
+[Unit]
+Description=Switch between day and night wallpapers
+
+[Service]
+Type=oneshot
+ExecCondition=/bin/sh -c 'test -S "$${XDG_RUNTIME_DIR}/$${WAYLAND_DISPLAY:-none}"'
+ExecStart=%h/.local/bin/wallpaper --last

@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# lk: encrypted (LUKS) drives. Sets one up, mounts it, unmounts it (lk -h)
+# Drives are remembered in ~/.config/lk/drives; the disks the system runs from are never offered.
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+lk: encrypted (LUKS) drives
+  lk setup    (lk s)  erase a drive and make it one encrypted ext4 partition that's yours
+  lk mount    (lk m)  unlock and mount a drive
+  lk unmount  (lk u)  unmount and lock a drive (says what's keeping it busy)
+  lk -h               this help
+
+setup asks everything first (the drive, its name and mount point, whether to overwrite all of it so nothing
+old can be recovered), then one YES, then the passphrase; the rest runs on its own and leaves the drive mounted.
+Known drives are in ~/.config/lk/drives, one per line: UUID<Tab>NAME<Tab>MOUNTPOINT. Edit a line to rename
+or move one, delete it to be asked again. The disks your system runs from are never shown.
+EOF
+}
+
+case ${1:-} in
+    setup | s) ACTION=setup ;;
+    mount | m) ACTION=mount ;;
+    unmount | u) ACTION=unmount ;;
+    -h | --help | help) usage; exit 0 ;;
+    *) usage >&2; exit 1 ;;
+esac
+[[ $# -eq 1 ]] || { usage >&2; exit 1; }
+[[ $EUID -eq 0 ]] || exec sudo --preserve-env=HOME "$0" "$ACTION"
+# sudo often sets HOME to /root regardless; the drives list and common.sh belong to whoever ran lk
+if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    h=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    [[ -n $h && -d $h ]] && HOME=$h
+    unset h
+fi
+
+APP=lk
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+[[ -r $HOME/.local/lib/common.sh ]] && . "$HOME/.local/lib/common.sh"
+declare -F step >/dev/null || step() { printf '\n\e[1m== %s\e[0m\n' "$1"; }
+declare -F warn >/dev/null || warn() { printf '\e[1;33m%s\e[0m\n' "$1"; }
+declare -F say >/dev/null || say() { printf '  %s\n' "$*"; }
+die() { printf '\e[1;31m%s\e[0m\n' "$*" >&2; exit 1; }
+[[ -t 0 ]] || die "lk needs a terminal"
+
+OWNER_UID=${SUDO_UID:-0} OWNER_GID=${SUDO_GID:-0}
+give_back() { [[ $OWNER_UID == 0 ]] || chown -- "$OWNER_UID:$OWNER_GID" "$@" 2>/dev/null || true; }
+
+CONFIG_DIR=$HOME/.config/lk
+DRIVES=$CONFIG_DIR/drives
+DEF_NAME=drive DEF_MOUNT=/mnt/hdd
+[[ -d $CONFIG_DIR ]] && give_back "$CONFIG_DIR" "$CONFIG_DIR"/*
+
+valid_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && $1 != control ]]; }
+valid_mount() {
+    [[ $1 != *[[:cntrl:]]* && $1 != *'/..'* && $1 != *'/./'* ]] || return 1
+    case $1 in /mnt/?* | /media/?* | /run/media/?* | "$HOME"/?*) return 0 ;; esac
+    return 1
+}
+
+declare -A D_NAME=() D_MOUNT=()
+if [[ -f $DRIVES ]]; then
+    while IFS=$'\t' read -r u n m || [[ -n $u ]]; do
+        [[ -z $u || $u == \#* ]] && continue
+        if valid_name "$n" && valid_mount "$m"; then D_NAME[$u]=$n D_MOUNT[$u]=$m
+        else warn "$DRIVES: skipping the line for $u (bad name or mount point)"; fi
+    done < "$DRIVES"
+fi
+
+save_drive() {
+    mkdir -p -- "$CONFIG_DIR" && give_back "$CONFIG_DIR"
+    { awk -F'\t' -v u="$1" '$1 != u' "$DRIVES" 2>/dev/null || true; printf '%s\t%s\t%s\n' "$1" "$2" "$3"; } > "$DRIVES.tmp"
+    mv -f -- "$DRIVES.tmp" "$DRIVES" && give_back "$DRIVES"
+}
+
+TABLE=$(lsblk -lnpo NAME,PKNAME)
+top_of() {
+    local d=$1 p
+    for _ in 1 2 3 4 5 6 7 8; do
+        p=$(awk -v d="$d" '$1 == d && $2 != "" { print $2; exit }' <<< "$TABLE")
+        [[ -n $p ]] || break
+        d=$p
+    done
+    printf '%s\n' "$d"
+}
+declare -A SYS_DISK=() SYS=()
+while IFS= read -r s; do
+    s=${s%%\[*}
+    [[ $s == /dev/* && -b $s ]] || continue
+    s=$(lsblk -dnpo NAME -- "$s" 2>/dev/null) || continue
+    SYS_DISK[$(top_of "$s")]=1
+done < <(
+    for t in / /boot /efi /boot/efi /home /usr /var; do findmnt -nro SOURCE --mountpoint "$t" 2>/dev/null || true; done
+    swapon --show=NAME --noheadings 2>/dev/null || true
+)
+while read -r dev _; do
+    [[ -n ${SYS_DISK[$(top_of "$dev")]:-} ]] && SYS[$dev]=1
+done <<< "$TABLE"
+is_system() { [[ -n ${SYS[$1]:-} ]]; }
+(( ${#SYS_DISK[@]} )) || warn "Couldn't tell which disk the system is on, so nothing is hidden: check what you pick."
+
+pick() {
+    local header=$1 choice n lines=()
+    mapfile -t lines
+    (( ${#lines[@]} )) || return 1
+    if command -v fzf >/dev/null; then
+        choice=$(printf '%s\n' "${lines[@]}" | fzf --no-input --delimiter=$'\t' --with-nth=2 --layout=reverse \
+            --height=~50% --info=hidden --no-sort --pointer='▶' --highlight-line --color='bg+:8,fg+:15:bold,pointer:4' \
+            --header="$header"$'\n'"j/k move · Enter picks · q cancels" \
+            --bind 'j:down,k:up,g:first,G:last,q:abort') || return 1
+    else
+        printf '%s\n' "$header" >&2
+        for n in "${!lines[@]}"; do printf '  %d) %s\n' $((n + 1)) "${lines[n]#*$'\t'}" >&2; done
+        read -rp "Number: " n
+        [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#lines[@]} )) || return 1
+        choice=${lines[n - 1]}
+    fi
+    printf '%s\n' "${choice%%$'\t'*}"
+}
+ask() { local a; read -r -e -i "$3" -p "$2" a || exit 1; printf -v "$1" '%s' "$a"; }
+model() { lsblk -dno MODEL -- "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
+size() { lsblk -dno SIZE -- "$1" 2>/dev/null | tr -d ' '; }
+empty_dir() { [[ ! -e $1 ]] || [[ -d $1 && -z $(find "$1" -mindepth 1 -maxdepth 1 -print -quit) ]]; }
+mount_ok() {
+    local mp=$1
+    valid_mount "$mp" || { warn "$mp: put drives under /mnt, /media or your home folder"; return 1; }
+    ! mountpoint -q -- "$mp" 2>/dev/null || { warn "Something is already mounted at $mp"; return 1; }
+    empty_dir "$mp" || { warn "$mp has files in it, which the drive would hide: use another folder"; return 1; }
+}
+mapper_free() { [[ ! -e /dev/mapper/$1 ]] || { warn "The name $1 is in use by a drive that's open now"; return 1; }; }
+mounted_at() { findmnt -nro TARGET -S "$1" 2>/dev/null || true; }
+free_space() { df -h --output=avail,size -- "$1" | awk 'NR == 2 { print $1 " free of " $2 }'; }
+
+# An unlocked drive whose disk was unplugged without lk u leaves a dead mapping (and often a dead mount)
+# behind: lsblk no longer lists it, but it still holds the name and the mount point. Its link to the
+# disk in /sys no longer leads anywhere, which is how it's told apart from a drive that's still there.
+orphaned() {
+    local dm s n=0
+    dm=$(readlink -f -- "/dev/mapper/$1" 2>/dev/null) || return 1
+    dm=${dm##*/}
+    [[ $dm == dm-* && $(cat "/sys/block/$dm/dm/uuid" 2>/dev/null) == CRYPT-* ]] || return 1
+    for s in "/sys/block/$dm/slaves/"*; do
+        [[ -L $s ]] || continue
+        n=$((n + 1))
+        [[ -e $s ]] && return 1
+    done
+    (( n > 0 ))
+}
+CLEARED=0
+clear_orphans() {
+    local f name t
+    for f in /sys/block/dm-*/dm/name; do
+        [[ -r $f ]] || continue
+        name=$(<"$f")
+        orphaned "$name" || continue
+        warn "$name was unplugged while it was unlocked; clearing what it left behind"
+        while IFS= read -r t; do
+            [[ -n $t ]] || continue
+            umount -l -- "$t" && say "dropped the dead mount at $t"
+        done < <(mounted_at "/dev/mapper/$name" | sort -r)
+        cryptsetup close "$name" 2>/dev/null || dmsetup remove --force "$name" 2>/dev/null ||
+            die "Couldn't remove the dead $name (a reboot clears it)."
+        say "removed the dead $name"
+        CLEARED=$((CLEARED + 1))
+    done
+}
+
+OPENED='' MOUNTED='' DONE=''
+on_exit() {
+    [[ -n $DONE || -z $OPENED ]] && return
+    [[ -n $MOUNTED ]] && umount -- "$MOUNTED" 2>/dev/null
+    cryptsetup close "$OPENED" 2>/dev/null && warn "Stopped: $OPENED is locked again."
+    return 0
+}
+trap on_exit EXIT
+
+case $ACTION in
+
+setup)
+    step "Set up an encrypted drive"
+    lines=()
+    while read -r dev type; do
+        [[ $type == disk && $dev != /dev/zram* ]] || continue
+        is_system "$dev" && continue
+        [[ $(lsblk -dnbo SIZE -- "$dev") -gt 0 ]] || continue
+        what=$(lsblk -nlo FSTYPE,LABEL -- "$dev" | awk 'NF { $1 = $1; printf "%s%s", (n++ ? ", " : ""), $0 }')
+        lines+=("$dev"$'\t'"$(printf '%-14s %7s  %-5s %s' "$dev" "$(size "$dev")" \
+            "$(lsblk -dno TRAN -- "$dev" | tr -d ' ')" "$(model "$dev")")${what:+   ($what)}")
+    done < <(lsblk -dnpo NAME,TYPE)
+    (( ${#lines[@]} )) || die "No drive to set up (the system's own disk isn't offered). Plugged in?"
+    DISK=$(printf '%s\n' "${lines[@]}" | pick "Which drive? Everything on it will be erased (the system's own disk isn't listed)") || die "Nothing picked."
+    { [[ -b $DISK ]] && ! is_system "$DISK"; } || die "Won't touch $DISK."
+    if [[ -n $(lsblk -nlo MOUNTPOINTS -- "$DISK" | tr -d '[:space:]') ]]; then
+        die "Something on $DISK is mounted ($(lsblk -nlo MOUNTPOINTS -- "$DISK" | awk 'NF' | paste -sd ' ')). Unmount it first (lk u)."
+    fi
+    lsblk -nlo TYPE -- "$DISK" | grep -qxE 'crypt|lvm|raid[0-9]*|md' &&
+        die "Part of $DISK is open (an unlocked LUKS volume, LVM or RAID). Close it first (lk u)."
+    echo
+    lsblk -o NAME,SIZE,FSTYPE,LABEL -- "$DISK"
+    echo
+
+    while ask NAME "Name for this drive: " "$DEF_NAME"; do
+        valid_name "$NAME" || { warn "Letters, digits, . _ and - only (starting with a letter or digit)"; continue; }
+        mapper_free "$NAME" && break
+    done
+    while ask MP "Where to mount it: " "$DEF_MOUNT"; do
+        MP=${MP%/}
+        mount_ok "$MP" && break
+    done
+    bytes=$(lsblk -dnbo SIZE -- "$DISK")
+    if [[ $(lsblk -dno ROTA -- "$DISK" | tr -d ' ') == 1 ]]; then speed=150; else speed=400; fi
+    secs=$(( bytes / (speed * 1000000) ))
+    printf -v took '%dh %02dmin' $((secs / 3600)) $((secs % 3600 / 60))
+    ERASE=''
+    read -rp "Also overwrite all of it, so nothing that was on it can be recovered? Slow: about $took. [Y/n] " a
+    [[ $a == [nN]* ]] || ERASE=1
+
+    echo
+    warn "This erases EVERYTHING on $DISK ($(model "$DISK"), $(size "$DISK"))."
+    read -rp "Type YES to go ahead: " a
+    [[ $a == YES ]] || die "Stopped; nothing was changed."
+
+    echo "Choose the drive's passphrase (you'll type it each time you mount the drive)."
+    while :; do
+        IFS= read -rsp "Passphrase: " PW; echo
+        [[ -n $PW ]] || { warn "It can't be empty"; continue; }
+        (( ${#PW} >= 8 )) || warn "(short: anyone holding the drive could guess it)"
+        IFS= read -rsp "Again: " a; echo
+        [[ $PW == "$a" ]] && break
+        warn "They don't match, once more"
+    done
+    unset a
+
+    step "Partitioning $DISK"
+    for p in $(lsblk -lnpo NAME -- "$DISK" | tac); do wipefs -aq -- "$p"; done
+    sgdisk --zap-all "$DISK" >/dev/null
+    sgdisk -n 1:0:0 -t 1:8309 -c "1:$NAME" "$DISK" >/dev/null
+    partx -u -- "$DISK" 2>/dev/null || true
+    udevadm settle
+    PART=''
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        PART=$(lsblk -lnpo NAME,TYPE -- "$DISK" | awk '$2 == "part" { print $1; exit }')
+        [[ -n $PART && -b $PART ]] && break
+        sleep 1
+    done
+    [[ -n $PART && -b $PART ]] || die "The new partition on $DISK didn't show up; unplug the drive, plug it back in and run lk setup again."
+    wipefs -aq -- "$PART"
+
+    step "Encrypting $PART"
+    printf '%s\n' "$PW" | cryptsetup -q luksFormat --type luks2 --label "$NAME" "$PART"
+    printf '%s\n' "$PW" | cryptsetup open "$PART" "$NAME"
+    unset PW
+    OPENED=$NAME
+    MAP=/dev/mapper/$NAME
+
+    if [[ -n $ERASE ]]; then
+        step "Overwriting all of it (about $took; Ctrl+C stops, and lk setup can be run again)"
+        dd if=/dev/zero of="$MAP" bs=4M iflag=count_bytes count="$(blockdev --getsize64 "$MAP")" \
+            oflag=direct conv=fsync status=progress
+    fi
+
+    step "Making the filesystem"
+    owner=()
+    [[ $OWNER_UID != 0 ]] && owner=(-E "root_owner=$OWNER_UID:$OWNER_GID")
+    mkfs.ext4 -q -m 0 -L "${NAME:0:16}" "${owner[@]}" -- "$MAP"
+
+    mkdir -p -- "$MP"
+    mount -- "$MAP" "$MP"
+    MOUNTED=$MP
+    save_drive "$(cryptsetup luksUUID "$PART")" "$NAME" "$MP"
+    DONE=1
+    step "Done"
+    say "$NAME is mounted at $MP ($(free_space "$MP")), and it's yours."
+    say "lk u locks it so you can unplug it; lk m opens it again (it only asks for the passphrase)."
+    ;;
+
+mount)
+    clear_orphans
+    lines=() already=()
+    while read -r dev fstype; do
+        [[ $fstype == crypto_LUKS ]] || continue
+        is_system "$dev" && continue
+        uuid=$(lsblk -dno UUID -- "$dev" | tr -d ' ')
+        open=$(lsblk -lnpo NAME,TYPE -- "$dev" | awk '$2 == "crypt" { print $1; exit }')
+        if [[ -n $open && -n $(mounted_at "$open") ]]; then
+            already+=("${open##*/} is already mounted at $(mounted_at "$open" | paste -sd ' ')")
+            continue
+        fi
+        name=${D_NAME[$uuid]:-}
+        lines+=("$dev"$'\t'"$(printf '%-14s %7s  %-20s %s' "$dev" "$(size "$dev")" "${name:-(new to lk)}" \
+            "$(model "$(top_of "$dev")")")${open:+   (unlocked)}")
+    done < <(lsblk -lnpo NAME,FSTYPE)
+    for a in "${already[@]}"; do say "$a"; done
+    (( ${#lines[@]} )) || die "No locked encrypted drive to mount. Plugged in?"
+    if (( ${#lines[@]} == 1 )); then DEV=${lines[0]%%$'\t'*}
+    else DEV=$(printf '%s\n' "${lines[@]}" | pick "Which drive?") || die "Nothing picked."; fi
+    { [[ -b $DEV ]] && ! is_system "$DEV"; } || die "Won't touch $DEV."
+
+    UUID=$(lsblk -dno UUID -- "$DEV" | tr -d ' ')
+    open=$(lsblk -lnpo NAME,TYPE -- "$DEV" | awk '$2 == "crypt" { print $1; exit }')
+    if [[ -n ${D_NAME[$UUID]:-} ]]; then
+        NAME=${D_NAME[$UUID]} MP=${D_MOUNT[$UUID]}
+        [[ -n $open ]] && NAME=${open##*/}
+        say "$DEV is $NAME, mounted at $MP (change that in ~/.config/lk/drives)"
+        mount_ok "$MP" || die "Can't mount $NAME at $MP."
+        [[ -n $open ]] || mapper_free "$NAME" || die "Rename $NAME in ~/.config/lk/drives, or close the other one (lk u)."
+    else
+        echo "$DEV ($(size "$DEV")) is new to lk."
+        label=$(lsblk -dno LABEL -- "$DEV" | sed 's/^ *//; s/ *$//')
+        valid_name "$label" || label=$DEF_NAME
+        if [[ -n $open ]]; then NAME=${open##*/}
+        else
+            while ask NAME "Name for it: " "$label"; do
+                valid_name "$NAME" || { warn "Letters, digits, . _ and - only (starting with a letter or digit)"; continue; }
+                mapper_free "$NAME" && break
+            done
+        fi
+        while ask MP "Where to mount it: " "$DEF_MOUNT"; do
+            MP=${MP%/}
+            mount_ok "$MP" && break
+        done
+    fi
+
+    if [[ -z $open ]]; then
+        cryptsetup open "$DEV" "$NAME"
+        OPENED=$NAME
+    fi
+    mkdir -p -- "$MP"
+    mount -- "/dev/mapper/$NAME" "$MP" || die "Couldn't mount it."
+    save_drive "$UUID" "$NAME" "$MP"
+    DONE=1
+    echo "Mounted $NAME at $MP ($(free_space "$MP"))."
+    ;;
+
+unmount)
+    clear_orphans
+    lines=()
+    while read -r dev type; do
+        [[ $type == crypt ]] || continue
+        is_system "$dev" && continue
+        at=$(mounted_at "$dev" | paste -sd ' ')
+        lines+=("$dev"$'\t'"$(printf '%-16s %s' "${dev##*/}" "${at:-(not mounted)}")")
+    done < <(lsblk -lnpo NAME,TYPE)
+    if (( ! ${#lines[@]} )); then
+        (( CLEARED )) && { echo "Nothing else is unlocked: you can unplug it."; exit 0; }
+        die "No unlocked encrypted drive (besides the system's own)."
+    fi
+    if (( ${#lines[@]} == 1 )); then MAP=${lines[0]%%$'\t'*}
+    else MAP=$(printf '%s\n' "${lines[@]}" | pick "Which drive?") || die "Nothing picked."; fi
+    is_system "$MAP" && die "Won't touch $MAP."
+    NAME=${MAP##*/}
+
+    while IFS= read -r t; do
+        [[ -n $t ]] || continue
+        echo "Unmounting $t (it first writes anything still waiting to go to the drive)"
+        if ! umount -- "$t"; then
+            warn "$t is in use by:"
+            fuser -vm "$t" 2>&1 | sed 's/^/  /' || true
+            die "Close those (or cd out of $t in that terminal) and run lk u again."
+        fi
+    done < <(mounted_at "$MAP" | sort -r)
+    cryptsetup close "$NAME" || die "Couldn't lock $NAME (something else still has it open)."
+    echo "$NAME is unmounted and locked: you can unplug it."
+    ;;
+
+esac

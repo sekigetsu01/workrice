@@ -1,0 +1,40 @@
+#!/bin/bash
+# Opens web links and local HTML pages in Glide (the default for http/https and text/html, and kitty's links);
+# a YouTube link asks FreeTube or YouTube first
+MM=$HOME/.config/mango/scripts/mm
+
+from_glide() {
+    mmsg get all-clients 2>/dev/null | python3 -I -c 'import json, sys
+c = next((c for c in json.load(sys.stdin).get("clients", []) if c.get("is_focused")), {})
+sys.exit(0 if (c.get("appid") or "").startswith("glide") else 1)' 2>/dev/null
+}
+glide_open() {
+    mmsg get all-clients 2>/dev/null | python3 -I -c 'import json, sys
+sys.exit(0 if any((c.get("appid") or "").startswith("glide") for c in json.load(sys.stdin).get("clients", [])) else 1)' 2>/dev/null
+}
+browser() {
+    from_glide && exec "$HOME/.local/bin/glide-bin" "$@"
+    if glide_open; then
+        touch "${XDG_RUNTIME_DIR:-/tmp}/open-link-follow"
+        exec "$HOME/.local/bin/glide-bin" "$@"
+    fi
+    "$MM" freetag >/dev/null
+    exec "$HOME/.local/bin/glide-bin" --new-window "$@"
+}
+
+case ${1:-} in
+    --freetube) shift; "$MM" freetag >/dev/null; exec flatpak run io.freetubeapp.FreeTube --new-window "$@" ;;
+    --browser) shift; browser "$@" ;;
+esac
+
+url=${1:-}
+case $url in http://* | https://*) ;; *) browser "$@" ;; esac
+host=${url#*://}
+host=${host%%[/?#]*}
+host=${host##*@}
+host=${host%%:*}
+case ${host,,} in
+    youtube.com | www.youtube.com | m.youtube.com | youtu.be | www.youtu.be)
+        timeout 5 qs ipc call link youtube "$url" >/dev/null 2>&1 || browser "$url" ;;
+    *) browser "$@" ;;
+esac

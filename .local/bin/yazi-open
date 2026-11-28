@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+# yazi's "open" (Enter / l): opens each file with xdg-open, all at once; books open in sioyek and that yazi window closes
+# what the viewers print goes to ~/.cache/yazi-open.log
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+BOOKS = {".pdf", ".epub", ".djvu", ".mobi", ".fb2", ".cbz", ".xps"}
+
+
+LOG = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "yazi-open.log")
+try:
+    with open(LOG, errors="replace") as fh:
+        keep = fh.readlines()[-200:]
+    with open(LOG, "w") as fh:
+        fh.writelines(keep)
+except OSError:
+    pass
+
+book = False
+for f in sys.argv[1:]:
+    with open(LOG, "a") as log:
+        log.write(f"--- {time.strftime('%F %T')} {f}\n")
+        log.flush()
+        if os.path.splitext(f)[1].lower() in BOOKS and shutil.which("sioyek"):
+            try:
+                subprocess.Popen(["sioyek", "--new-window", f], stdout=log, stderr=log, start_new_session=True)
+                book = True
+            except OSError:
+                pass
+            continue
+        try:
+            subprocess.Popen(["xdg-open", f], stdout=log, stderr=log, start_new_session=True)
+        except OSError:
+            continue
+
+if book:
+    win = os.environ.get("KITTY_WINDOW_ID")
+    if win:
+        subprocess.run(["/usr/bin/kitty", "@", "close-window", "--match", f"id:{win}"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif os.environ.get("YAZI_ID"):
+        subprocess.run(["ya", "emit-to", os.environ["YAZI_ID"], "quit"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

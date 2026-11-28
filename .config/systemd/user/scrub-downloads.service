@@ -1,0 +1,7 @@
+[Unit]
+Description=Clean hidden data from new downloads
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/scrub-downloads
+Nice=10

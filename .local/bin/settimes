@@ -1,0 +1,56 @@
+#!/bin/bash
+# settimes: opens ~/.config/times.conf (night wallpapers, red screen and dimming, any other timings) in your editor,
+#   then applies it to the timers. A value it can't read falls back to its default, and it offers to reopen the editor
+F=${XDG_CONFIG_HOME:-$HOME/.config}/times.conf
+SD=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+
+declare -A D=([night_start]=21:00 [dim_start]=01:00 [night_end]=05:00 [dim_end]=06:00 [pomo]='40 10')
+
+bad() { BAD+=("$k must be $1, not '${T[$k]}' (using ${D[$k]})"); T[$k]=${D[$k]}; }
+load() {
+    BAD=() T=()
+    for k in "${!D[@]}"; do T[$k]=${D[$k]}; done
+    times_load "$F"
+    for k in "${!TIMES[@]}"; do T[$k]=${TIMES[$k]}; done
+    for k in night_start dim_start night_end dim_end; do [[ ${T[$k]} =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]] || bad "HH:MM"; done
+    k=pomo; [[ ${T[$k]} =~ ^[1-9][0-9]*( +[1-9][0-9]*)*$ ]] || bad "minutes like '40 10'"
+}
+
+declare -A T
+if [ "${1:-}" != --apply ]; then
+    read -ra ed <<< "${EDITOR:-nvim}"   # (EDITOR can carry options: "code -w")
+    while :; do
+        "${ed[@]}" "$F" || exit
+        load
+        [ ${#BAD[@]} -eq 0 ] && break
+        printf 'settimes: %s\n' "${BAD[@]}" >&2
+        read -r -p "Fix it in the editor? [Y/n] " a || a=n
+        case $a in [nN]*) break ;; esac
+    done
+else
+    load
+fi
+if [ ${#BAD[@]} -gt 0 ]; then
+    [ "${1:-}" = --apply ] && printf 'settimes: %s\n' "${BAD[@]}" >&2
+    notify-send -u critical -a settimes "Some times use their default" "$(printf '%s\n' "${BAD[@]}")
+Fix them with settimes" 2>/dev/null
+fi
+
+mkdir -p "$SD/night.timer.d" "$SD/dim.timer.d"
+printf '[Timer]\nOnCalendar=\nOnCalendar=%s\nOnCalendar=%s\n' "${T[night_start]}" "${T[night_end]}" > "$SD/night.timer.d/times.conf"
+printf '[Timer]\nOnCalendar=\nOnCalendar=%s\nOnCalendar=%s\nOnCalendar=%s\n' "${T[dim_start]}" "${T[night_end]}" "${T[dim_end]}" > "$SD/dim.timer.d/times.conf"
+
+[ -n "$WAYLAND_DISPLAY" ] && systemctl --user import-environment WAYLAND_DISPLAY 2>/dev/null
+systemctl --user daemon-reload 2>/dev/null
+systemctl --user enable --now night.timer dim.timer >/dev/null 2>&1
+systemctl --user restart night.timer dim.timer 2>/dev/null
+
+if [ -n "$WAYLAND_DISPLAY" ]; then
+    "$HOME/.local/bin/wallpaper" --last
+    # night mode as it should be now: the timer's catch-up at boot comes before Wayland (no red then), and a reboot
+    # within the night misses no time for it to catch up on
+    [ "${1:-}" = --apply ] && [ -x "$HOME/.local/bin/night-mode" ] && "$HOME/.local/bin/night-mode"
+fi
+exit 0

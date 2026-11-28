@@ -1,0 +1,57 @@
+#!/bin/bash
+# ex ARCHIVE…: each one extracted next to it, replacing what's there: an archive holding one folder (or file)
+# gives just that, anything else goes into a folder named after the archive.
+rc=0
+for f in "$@"; do
+    [ -f "$f" ] || { echo "ex: $f: not a file" >&2; rc=1; continue; }
+    name=$(basename -- "$f") parent=$(dirname -- "$f")
+    case "${name,,}" in
+        *.tar.gz|*.tar.xz|*.tar.bz2|*.tar.zst) base=${name%.[tT][aA][rR].*} ;;
+        *.tgz|*.txz|*.tbz2|*.tzst|*.tar|*.zip|*.7z|*.rar) base=${name%.*} ;;
+        *.gz)  gunzip -kf -- "$f" || rc=1; continue ;;
+        *.xz)  unxz -kf -- "$f" || rc=1; continue ;;
+        *.bz2) bunzip2 -kf -- "$f" || rc=1; continue ;;
+        *.zst) unzstd -qf -- "$f" || rc=1; continue ;;
+        *) echo "ex: $name: not an archive I know" >&2; rc=1; continue ;;
+    esac
+    [ -n "$base" ] || base=${name#.}-extracted
+
+    tmp=$(mktemp -d "$parent/.ex.XXXXXX") || { rc=1; continue; }
+    case "${name,,}" in
+        *.zip|*.7z|*.rar) bsdtar -xf "$f" -C "$tmp" ;;
+        *) tar -xf "$f" -C "$tmp" ;;
+    esac || { echo "ex: couldn't extract $name" >&2; rm -rf -- "$tmp"; rc=1; continue; }
+
+    only=$(ls -A -- "$tmp")
+    case $only in *$'\n'*) only= ;; esac
+    if [ -n "$only" ]; then
+        dir="$parent/$only"
+        src=$tmp/$only
+    else
+        dir="$parent/$base"
+        src=$tmp
+        chmod "$(umask -S)" -- "$tmp"
+    fi
+    if [ -d "$dir" ] && [ -d "$src" ] && [ ! -L "$dir" ]; then
+        cp -a -- "$src/." "$dir/" || { echo "ex: couldn't copy $name's files into ${dir#./}" >&2; rm -rf -- "$tmp"; rc=1; continue; }
+        rm -rf -- "$tmp"
+    else
+        # a folder and a file by the same name: neither replaces the other, it goes in beside it
+        if { [ -d "$dir" ] && [ ! -L "$dir" ]; } || { [ -d "$src" ] && [ -f "$dir" ] && [ ! -L "$dir" ]; }; then
+            # (a file keeps its extension last: report-2.pdf)
+            stem=$dir ext=
+            b=${dir##*/}
+            if [ ! -d "$src" ] && [[ $b == ?*.* ]]; then stem=${dir%.*} ext=.${dir##*.}; fi
+            n=2
+            while [ -e "$stem-$n$ext" ] || [ -L "$stem-$n$ext" ]; do n=$((n + 1)); done
+            echo "ex: ${dir#./} is already there as a $([ -d "$dir" ] && echo folder || echo file): kept" >&2
+            dir=$stem-$n$ext
+        else
+            rm -f -- "$dir"
+        fi
+        mv -- "$src" "$dir" || { echo "ex: couldn't put $name's files at ${dir#./}" >&2; rm -rf -- "$tmp"; rc=1; continue; }
+        [ "$src" = "$tmp" ] || rmdir -- "$tmp"
+    fi
+    echo "$name → ${dir#./}"
+done
+exit "$rc"

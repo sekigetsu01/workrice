@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+# The bar's network (wifi name), disk, battery and VPN state, printed as a JSON line whenever it changes (Bar.qml
+# reads it). Network changes come straight from the kernel; a line on stdin checks again now.
+import json
+import os
+import select
+import socket
+import struct
+import sys
+import time
+
+GROUPS = 0x1 | 0x10 | 0x40 | 0x100 | 0x400
+DUMP = 0x301
+VPN = ("tun", "wg")
+
+
+def attrs(buf, off):
+    out = {}
+    while off + 4 <= len(buf):
+        ln, typ = struct.unpack_from("HH", buf, off)
+        if ln < 4:
+            break
+        out[typ & 0x3fff] = buf[off + 4:off + ln]
+        off += (ln + 3) & ~3
+    return out
+
+
+def messages(data):
+    off = 0
+    while off + 16 <= len(data):
+        ln, typ = struct.unpack_from("IH", data, off)
+        if ln < 16:
+            break
+        yield typ, data[off + 16:off + ln]
+        off += (ln + 3) & ~3
+
+
+class Netlink:
+    def __init__(self, proto, groups=0):
+        self.sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, proto)
+        self.sock.bind((0, groups))
+        self.seq = 0
+
+    def ask(self, typ, flags, payload):
+        self.seq += 1
+        self.sock.settimeout(2)
+        self.sock.send(struct.pack("IHHII", 16 + len(payload), typ, flags, self.seq, 0) + payload)
+        res = []
+        try:
+            while True:
+                for t, body in messages(self.sock.recv(1 << 16)):
+                    if t in (2, 3):
+                        return res
+                    res.append(body)
+                if flags != DUMP:
+                    return res
+        except OSError:
+            return res
+
+
+def u32(b):
+    return struct.unpack("I", b[:4])[0] if b and len(b) >= 4 else 0
+
+
+class Wifi:
+    def __init__(self):
+        self.nl = None
+        self.fam = 0
+
+    def ssid(self, index):
+        try:
+            if not self.nl:
+                self.nl = Netlink(16)
+                name = b"nl80211\0"
+                at = struct.pack("HH", 4 + len(name), 2) + name
+                for body in self.nl.ask(0x10, 1, struct.pack("BBH", 3, 1, 0) + at):
+                    self.fam = struct.unpack("H", attrs(body, 4).get(1, b"\0\0")[:2])[0]
+            if not self.fam:
+                return ""
+            for body in self.nl.ask(self.fam, 1, struct.pack("BBH", 5, 0, 0) + struct.pack("HHI", 8, 3, index)):
+                s = attrs(body, 4).get(52)
+                if s:
+                    return s.decode("utf-8", "replace")
+        except OSError:
+            pass
+        return ""
+
+
+def network(nl, wifi, rfkill):
+    links = {}
+    for body in nl.ask(18, DUMP, struct.pack("BBHiII", 0, 0, 0, 0, 0, 0)):
+        if len(body) < 16:
+            continue
+        _, _, _, index, flags, _ = struct.unpack_from("BBHiII", body)
+        a = attrs(body, 16)
+        name = a.get(3, b"").split(b"\0")[0].decode(errors="replace")
+        links[index] = (name, flags, a.get(16, b"\0")[0], a.get(33, b"\0")[0])
+    vpn = any(n.startswith(VPN) and op != 2 for n, _, op, _ in links.values())
+    best = None
+    for body in nl.ask(26, DUMP, struct.pack("BBBBBBBBI", 0, 0, 0, 0, 0, 0, 0, 0, 0)):
+        if len(body) < 12 or body[1] != 0 or body[4] != 254:
+            continue
+        a = attrs(body, 12)
+        if 5 not in a or 4 not in a or links.get(u32(a[4]), ("",))[0].startswith(VPN):
+            continue
+        prio = u32(a.get(6))
+        if best is None or prio < best[0]:
+            best = (prio, u32(a[4]))
+    if best is None or best[1] not in links:
+        return ("disabled" if rfkill else "disconnected"), "", vpn
+    name, flags, _, carrier = links[best[1]]
+    if not (flags & 1) or carrier != 1:
+        return ("disabled" if rfkill else "disconnected"), "", vpn
+    addr = any(len(b) >= 8 and u32(b[4:8]) == best[1] and b[3] < 253
+               for b in nl.ask(22, DUMP, struct.pack("BBBBI", 0, 0, 0, 0, 0)))
+    if not addr:
+        return "linked", "", vpn
+    essid = ""
+    if os.path.exists(f"/sys/class/net/{name}/wireless") or os.path.exists(f"/sys/class/net/{name}/phy80211"):
+        essid = wifi.ssid(best[1])
+    return ("wifi" if essid else "ethernet"), essid, vpn
+
+
+def size(v):
+    f, p = float(v), 0
+    while p < 5 and f / 1024 >= 1:
+        f /= 1024
+        p += 1
+    return "%.1f%sB" % (f, ("", "ki", "Mi", "Gi", "Ti", "Pi")[p])
+
+
+def disk():
+    try:
+        s = os.statvfs("/")
+    except OSError:
+        return "", ""
+    if not s.f_blocks:
+        return "", ""
+    used = s.f_blocks - s.f_bfree
+    return size(s.f_bavail * s.f_frsize), "%s used out of %s on / (%d%%)" % (
+        size(used * s.f_frsize), size(s.f_blocks * s.f_frsize), used * 100 // s.f_blocks)
+
+
+PS = "/sys/class/power_supply"
+
+
+def rd(n, f):
+    try:
+        with open(os.path.join(PS, n, f)) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def battery_names():
+    try:
+        names = [n for n in os.listdir(PS) if rd(n, "type") == "Battery" and rd(n, "scope") != "Device"]
+    except OSError:
+        return []
+    return sorted(names, key=lambda n: (not n.startswith("BAT"), n))
+
+
+DRAIN = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "battery", "drain")
+
+
+def drain(rate=None):
+    try:
+        with open(DRAIN) as f:
+            avg = float(f.read().strip() or 0)
+    except (OSError, ValueError):
+        avg = 0.0
+    if rate:
+        avg = rate if avg <= 0 else avg * 0.9 + rate * 0.1
+        try:
+            os.makedirs(os.path.dirname(DRAIN), exist_ok=True)
+            with open(DRAIN + ".new", "w") as f:
+                f.write("%.0f\n" % avg)
+            os.replace(DRAIN + ".new", DRAIN)
+        except OSError:
+            pass
+    return avg
+
+
+RATES = []
+_rates_for = ""
+
+
+def steady(status, r):
+    global _rates_for
+    if status != _rates_for:
+        RATES.clear()
+        _rates_for = status
+    if r > 0:
+        RATES.append(r)
+        del RATES[:-20]
+    return sum(RATES) / len(RATES) if len(RATES) >= 2 else 0
+
+
+def hm(h):
+    m = int(round(h * 60))
+    return "%dh %02dm" % (m // 60, m % 60)
+
+
+def battery():
+    for n in battery_names():
+        def rd1(f, n=n):
+            return rd(n, f)
+        cap = rd1("capacity")
+        if not cap.isdigit():
+            continue
+        status = rd1("status")
+        now, full, rate = rd1("energy_now"), rd1("energy_full"), rd1("power_now")
+        if not now.isdigit():
+            now, full, rate = rd1("charge_now"), rd1("charge_full"), rd1("current_now")
+        left = on_battery = ""
+        # some drivers report the rate negative while discharging
+        r = abs(int(rate)) if rate.lstrip("-").isdigit() else 0
+        avg_now = steady(status, r)
+        if now.isdigit() and avg_now > 0:
+            h, c = None, int(now)
+            if status == "Discharging":
+                h = c / avg_now
+            elif status == "Charging" and full.isdigit():
+                f = int(full)
+                if c < 0.8 * f:
+                    h = (0.8 * f - c) / avg_now + 0.2 * f / (avg_now * 0.5)
+                else:
+                    h = max(0, f - c) / (avg_now * 0.6)
+            if h is not None and 1 / 60 <= h < 48:
+                left = hm(h)
+        avg = drain(r if status == "Discharging" and r > 0 else None)
+        if status != "Discharging" and avg > 0 and now.isdigit() and int(now) / avg < 48:
+            on_battery = hm(int(now) / avg)
+        out = {"bat": min(100, int(cap)), "batStatus": status, "batLeft": left}
+        if on_battery:
+            out["batOnBattery"] = on_battery
+        return out
+    return None
+
+
+def main():
+    events = Netlink(0, GROUPS)
+    events.sock.setblocking(False)
+    nl = Netlink(0)
+    wifi = Wifi()
+    try:
+        rf = os.open("/dev/rfkill", os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        rf = -1
+    blocked = False
+    watch = [events.sock, sys.stdin] + ([rf] if rf >= 0 else [])
+    next_disk = next_bat = due = 0.0
+    state = {}
+    last = None
+    while True:
+        now = time.monotonic()
+        if now >= next_disk:
+            state["disk"], state["diskTip"] = disk()
+            next_disk = now + 60
+        if now >= next_bat:
+            for k in ("bat", "batStatus", "batLeft"):
+                state.pop(k, None)
+            for k in ("batOnBattery",):
+                state.pop(k, None)
+            state.update(battery() or {})
+            next_bat = now + 15
+        if due is not None and now >= due:
+            net, essid, vpn = network(nl, wifi, blocked)
+            state.update(net=net, essid=essid, vpn=vpn)
+            due = None
+        out = json.dumps(state, ensure_ascii=False)
+        if out != last:
+            try:
+                sys.stdout.write(out + "\n")
+                sys.stdout.flush()
+            except OSError:
+                return
+            last = out
+        wait = min(next_disk, next_bat) - time.monotonic()
+        if due is not None:
+            wait = min(wait, due - time.monotonic())
+        for r in select.select(watch, [], [], max(0.0, wait))[0]:
+            if r is sys.stdin:
+                if not os.read(0, 4096):
+                    return
+                due = time.monotonic()
+            elif r is events.sock:
+                try:
+                    while events.sock.recv(1 << 16):
+                        pass
+                except OSError:
+                    pass
+                if due is None:
+                    due = time.monotonic() + 0.15
+            else:
+                try:
+                    while True:
+                        ev = os.read(rf, 8)
+                        if len(ev) < 8:
+                            break
+                        if ev[4] == 1 and ev[5] in (0, 2):
+                            blocked = bool(ev[6] or ev[7])
+                            if due is None:
+                                due = time.monotonic()
+                except OSError:
+                    pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

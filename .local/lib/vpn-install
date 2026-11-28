@@ -1,0 +1,14 @@
+#!/bin/sh
+# Lets the VPN start without a password: installs its root half (vpn-root) and a sudo rule for it. Once, and again
+# after changing vpn-root:
+#   sudo sh ~/.local/lib/vpn-install
+set -e
+[ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] || { echo "Run it with sudo: sudo sh ~/.local/lib/vpn-install" >&2; exit 1; }
+home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+install -D -o root -g root -m 755 "$home/.local/lib/vpn-root" /usr/local/lib/vpn-root
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+printf '%s ALL=(root) NOPASSWD: /usr/local/lib/vpn-root ""\n' "$SUDO_USER" > "$tmp"
+visudo -cqf "$tmp"
+install -o root -g root -m 440 "$tmp" /etc/sudoers.d/vpn
+echo "Done: the VPN now starts without a password."

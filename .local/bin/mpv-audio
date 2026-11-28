@@ -1,0 +1,10 @@
+#!/bin/bash
+# Playing audio: what's in ~/Audiobooks plays in Books, anything else in a small mpv window
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+[ "$#" -gt 0 ] || { notify "mpv-audio" "Give it a file or a link to play"; echo "Usage: mpv-audio FILE|URL…" >&2; exit 1; }
+f=$(readlink -f -- "$1")
+[ -x "$HOME/.local/bin/books" ] &&
+    case $f in "$(readlink -f "${BOOKS_DIR:-$HOME/Audiobooks}")"/*) exec "$HOME/.local/bin/books" "$f" ;; esac
+if [ "$#" -eq 1 ] && [ ! -d "$1" ]; then set -- --autocreate-playlist=same --directory-mode=ignore -- "$@"; else set -- -- "$@"; fi
+term_exec --app-id=mpv-audio --title=mpv -e mpv --no-video --term-osd-bar "$@"

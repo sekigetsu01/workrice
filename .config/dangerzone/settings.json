@@ -1,0 +1,18 @@
+{
+    "save": true,
+    "archive": false,
+    "ocr": true,
+    "ocr_language": "English",
+    "open": true,
+    "open_app": "Sioyek",
+    "safe_extension": "-safe.pdf",
+    "updater_ask_before_download": true,
+    "updater_check_all": true,
+    "updater_last_check": 1791987383,
+    "updater_latest_version": "0.11.0",
+    "updater_latest_changelog": "",
+    "updater_remote_log_index": 3250555915,
+    "updater_errors": 0,
+    "output_dir": "/home/user/sync/documents",
+    "stop_other_podman_machines": "ask"
+}

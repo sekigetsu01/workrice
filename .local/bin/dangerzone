@@ -1,0 +1,4 @@
+#!/bin/sh
+# dangerzone: Dangerzone (suspicious documents to safe PDFs), picking files with yazi and with Vim keys (~/.config/qt-tweaks)
+QT_QPA_PLATFORMTHEME=xdgdesktopportal PYTHONPATH="$HOME/.config/qt-tweaks${PYTHONPATH:+:$PYTHONPATH}" \
+    exec /usr/bin/dangerzone "$@"

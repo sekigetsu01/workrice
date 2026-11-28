@@ -1,0 +1,28 @@
+#!/bin/bash
+# sioyek's ; : looks up the selected word ("define WORD") in a new Glide tab, with the first search engine in
+# ~/.config/glide/search.js
+{ IFS= read -r text; IFS= read -r url; } < <(printf '%s' "$*" | python3 -c '
+import json, os, re, sys, urllib.parse
+t = sys.stdin.read()
+t = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", t)
+t = re.sub(r"\s+", " ", t).strip().strip(".,;:!?\"()[]\u201c\u201d\u2018\u2019")[:200]
+print(t)
+try:
+    s = open(os.path.expanduser("~/.config/glide/search.js")).read()
+    url = json.loads(s[s.index("["):s.rindex("]") + 1])[0][3]
+except (OSError, ValueError, IndexError, KeyError, TypeError):
+    url = "https://duckduckgo.com/?q={searchTerms}"
+print(url.replace("{searchTerms}", urllib.parse.quote_plus("define " + t)))
+')
+if [ -z "$text" ]; then
+    notify-send --app-name=sioyek "Nothing selected" 2>/dev/null
+    exit 0
+fi
+if ! command -v glide-bin >/dev/null; then
+    notify-send --urgency=critical --app-name=sioyek "Couldn't find Glide" "glide-bin isn't installed (yay -S glide-browser-bin)" 2>/dev/null
+    exit 1
+fi
+setsid -f glide-bin --new-tab "$url" >/dev/null 2>&1
+notify-send --app-name=sioyek -h boolean:x-quiet:true "Define" "$text" 2>/dev/null
+"$HOME/.config/mango/scripts/mm" focus glide
+exit 0

@@ -1,0 +1,8 @@
+# The default for web links and HTML pages: open-link (hidden from the launcher)
+[Desktop Entry]
+Type=Application
+Name=Open link
+Comment=Web links and HTML pages in the browser (placed on a free tag); YouTube links ask FreeTube or YouTube
+Exec=/home/user/.local/bin/open-link %u
+NoDisplay=true
+MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;application/xhtml+xml;

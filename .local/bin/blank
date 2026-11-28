@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# blank: erase a drive (a USB stick, an external disk) and make it like new: one partition, the filesystem you pick (blank -h)
+# The disks the system runs from are never offered. For an encrypted drive, use lk setup instead.
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+blank: erase a drive and make it like new (one partition, the filesystem you pick)
+  blank       pick the drive, the filesystem (exFAT, FAT32, ext4, NTFS, or blank) and its name, then one YES
+  blank -h    this help
+
+It asks everything first, then the rest runs on its own: whatever on the drive is mounted or unlocked is
+unmounted and locked, the drive is wiped, partitioned and formatted. The disks your system runs from are
+never shown. Blank leaves no partition at all, ready to flash an ISO onto with dd.
+For an encrypted drive (opened with a password), use lk setup.
+EOF
+}
+
+case ${1:-} in
+    '') ;;
+    -h | --help | help) usage; exit 0 ;;
+    *) usage >&2; exit 1 ;;
+esac
+[[ $EUID -eq 0 ]] || exec sudo --preserve-env=HOME "$0"
+
+APP=blank
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+[[ -r $HOME/.local/lib/common.sh ]] && . "$HOME/.local/lib/common.sh"
+declare -F step >/dev/null || step() { printf '\n\e[1m== %s\e[0m\n' "$1"; }
+declare -F warn >/dev/null || warn() { printf '\e[1;33m%s\e[0m\n' "$1"; }
+declare -F say >/dev/null || say() { printf '  %s\n' "$*"; }
+die() { printf '\e[1;31m%s\e[0m\n' "$*" >&2; exit 1; }
+[[ -t 0 ]] || die "blank needs a terminal"
+
+OWNER_UID=${SUDO_UID:-0} OWNER_GID=${SUDO_GID:-0}
+
+# The disks the system runs from (/, /boot, swap… and whatever they sit on), and everything on them
+TABLE=$(lsblk -lnpo NAME,PKNAME)
+top_of() {
+    local d=$1 p
+    for _ in 1 2 3 4 5 6 7 8; do
+        p=$(awk -v d="$d" '$1 == d && $2 != "" { print $2; exit }' <<< "$TABLE")
+        [[ -n $p ]] || break
+        d=$p
+    done
+    printf '%s\n' "$d"
+}
+declare -A SYS_DISK=() SYS=()
+while IFS= read -r s; do
+    s=${s%%\[*}
+    [[ $s == /dev/* && -b $s ]] || continue
+    s=$(lsblk -dnpo NAME -- "$s" 2>/dev/null) || continue
+    SYS_DISK[$(top_of "$s")]=1
+done < <(
+    for t in / /boot /efi /boot/efi /home /usr /var; do findmnt -nro SOURCE --mountpoint "$t" 2>/dev/null || true; done
+    swapon --show=NAME --noheadings 2>/dev/null || true
+)
+while read -r dev _; do
+    [[ -n ${SYS_DISK[$(top_of "$dev")]:-} ]] && SYS[$dev]=1
+done <<< "$TABLE"
+is_system() { [[ -n ${SYS[$1]:-} ]]; }
+(( ${#SYS_DISK[@]} )) || die "Couldn't tell which disk the system is on, so blank won't risk offering any."
+
+pick() {
+    local header=$1 choice n lines=()
+    mapfile -t lines
+    (( ${#lines[@]} )) || return 1
+    if command -v fzf >/dev/null; then
+        choice=$(printf '%s\n' "${lines[@]}" | fzf --no-input --delimiter=$'\t' --with-nth=2 --layout=reverse \
+            --height=~50% --info=hidden --no-sort --pointer='▶' --highlight-line --color='bg+:8,fg+:15:bold,pointer:4' \
+            --header="$header"$'\n'"j/k move · Enter picks · q cancels" \
+            --bind 'j:down,k:up,g:first,G:last,q:abort') || return 1
+    else
+        printf '%s\n' "$header" >&2
+        for n in "${!lines[@]}"; do printf '  %d) %s\n' $((n + 1)) "${lines[n]#*$'\t'}" >&2; done
+        read -rp "Number: " n
+        [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#lines[@]} )) || return 1
+        choice=${lines[n - 1]}
+    fi
+    printf '%s\n' "${choice%%$'\t'*}"
+}
+ask() { local a; read -r -e -i "$3" -p "$2" a || exit 1; printf -v "$1" '%s' "$a"; }
+model() { lsblk -dno MODEL -- "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
+size() { lsblk -dno SIZE -- "$1" 2>/dev/null | tr -d ' '; }
+
+STARTED=''
+trap '[[ -z $STARTED ]] || warn "Stopped partway: $DISK may be left empty or half-made. Run blank again to finish it."' ERR
+
+step "Make a drive like new"
+
+# The drive
+lines=()
+while read -r dev type; do
+    [[ $type == disk && $dev != /dev/zram* ]] || continue
+    is_system "$dev" && continue
+    [[ $(lsblk -dnbo SIZE -- "$dev") -gt 0 ]] || continue
+    what=$(lsblk -nlo FSTYPE,LABEL -- "$dev" | awk 'NF { $1 = $1; printf "%s%s", (n++ ? ", " : ""), $0 }')
+    lines+=("$dev"$'\t'"$(printf '%-14s %7s  %-5s %s' "$dev" "$(size "$dev")" \
+        "$(lsblk -dno TRAN -- "$dev" | tr -d ' ')" "$(model "$dev")")${what:+   ($what)}")
+done < <(lsblk -dnpo NAME,TYPE)
+(( ${#lines[@]} )) || die "No drive to erase (the system's own disk isn't offered). Plugged in?"
+DISK=$(printf '%s\n' "${lines[@]}" | pick "Which drive? Everything on it will be erased (the system's own disk isn't listed)") || die "Nothing picked."
+{ [[ -b $DISK ]] && ! is_system "$DISK"; } || die "Won't touch $DISK."
+lsblk -nlo TYPE -- "$DISK" | grep -qxE 'lvm|raid[0-9]*|md' &&
+    die "Part of $DISK is in use as LVM or RAID. Take it apart first; blank won't."
+echo
+lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINTS -- "$DISK"
+echo
+
+# The filesystem
+lines=()
+command -v mkfs.exfat >/dev/null && lines+=($'exfat\texFAT    works on Windows, Mac, Linux, TVs and cameras; files of any size (best for most USBs)')
+command -v mkfs.fat >/dev/null && lines+=($'fat32\tFAT32    works on everything, even old devices and car stereos; no file over 4 GB')
+command -v mkfs.ext4 >/dev/null && lines+=($'ext4\text4     Linux only (Windows and Mac can'\''t read it)')
+command -v mkfs.ntfs >/dev/null && lines+=($'ntfs\tNTFS     Windows; Mac can only read it')
+lines+=($'blank\tblank    wiped, no partition at all: ready to flash an ISO onto with dd')
+FS=$(printf '%s\n' "${lines[@]}" | pick "Which filesystem? (for one that's encrypted, use lk setup)") || die "Nothing picked."
+
+case $FS in
+    fat32) MAXLEN=11 ;;
+    exfat) MAXLEN=15 ;;
+    ext4) MAXLEN=16 ;;
+    ntfs) MAXLEN=32 ;;
+    blank) MAXLEN=0 ;;
+esac
+LABEL=''
+(( MAXLEN )) && if [[ $(lsblk -dno TRAN -- "$DISK" | tr -d ' ') == usb && $(lsblk -dno ROTA -- "$DISK" | tr -d ' ') == 0 ]]; then
+    def=USB
+else def=DRIVE; fi
+(( MAXLEN )) && while ask LABEL "Name for it (what you'll see when you plug it in): " "$def"; do
+    [[ $FS == fat32 ]] && LABEL=${LABEL^^}
+    [[ $LABEL =~ ^[A-Za-z0-9_-]([A-Za-z0-9\ _-]*[A-Za-z0-9_-])?$ ]] ||
+        { warn "Letters, digits, spaces, _ and - only (no space at either end)"; continue; }
+    (( ${#LABEL} <= MAXLEN )) || { warn "At most $MAXLEN characters for $FS"; continue; }
+    break
+done
+
+bytes=$(lsblk -dnbo SIZE -- "$DISK")
+# rough write speeds in MB/s: a spinning disk, a USB stick, anything else (SSDs)
+if [[ $(lsblk -dno ROTA -- "$DISK" | tr -d ' ') == 1 ]]; then speed=150
+elif [[ $(lsblk -dno TRAN -- "$DISK" | tr -d ' ') == usb ]]; then speed=30
+else speed=400; fi
+secs=$(( bytes / (speed * 1000000) ))
+printf -v took '%dh %02dmin' $((secs / 3600)) $((secs % 3600 / 60))
+ERASE=''
+read -rp "Also overwrite all of it, so nothing that was on it can be recovered? Slow: about $took. [Y/n] " a
+[[ $a == [nN]* ]] || ERASE=1
+
+echo
+if [[ $FS == blank ]]; then what="leaves it blank"; else what="makes it one $FS drive named $LABEL"; fi
+warn "This erases EVERYTHING on $DISK ($(model "$DISK"), $(size "$DISK")) and $what."
+read -rp "Type YES to go ahead: " a
+[[ $a == YES ]] || die "Stopped; nothing was changed."
+STARTED=1
+
+# Anything on it that's mounted, switched on as swap or unlocked: off (deepest first)
+step "Unmounting what's on $DISK"
+mapfile -t uuids < <(lsblk -lnpo UUID -- "$DISK" | awk 'NF')
+for dev in $(lsblk -lnpo NAME -- "$DISK" | tac); do
+    while IFS= read -r t; do
+        [[ -n $t ]] || continue
+        say "unmounting $t"
+        if ! umount -- "$t"; then
+            warn "$t is in use by:"
+            fuser -vm "$t" 2>&1 | sed 's/^/  /' || true
+            die "Close those (or cd out of $t in that terminal) and run blank again. Nothing was erased."
+        fi
+    done < <(findmnt -nro TARGET -S "$dev" 2>/dev/null | sort -r)
+    swapon --show=NAME --noheadings 2>/dev/null | grep -qxF -- "$dev" && { say "switching off swap on $dev"; swapoff -- "$dev"; }
+    if [[ $(lsblk -dno TYPE -- "$dev") == crypt ]]; then
+        say "locking ${dev##*/}"
+        cryptsetup close "${dev##*/}" || die "Couldn't lock ${dev##*/} (something still has it open). Nothing was erased."
+    fi
+done
+
+# lk no longer needs to remember an encrypted drive that was on it
+LK=$HOME/.config/lk/drives
+if [[ -f $LK ]] && (( ${#uuids[@]} )) && grep -qFf <(printf '%s\t\n' "${uuids[@]}") "$LK"; then
+    grep -vFf <(printf '%s\t\n' "${uuids[@]}") "$LK" > "$LK.tmp" || true
+    mv -f -- "$LK.tmp" "$LK"
+    [[ $OWNER_UID == 0 ]] || chown -- "$OWNER_UID:$OWNER_GID" "$LK"
+    say "(lk forgot the encrypted drive that was on it)"
+fi
+
+step "Wiping $DISK"
+for p in $(lsblk -lnpo NAME -- "$DISK" | tac); do wipefs -aq -- "$p"; done
+if [[ -n $ERASE ]]; then
+    step "Overwriting all of it (about $took; Ctrl+C stops, and blank can be run again)"
+    dd if=/dev/zero of="$DISK" bs=4M iflag=count_bytes count="$bytes" oflag=direct conv=fsync status=progress
+fi
+
+if [[ $FS == blank ]]; then
+    sync
+    STARTED=''
+    echo
+    echo "Done: $DISK is blank. Flash an ISO onto it with:"
+    echo "  sudo dd if=FILE.iso of=$DISK bs=4M oflag=direct conv=fsync status=progress"
+    exit 0
+fi
+
+step "Partitioning $DISK"
+# An MBR table where it fits (under 2 TiB: what TVs, cameras and old computers read), else GPT
+if (( bytes < 2199023255552 )); then
+    case $FS in fat32) t=c ;; exfat | ntfs) t=7 ;; ext4) t=83 ;; esac
+    printf 'label: dos\n,,%s\n' "$t"
+else
+    case $FS in ext4) t=0FC63DAF-8483-4772-8E79-3D69D8477DE4 ;; *) t=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 ;; esac
+    printf 'label: gpt\n,,%s\n' "$t"
+fi | sfdisk -q --wipe always --wipe-partitions always -- "$DISK"
+partx -u -- "$DISK" 2>/dev/null || true
+udevadm settle
+PART=''
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    PART=$(lsblk -lnpo NAME,TYPE -- "$DISK" | awk '$2 == "part" { print $1; exit }')
+    [[ -n $PART && -b $PART ]] && break
+    sleep 1
+done
+[[ -n $PART && -b $PART ]] || die "The new partition on $DISK didn't show up; unplug the drive, plug it back in and run blank again."
+wipefs -aq -- "$PART"
+
+step "Making the $FS filesystem"
+case $FS in
+    exfat) mkfs.exfat -L "$LABEL" -- "$PART" >/dev/null ;;
+    fat32) mkfs.fat -F 32 -n "$LABEL" -- "$PART" >/dev/null ;;
+    ntfs) mkfs.ntfs -f -q -L "$LABEL" "$PART" ;;  # (mkfs.ntfs doesn't take --)
+    ext4)
+        owner=()
+        [[ $OWNER_UID != 0 ]] && owner=(-E "root_owner=$OWNER_UID:$OWNER_GID")
+        mkfs.ext4 -q -m 0 -L "$LABEL" "${owner[@]}" -- "$PART" ;;
+esac
+sync
+udevadm settle
+STARTED=''
+
+echo
+lsblk -o NAME,SIZE,FSTYPE,LABEL -- "$DISK"
+echo
+echo "Done: $DISK is one $FS drive named $LABEL. Unplug it whenever you like, or open it in your file manager."

@@ -1,0 +1,86 @@
+#!/bin/bash
+# scrub-downloads: scrubs each new file in ~/Downloads once it has finished downloading (run by scrub-downloads.path)
+#   scrub-downloads --baseline: marks what's there now as seen, without touching it (sys-setup, when it turns this on)
+export PATH="$HOME/.local/bin:$PATH:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl"
+DL=${XDG_DOWNLOAD_DIR:-$HOME/Downloads}
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/scrub-downloads
+SEEN=$STATE/seen
+mkdir -p "$STATE"
+[ -d "$DL" ] || exit 0
+exec 9>"$STATE/lock"; flock -n 9 || exit 0
+LOG=$STATE/last-run.log
+: > "$LOG"
+
+declare -A seen
+first=false
+[ "${1:-}" = --baseline ] && first=true
+if [ -f "$SEEN" ]; then
+    while IFS=$'\t' read -r n s; do [ -n "$n" ] && seen[$n]=$s; done < "$SEEN"
+fi
+stamp() { stat -c '%s %Y' -- "$1" 2>/dev/null; }
+declare -A known
+for n in "${!seen[@]}"; do known[k${seen[$n]}]=1; done
+save() {
+    local n
+    for n in "${!seen[@]}"; do
+        if [ -e "$DL/$n" ]; then printf '%s\t%s\n' "$n" "${seen[$n]}"; fi
+    done > "$SEEN.tmp" && mv -f "$SEEN.tmp" "$SEEN"
+}
+
+unfinished() {
+    local f=$1 n=${1##*/}
+    case $n in
+        .*|*.part|*.crdownload|*.tmp|*.ytdl|*.part-Frag*|*.temp.*|*.f[0-9]*.*) return 1 ;;
+    esac
+    [ -e "$f.part" ] || [ -e "$f.crdownload" ] && return 1
+    (( $(date +%s) - $(stat -c %Y -- "$f") < 3 )) && return 2
+    fuser -s -- "$f" 2>/dev/null && return 2
+    [ -s "$f" ] || return 1
+    return 0
+}
+
+cleaned=()
+for _ in $(seq 1 60); do
+    pending=false
+    before=$(stat -c %Y.%Z -- "$DL"; find "$DL" -maxdepth 1 -type f -printf '%f %s %T@\n' 2>/dev/null | sort | md5sum)
+    for f in "$DL"/*; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        n=${f##*/}
+        st=$(stamp "$f")
+        [ "${seen[$n]-}" = "$st" ] && continue
+        if [ -n "${known[k$st]-}" ]; then seen[$n]=$st; continue; fi
+        if $first; then seen[$n]=$(stamp "$f"); continue; fi
+        case ${n,,} in *.zip|*.tar|*.torrent|speak-voices.opus) seen[$n]=$st; continue ;; esac
+        unfinished "$f"
+        case $? in 1) continue ;; 2) pending=true; continue ;; esac
+        out=$(scrub -- "$f" 2>&1)
+        printf '%s\n' "$out" | head -n 3 >> "$LOG"
+        grep -q '^cleaned ' <<< "$out" && cleaned+=("$n")
+        seen[$n]=$(stamp "$f"); known[k${seen[$n]}]=1
+    done
+    save
+    sleep 1
+    after=$(stat -c %Y.%Z -- "$DL"; find "$DL" -maxdepth 1 -type f -printf '%f %s %T@\n' 2>/dev/null | sort | md5sum)
+    if ! $pending && [ "$before" != "$after" ]; then
+        changed=false
+        for f in "$DL"/*; do
+            [ -f "$f" ] && [ ! -L "$f" ] || continue
+            st=$(stamp "$f")
+            [ "${seen[${f##*/}]-}" = "$st" ] || [ -n "${known[k$st]-}" ] && continue
+            unfinished "$f"; [ $? = 1 ] && continue
+            changed=true; break
+        done
+        $changed || break
+        continue
+    fi
+    $pending || break
+    sleep 4
+done
+
+if (( ${#cleaned[@]} )); then
+    body=$(printf 'cleaned  ~/Downloads/%s\n' "${cleaned[@]:0:5}")
+    (( ${#cleaned[@]} > 5 )) && body+=$'\n'"… and $(( ${#cleaned[@]} - 5 )) more"
+    notify-send -a scrub "Scrub" "$body" >> "$LOG" 2>&1 ||
+        echo "notify-send failed ($?)" >> "$LOG"
+fi
+exit 0

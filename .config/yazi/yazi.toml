@@ -1,0 +1,73 @@
+# yazi, the file manager: the layout, previews, what opens which files (opener / open) and the previewer plugins
+[mgr]
+ratio = [2, 2, 4]
+sort_sensitive = true
+linemode = "size"
+
+[preview]
+# defaults are 600x900, which leaves a small picture in a wide pane;
+# set high so the pane size is what limits it
+max_width = 2400
+max_height = 2400
+
+[opener]
+edit = [
+  { run = 'nvim %s', block = true, desc = "nvim" },
+]
+note = [
+  { run = 'nvim %s', block = true, desc = "nvim" },
+]
+open = [
+  { run = 'yazi-open %s', orphan = true, desc = "Open" },
+]
+keepass = [
+  { run = 'kp open %s', orphan = true, desc = "kp" },
+  { run = 'keepassxc %s', orphan = true, desc = "KeePassXC" },
+]
+unpack = [
+  { run = 'ex %s', block = true, desc = "Extract here" },
+]
+reveal = [
+  { run = '''exiftool %s1; echo "Press enter to exit"; read _''', block = true, desc = "Show EXIF" },
+]
+listen = [
+  { run = 'mpv-audio %s', orphan = true, desc = "Play (~/Audiobooks: Books, where it is; else a small mpv window)" },
+]
+play = [
+  { run = 'mpv %s > "$HOME/.cache/mpv-yazi.log" 2>&1', orphan = true, desc = "Play with mpv" },
+  { run = '''mediainfo %s1; echo "Press enter to exit"; read _''', block = true, desc = "Show media info" },
+]
+
+[open]
+prepend_rules = [
+  { url = "*.{md,markdown}", use = ["note"] },
+  { url = "*.kdbx", use = ["keepass", "reveal"] },
+  { url = "*.{zip,7z,rar,tar,tgz,txz,tbz2,tzst,gz,xz,bz2,zst}", use = ["unpack"] },
+  { mime = "audio/*", use = ["listen", "play", "reveal"] },
+]
+
+[tasks]
+bizarre_retry = 5
+image_bound = [0, 0]
+
+[plugin]
+prepend_previewers = [
+  # what's inside an archive
+  { url = "*.{zip,7z,rar,tar,tgz,txz,tbz2,tzst,tar.gz,tar.xz,tar.bz2,tar.zst}", run = 'piper -- bsdtar -tf "$1" --passphrase x 2>&1' },
+  { url = "*.{desktop,service,timer,socket,mount,path,target}", run = 'piper -- bat -p --color=always --theme=ansi -- "$1" 2>/dev/null || cat -- "$1"' },
+  { url = "*.{img,fat,ext,ext2,ext3,ext4,squashfs,ntfs,hfs,hfsx}", run = 'piper -- file -b -- "$1"' },
+  # notes: rendered markdown with their pictures in place
+  { url = "*.{md,markdown}", run = "note-preview" },
+  { mime = "text/{plain,markdown}", run = "note-preview" },
+  { mime = "audio/*",        run = "audio-preview" },
+  { url = "*/", run = "tree-preview" },
+  { mime = "application/{octet-stream,msdownload,executable,pie-executable,sharedlib,object,coredump}", run = 'piper -- hexyl --border=none --color=always --terminal-width="$w" -- "$1" 2>/dev/null || file -b -- "$1"' },
+]
+prepend_preloaders = [
+  { url = "*.{md,markdown}", run = "note-preview" },
+  { mime = "audio/*",        run = "audio-preview" },
+]
+prepend_fetchers = [
+  { url = "*",  run = "git", group = "git" },
+  { url = "*/", run = "git", group = "git" },
+]

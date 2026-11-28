@@ -1,0 +1,7 @@
+[Unit]
+Description=Night mode: red screen and lowest brightness
+
+[Service]
+Type=oneshot
+# no ExecCondition on Wayland: the catch-up run at boot comes before it, and brightness doesn't need it
+ExecStart=%h/.local/bin/night-mode

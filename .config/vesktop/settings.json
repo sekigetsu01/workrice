@@ -1,0 +1,30 @@
+{
+    "discordBranch": "stable",
+    "minimizeToTray": false,
+    "arRPC": true,
+    "customTitleBar": false,
+    "enableSplashScreen": false,
+    "splashTheming": false,
+    "tray": false,
+    "spellCheckLanguages": [
+        "en-US"
+    ],
+    "hardwareAcceleration": false,
+    "hardwareVideoAcceleration": false,
+    "nativeTitleBar": false,
+    "staticTitle": false,
+    "enableMenu": false,
+    "enableShadow": true,
+    "enableRoundedCorners": true,
+    "clickTrayToShowHide": false,
+    "disableMinSize": false,
+    "disableSmoothScroll": true,
+    "enableTaskbarFlashing": false,
+    "openLinksWithElectron": false,
+    "autoStartMinimized": false,
+    "splashPixelated": false,
+    "webRTCIPHandlingPolicy": "default",
+    "appBadge": true,
+    "transparencyOption": "none",
+    "hardwareVideoEncoding": false
+}

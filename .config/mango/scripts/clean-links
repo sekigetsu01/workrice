@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+# Copy a link anywhere and the tracking bits (utm_…, fbclid, YouTube's si, Amazon's ref …) come off it on the
+# clipboard. mango starts it with wl-paste --watch; passwords (marked sensitive) and copied pictures are left alone
+import os
+import re
+import subprocess
+import sys
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
+
+ANYWHERE = {
+    "fbclid", "gclid", "gclsrc", "dclid", "gbraid", "wbraid", "msclkid", "yclid", "twclid", "ttclid",
+    "igshid", "igsh", "mc_cid", "mc_eid", "_hsenc", "_hsmi", "mkt_tok", "oly_anon_id", "oly_enc_id",
+    "vero_id", "vero_conv", "wickedid", "rb_clickid", "s_cid", "ref_src", "ref_url", "srsltid",
+    "sharer",
+}
+PREFIXES = ("utm_", "pd_rd_", "pf_rd_", "share_", "sender_")
+BY_SITE = {
+    "youtube.com": {"si", "feature", "pp", "ab_channel", "embeds_referring_euri", "embeds_referring_origin", "source_ve_path"},
+    "youtu.be": {"si", "feature", "pp"},
+    "spotify.com": {"si", "context", "nd", "go"},
+    "soundcloud.com": {"si", "ref", "p", "c"},
+    "instagram.com": {"img_index"},
+    "tiktok.com": {"_r", "_t", "is_from_webapp", "is_copy_url", "u_code", "preview_pb", "web_id", "tt_from", "checksum", "timestamp", "user_id", "social_share_type"},
+    "x.com": {"s", "t"},
+    "twitter.com": {"s", "t"},
+    "reddit.com": {"rdt", "context", "correlation_id"},
+    "linkedin.com": {"trackingId", "refId", "lipi", "trk", "trkInfo", "originalSubdomain"},
+    "amazon.": {"ref", "ref_", "tag", "psc", "smid", "spLa", "crid", "sprefix", "qid", "sr", "keywords", "content-id", "linkCode", "linkId", "th"},
+    "facebook.com": {"mibextid", "rdid", "sfnsn", "__tn__", "__cft__[0]"},
+    "google.": {"ved", "ei", "sa", "usg", "sxsrf", "oq", "gs_lcrp", "gs_lp", "sca_esv", "sca_upv", "sclient", "uact", "bih", "biw", "rlz", "sourceid"},
+}
+
+
+def clean(url):
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    drop = set()
+    for site, extra in BY_SITE.items():
+        if host == site or host.endswith("." + site) or (site.endswith(".") and (host.startswith(site) or "." + site in host)):
+            drop |= extra
+    path = re.sub(r"/ref=[^/]*$", "", parts.path) if "amazon." in host else parts.path
+    query = [q for q in parts.query.split("&") if q]
+    keys = [unquote_plus(q.split("=", 1)[0]) for q in query]
+    keep = [q for q, k in zip(query, keys)
+            if not (k.lower() in ANYWHERE or k.lower().startswith(PREFIXES) or k in drop or k.lower() in drop)]
+    if path == parts.path and len(keep) == len(query):
+        return url
+    return urlunsplit((parts.scheme, parts.netloc, path, "&".join(keep), parts.fragment))
+
+
+def is_image_copy():
+    try:
+        types = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True, timeout=2).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(t.startswith("image/") for t in types)
+
+
+if os.environ.get("CLIPBOARD_STATE") != "sensitive" and not is_image_copy():
+    data = sys.stdin.buffer.read()
+    text = data.strip().decode(errors="replace") if len(data) <= 4000 else ""
+    if re.fullmatch(r"https?://\S+", text):
+        tidy = clean(text)
+        if tidy != text:
+            subprocess.run(["wl-copy", "--", tidy])

@@ -1,0 +1,340 @@
+#!/bin/bash
+# update: the full system update, start to finish with one password: Arch news, packages and AUR, sys-setup, flatpaks,
+#   nvim and yazi plugins, then clean-up and checks (missing libraries, a new kernel, a mango that rejects its config)
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+# the installers run this through sudo -u, whose PATH lacks ~/.local/bin (sys-setup and the scripts it calls)
+export PATH="$HOME/.local/bin:$PATH"
+
+sudo_keep || exit 1
+
+step "Arch news"
+last=$(tac /var/log/pacman.log 2>/dev/null | grep -a -m 1 'starting full system upgrade')
+last=${last:1:24}
+[ -n "$last" ] && feed=$(curl -fsS --max-time 10 https://archlinux.org/feeds/news/) &&
+news=$(LAST="$last" python3 -I -c '
+import os, sys, re, html
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+last = os.environ.get("LAST", "")
+try:
+    since = datetime.fromisoformat(last) if last else None
+    if since and since.tzinfo is None: since = since.replace(tzinfo=timezone.utc)
+except ValueError:
+    since = None
+items = re.findall(r"<item>(.*?)</item>", sys.stdin.read(), re.S)
+if not items: sys.exit(1)
+for item in items:
+    title = re.search(r"<title>(.*?)</title>", item, re.S)
+    date = re.search(r"<pubDate>(.*?)</pubDate>", item, re.S)
+    link = re.search(r"<link>(.*?)</link>", item, re.S)
+    if not (title and date): continue
+    when = parsedate_to_datetime(date.group(1).strip())
+    if since and when <= since: continue
+    print(f"{when:%d %b %Y}  {html.unescape(title.group(1).strip())}\n             {link.group(1).strip() if link else str()}")
+' 2>/dev/null <<<"$feed")
+fetched=$?
+if [ -z "$last" ]; then
+    echo "(no earlier update found in the pacman log; showing nothing)"
+elif [ "$fetched" -ne 0 ]; then
+    echo "(couldn't check Arch news: offline, or the site is down; https://archlinux.org/news/)"
+elif [ -n "$news" ]; then
+    warn "New since your last update ($last):"
+    printf '%s\n' "$news"
+else
+    echo "Nothing new."
+fi
+
+step "System packages"
+upgraded=false
+unlock_pacman
+keys=${XDG_STATE_HOME:-$HOME/.local/state}/update/keyring-refresh
+if [ -z "$(find "$keys" -mtime -7 2>/dev/null)" ]; then
+    echo "Refreshing the keys that sign packages (once a week, about 30 seconds)…"
+    if sudo timeout 120 systemctl start archlinux-keyring-wkd-sync.service >/dev/null 2>&1; then
+        mkdir -p "${keys%/*}" && touch "$keys"
+    else
+        sudo systemctl stop archlinux-keyring-wkd-sync.service >/dev/null 2>&1
+        echo "(couldn't refresh them; pacman still checks signatures with the keys you have)"
+    fi
+fi
+if sudo pacman -Syu --noconfirm; then upgraded=true
+else warn "pacman didn't finish. Scroll up for the error. If it says two packages conflict, run  sudo pacman -Syu  yourself and answer the question."; fi
+
+step "AUR packages"
+aur_ok=true
+if ! $upgraded; then
+    echo "Skipped until the system update above goes through."
+else
+    vcs=$(pacman -Qmq | grep -E -- '-(git|hg|svn|bzr|fossil|darcs)$' | paste -sd ' ')
+    rebuilt=false
+    if [ -n "$vcs" ] && [ ! -s "${XDG_CACHE_HOME:-$HOME/.cache}/yay/vcs.json" ]; then
+        echo "yay lost track of which commit the -git packages came from; building them from the latest source: $vcs"
+        rebuilt=true
+        # shellcheck disable=SC2086
+        yay -S $vcs --sudoloop --noconfirm --answerclean None --answerdiff None --answeredit None --mflags --nocheck ||
+            { aur_ok=false; warn "yay couldn't build all of $vcs (the error is above)."; }
+    fi
+    if aur=$(yay -Qua --devel) && [ -n "$aur" ]; then
+        printf '%s\n' "$aur"
+        yay -Sua --devel --sudoloop --noconfirm --answerclean None --answerdiff None --answeredit None --mflags --nocheck ||
+            { aur_ok=false; warn "yay didn't finish. Scroll up for the error. Everything else is up to date."; }
+    elif $rebuilt; then
+        echo "Nothing else to update."
+    else
+        echo "Nothing to update."
+    fi
+fi
+if $upgraded; then
+    broken=$(for p in $(pacman -Qmq); do
+        pacman -Qlq "$p" | grep -E '^/usr/(bin|lib)/[^/]+$' | while read -r f; do
+            [ -f "$f" ] && ldd "$f" 2>/dev/null | grep -q 'not found' && { echo "$p"; break; }
+        done
+    done | grep -v -- '-debug$')
+    others=$(paste -sd ' ' <<< "$broken")
+    if [ -n "$others" ]; then
+        echo "Building again against the new libraries: $others"
+        # shellcheck disable=SC2086
+        yay -S --rebuild $others --sudoloop --noconfirm --answerclean None --answerdiff None --answeredit None --mflags --nocheck ||
+            { aur_ok=false; warn "yay couldn't build $others again (the error is above), so they won't start."; }
+    fi
+fi
+
+step "System settings"
+setup_ok=true
+if $upgraded; then
+    sys-setup || { setup_ok=false; warn "sys-setup didn't finish everything (the reason is just above)."; }
+else
+    setup_ok=false
+    warn "Skipped: installing more while the update is half done can break programs. Fix the update, then run update again."
+fi
+
+fp_list() {
+    flatpak list --columns=application,branch,name,version,active,options 2>/dev/null |
+        awk -F'\t' '{ print $1 "/" $2 "\t" $3 "\t" $4 "\t" $5 "\t" ($6 ~ /runtime/ ? "runtime" : "app") }' | sort
+}
+fp_ok=
+if command -v flatpak >/dev/null; then
+    step "Flatpak apps"
+    fp_before=$(fp_list)
+    if flatpak update -y --noninteractive; then fp_ok=true; else fp_ok=false; fi
+fi
+
+if command -v nvim >/dev/null; then
+    step "nvim plugins"
+    if nvim --headless +PackUpdate +qa >/dev/null 2>&1; then echo "Done."
+    else warn "nvim plugin update failed (open nvim and run :PackUpdate to see why)."; fi
+fi
+
+if command -v ya >/dev/null; then
+    step "yazi plugins"
+    ya pkg upgrade || warn "yazi plugin update failed (the reason is just above)."
+fi
+
+# clean-up after a system update: orphaned packages, caches, old logs, temp files, app caches unused for a month
+used() { df --output=source,used -B1 / "$HOME" | awk 'NR > 1 && !seen[$1]++ {s += $2} END {print s + 0}'; }
+size() { local s; s=$("$@" 2>/dev/null); printf '%8s  ' "${s%%$'\t'*}"; }
+gone() { size du -sh "$1"; echo "${1/#$HOME/\~}"; rm -rf "$1"; }
+clean_up() {
+    busy=false
+    pacman_busy && busy=true
+    before=$(used)
+
+    step "Orphaned packages"
+    first=true removed=false
+    $busy && { echo "pacman is busy in another window: packages left alone this time."; first=false; }
+    while ! $busy && orphans=$(pacman -Qdtq) && [ -n "$orphans" ]; do
+        first=false
+        # shellcheck disable=SC2086
+        sudo pacman -Rns --noconfirm $orphans || break
+        removed=true
+    done
+    $first && echo "None."
+    # removing orphans can take a library mango or quickshell needs without saying so: checked again before the
+    # package cache (the way back) goes
+    $removed && check_libs
+
+    step "Package cache"
+    if $busy; then
+        echo "pacman is busy in another window: package cache left alone this time."
+    elif ! $ok; then
+        echo "Kept: a check above failed, and the old packages here are what  sudo pacman -U  rolls back to."
+    else
+        size sudo du -sh /var/cache/pacman/pkg; echo /var/cache/pacman/pkg
+        sudo find /var/cache/pacman/pkg -mindepth 1 -delete
+        yc=$HOME/.cache/yay
+        if [ -n "$(find "$yc" -mindepth 1 -maxdepth 1 ! -name vcs.json -print -quit 2>/dev/null)" ]; then
+            size du -sh --exclude=vcs.json "$yc"; echo "${yc/#$HOME/\~} (all but vcs.json)"
+            find "$yc" -mindepth 1 -maxdepth 1 ! -name vcs.json -exec rm -rf {} +
+        fi
+    fi
+
+    step "System"
+    sudo journalctl --vacuum-time=2weeks 2>&1 | tail -n 1
+    sudo find /var/lib/systemd/coredump -mindepth 1 -delete 2>/dev/null
+    if [[ ,$(findmnt -no OPTIONS -T /var/tmp), == *,noatime,* ]]; then
+        echo "(/var/tmp is on a noatime drive, so its old files were left alone)"
+    elif command -v fuser >/dev/null; then
+        sudo find /var/tmp -mindepth 1 -maxdepth 1 ! -name 'systemd-private-*' -mtime +10 -exec sh -c '
+            for e; do
+                [ -z "$(find "$e" \( -type f -atime -10 -o -mtime -10 -o -ctime -10 \) -print -quit)" ] &&
+                    [ -z "$(find "$e" -print0 | xargs -0 -r fuser 2>/dev/null)" ] && rm -rf -- "$e"
+            done' sh {} +
+    else
+        echo "(fuser isn't installed, so old files in /var/tmp were left alone: sudo pacman -S psmisc)"
+    fi
+    echo "Crash dumps and old temp files: done."
+
+    if command -v flatpak >/dev/null; then
+        step "Unused Flatpak runtimes"
+        flatpak uninstall --unused -y --noninteractive
+    fi
+
+    step "App caches"
+    for dir in \
+        "$HOME/.cache/thumbnails" \
+        "$HOME/.cache/pip" \
+        "$HOME/.cache/yarn" \
+        "$HOME/.cache/go-build" \
+        "$HOME/.cache/typescript" \
+        "$HOME/.cache/mesa_shader_cache" \
+        "$HOME/.cache/mesa_shader_cache_db" \
+        "$HOME/.cache/nvidia" \
+        "$HOME/.cache/fontconfig" \
+        "$HOME/.nv/GLCache" \
+        "$HOME/.npm/_cacache" \
+        "$HOME/.cargo/registry/cache" \
+        "$HOME/.cargo/git/db" \
+        "$HOME"/.cache/qtshadercache* \
+        "$HOME"/.var/app/*/cache; do
+        [ -e "$dir" ] && gone "$dir"
+    done
+
+    while IFS= read -r -d '' dir; do
+        parent=${dir%/*}
+        if [ -e "$parent/Local State" ] || [ -e "$parent/Preferences" ]; then gone "$dir"; fi
+    done < <(find "$HOME/.config" "$HOME/.var/app" -maxdepth 5 -type d \
+        \( -name Cache -o -name 'Code Cache' -o -name GPUCache -o -name DawnCache \
+        -o -name DawnGraphiteCache -o -name DawnWebGPUCache -o -name ShaderCache \) -print0 2>/dev/null)
+
+    if [[ ,$(findmnt -no OPTIONS -T "$HOME/.cache"), == *,noatime,* ]]; then
+        echo "      ~/.cache is on a noatime drive: unused app caches left alone"
+    else
+        old=0
+        for dir in "$HOME"/.cache/* "$HOME"/.cache/.[!.]*; do
+            [ -e "$dir" ] || continue
+            case ${dir##*/} in
+                wal|zsh|keepassxc|yazi|nvim|quickshell*|qs_*) continue ;;
+                speak|transcribe|books) continue ;;
+                torch) continue ;;
+            esac
+            [ -n "$(find "$dir" \( \( -type f -atime -30 \) -o -mtime -30 -o -ctime -30 \) -print -quit 2>/dev/null)" ] && continue
+            gone "$dir"
+            old=$((old + 1))
+        done
+        echo "      $old unused app caches in ~/.cache"
+    fi
+
+    step "Tidying"
+    if command -v uv >/dev/null && [ -d "$(uv cache dir 2>/dev/null)" ]; then
+        size du -sh "$(uv cache dir)"; echo "Python package downloads (uv)"
+        timeout 60 uv cache clean -q 2>/dev/null || echo "          (uv is busy installing something: left for next time)"
+    fi
+    for app in "BraveSoftware brave brave-browser brave-beta" "google-chrome google-chrome-stable" "chromium chromium" \
+        "vivaldi vivaldi vivaldi-stable" "spotify spotify" "discord discord" "Code code" "VSCodium codium" "zoom zoom"; do
+        read -r dir cmds <<< "$app"
+        [ -e "$HOME/.cache/$dir" ] || continue
+        for c in $cmds; do command -v "$c" >/dev/null && continue 2; done
+        gone "$HOME/.cache/$dir"
+    done
+    if command -v podman >/dev/null; then
+        podman image prune -f >/dev/null 2>&1
+        podman images --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null | while read -r id name; do
+            case $name in *dangerzone*) continue ;; esac
+            podman rmi "$id" >/dev/null 2>&1 && echo "          ${name%:<none>} (container image)"
+        done
+    fi
+
+    rm -f "$HOME/.local/share/recently-used.xbel"
+
+    after=$(used)
+    freed=$(( before - after ))
+    [ "$freed" -lt 0 ] && freed=0
+    printf '\n\e[1mFreed %s\e[0m\n' "$(numfmt --to=iec --suffix=B "$freed")"
+}
+
+step "Checks"
+ok=true
+check_libs() {
+    local prog bin missing pkg fix
+    for prog in mango quickshell; do
+        bin=$(command -v "$prog") || continue
+        missing=$(ldd "$bin" 2>/dev/null | awk '/not found/ {printf "%s%s", s, $1; s = " "}')
+        if [ -n "$missing" ]; then
+            ok=false
+            if pkg=$(pacman -Qoq "$bin" 2>/dev/null); then fix="yay -S --rebuild $pkg"
+            else fix="a rebuild of $bin"; fi
+            warn "$prog is missing libraries ($missing). Don't log out yet: rebuild it with  $fix"
+        fi
+    done
+}
+check_libs
+if command -v mango >/dev/null && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/mango/config.conf" ] &&
+    { ! out=$(mango -p -c "${XDG_CONFIG_HOME:-$HOME/.config}/mango/config.conf" 2>&1) || [[ $out == *"[ERROR]"* ]]; }; then
+    ok=false
+    printf '%s\n' "$out" | tail -n 20
+    warn "The new mango doesn't accept your config (the problems are just above). Don't log out yet: fix them first."
+fi
+
+$upgraded && clean_up
+# the clean-up pushes the warnings up out of sight
+$ok || warn "Don't log out yet: mango or quickshell has a problem (the reason is above)."
+
+if [ ! -d "/usr/lib/modules/$(uname -r)" ]; then
+    warn "A new kernel was installed: reboot when you can (USB drives and some devices won't work until you do)."
+fi
+if [ -n "$fp_ok" ]; then
+    step "Flatpak"
+    FP_BEFORE=$fp_before FP_AFTER=$(fp_list) python3 -I -c '
+import os
+def rows(v):
+    out = {}
+    for line in os.environ[v].splitlines():
+        f = line.split("\t")
+        if len(f) == 5:
+            out[f[0]] = {"name": f[1] or f[0].split("/")[0], "ver": f[2], "commit": f[3], "kind": f[4]}
+    return out
+a, b = rows("FP_BEFORE"), rows("FP_AFTER")
+def ver(x):
+    return x["ver"] or x["commit"][:7]
+apps = [(k, b[k]) for k in sorted(b, key=lambda k: b[k]["name"].lower()) if b[k]["kind"] == "app"]
+upd = [(k, x) for k, x in apps if k in a and a[k]["commit"] != x["commit"]]
+new = [(k, x) for k, x in apps if k not in a]
+gone = [a[k] for k in sorted(a) if k not in b and a[k]["kind"] == "app"]
+rt_upd = [x["name"] for k, x in b.items() if x["kind"] == "runtime" and k in a and a[k]["commit"] != x["commit"]]
+rt_new = [x["name"] for k, x in b.items() if x["kind"] == "runtime" and k not in a]
+rt_gone = [x["name"] for k, x in a.items() if x["kind"] == "runtime" and k not in b]
+B, R = "\033[1;32m", "\033[0m"
+for k, x in upd:
+    old = ver(a[k])
+    print(f"  {B}Updated{R} {x["name"]}: " + (f"{old} → {ver(x)}" if old != ver(x) else f"{ver(x)} (a new build)"))
+for k, x in new:
+    print(f"  {B}Installed{R} {x["name"]} {ver(x)}")
+for x in gone:
+    print(f"  Removed {x["name"]}")
+def some(names):
+    names = sorted(set(names))
+    return ", ".join(names[:4]) + (f" and {len(names) - 4} more" if len(names) > 4 else "")
+if rt_upd:
+    print(f"  Runtimes updated ({len(rt_upd)}): {some(rt_upd)}")
+if rt_new:
+    print(f"  Runtimes added ({len(rt_new)}): {some(rt_new)}")
+if rt_gone:
+    print(f"  Runtimes removed ({len(rt_gone)}): {some(rt_gone)}")
+if not (upd or new or gone or rt_upd or rt_new or rt_gone):
+    print("  Nothing updated: every flatpak was already up to date.")
+'
+    $fp_ok || warn "flatpak update didn't finish (the reason is under Flatpak apps above): what's listed here did change."
+fi
+
+if $ok && $upgraded && $setup_ok && $aur_ok && ${fp_ok:-true}; then [ -d "/usr/lib/modules/$(uname -r)" ] && echo "All good."; exit 0; else exit 1; fi

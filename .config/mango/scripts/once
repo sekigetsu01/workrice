@@ -1,0 +1,11 @@
+#!/bin/bash
+# once NAME CMD...: runs CMD once per key press. mango repeats a held key, and every repeat comes within 0.25 s
+# of the one before, so those are skipped (holding a key runs it once, not over and over)
+f=${XDG_RUNTIME_DIR:-/tmp}/once-$1
+shift
+now=${EPOCHREALTIME/[.,]/}
+last=0
+{ read -r last < "$f"; } 2>/dev/null
+echo "$now" > "$f"
+(( now - last >= 0 && now - last < 250000 )) && exit 0
+exec "$@"

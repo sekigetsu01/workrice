@@ -1,0 +1,10 @@
+#!/bin/sh
+# set-zone ZONE [--install]: sets the time zone through the root helper, which needs no password.
+# Exit 3: the helper isn't installed (or changed): run again with --install, the password on stdin, once.
+lib=$HOME/.local/lib
+root=/usr/local/lib/tz-root
+if [ "${2:-}" = --install ]; then
+    sudo -S -p '' sh "$lib/tz-install" || exit 1
+fi
+cmp -s "$lib/tz-root" "$root" && sudo -n -l "$root" >/dev/null 2>&1 || exit 3
+exec sudo -n "$root" "$1"

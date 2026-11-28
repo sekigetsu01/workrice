@@ -1,0 +1,22 @@
+#!/bin/sh
+# The calculator's exchange rates (frankfurter.dev: the ECB's daily rates), saved for 12 hours.
+#   fx        what's saved, whatever its age (nothing when there's none); exit 3 when it's missing or over 12 hours old
+#   fx fetch  downloads new ones: the calculator's Update rates button (bottom right)
+f="${XDG_CACHE_HOME:-$HOME/.cache}/quickshell-fx.json"
+if [ "$1" = fetch ]; then
+    v=$(sed -n 's/^Milestone=\([0-9]*\).*/\1/p' /opt/glide-browser-bin/platform.ini 2>/dev/null)
+    v=${v:-159}
+    mkdir -p "${f%/*}"
+    if curl -fsS --max-time 8 -A "Mozilla/5.0 (X11; Linux x86_64; rv:$v.0) Gecko/20100101 Firefox/$v.0" \
+        -H 'Accept: application/json' -H 'Accept-Language: en-US,en;q=0.5' \
+        https://api.frankfurter.dev/v1/latest > "$f.tmp" 2>/dev/null && [ -s "$f.tmp" ]; then
+        mv -f "$f.tmp" "$f"
+    else
+        rm -f "$f.tmp"
+        notify-send --app-name=Calculator "Couldn't update the exchange rates" "Offline, or frankfurter.dev is down: the saved ones are still used"
+        exit 1
+    fi
+fi
+[ -s "$f" ] || exit 3
+cat "$f"
+[ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 43200 ] || exit 3

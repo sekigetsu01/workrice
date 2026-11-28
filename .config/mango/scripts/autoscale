@@ -1,0 +1,61 @@
+#!/bin/bash
+# Every monitor scaled so things look the same size as on this laptop at scale 1.
+# AUTOSCALE_DIST: how far away you sit from an external monitor, in cm (default 70; the laptop's own screen is 50).
+# ~/.config/mango/scale-overrides: a monitor you want bigger or smaller, one per line, "name scale" (a name from
+# wlr-randr, e.g. "DP-1 1.25"); a set scale always wins.
+command -v wlr-randr >/dev/null || { notify-send --app-name=Display "Screens not scaled" "wlr-randr isn't installed (sys-setup installs it)."; exit 1; }
+
+apply() {
+    wlr-randr --json 2>/dev/null | python3 -I -c '
+import json, os, sys
+REF_PPI, REF_DIST = 1920 / (340 / 25.4), 50
+dist_ext = float(os.environ.get("AUTOSCALE_DIST") or 70)
+overrides = {}
+try:
+    for line in open(os.path.expanduser("~/.config/mango/scale-overrides")):
+        parts = line.split("#")[0].split()
+        if len(parts) == 2:
+            overrides[parts[0]] = float(parts[1])
+except (OSError, ValueError):
+    pass
+for o in json.load(sys.stdin):
+    if not o.get("enabled"):
+        continue
+    mode = next((m for m in o.get("modes", []) if m.get("current")), None)
+    if not mode:
+        continue
+    name = o["name"]
+    if name in overrides:
+        want = overrides[name]
+    else:
+        rotated = str(o.get("transform", "normal")) in ("90", "270", "flipped-90", "flipped-270")
+        px = mode["height"] if rotated else mode["width"]
+        size = o.get("physical_size") or {}
+        mm = (size.get("height") if rotated else size.get("width")) or 0
+        ppi = px / (mm / 25.4) if mm else 0
+        internal = name.startswith(("eDP", "LVDS", "DSI"))
+        if 50 <= ppi <= 400:
+            raw = ppi * (REF_DIST if internal else dist_ext) / (REF_PPI * REF_DIST)
+        else:
+            raw = (mode["width"] if rotated else mode["height"]) / 1080
+        want = max(1.0, round(raw * 8) / 8)
+    if abs(float(o.get("scale", 1)) - want) > 0.01:
+        print(name, want)
+' | while read -r name scale; do
+        wlr-randr --output "$name" --scale "$scale"
+    done
+}
+
+apply
+mmsg watch all-monitors 2>/dev/null | python3 -I -u -c 'import json, sys
+last = None
+for line in sys.stdin:
+    try:
+        names = " ".join(sorted(m["name"] for m in json.loads(line)["monitors"]))
+    except Exception:
+        continue
+    if names != last:
+        last = names
+        print(names)' | while read -r _; do
+    apply
+done

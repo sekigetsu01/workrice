@@ -1,0 +1,578 @@
+#!/bin/bash
+# books: the Books audiobook player (Alt+b): your audiobooks in ~/Audiobooks, where you stopped, chapters, bookmarks
+#   books · books FILE · books --paused FILE · books LINK (a YouTube video downloaded into your books and played)
+set -o pipefail
+SELF=$(readlink -f "$0")
+LIB=${BOOKS_DIR:-$HOME/Audiobooks}
+LIB=${LIB%/}
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/books
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/books
+SOCK=${XDG_RUNTIME_DIR:-/tmp}/books.sock
+SPEAK=$HOME/.local/bin/speak
+C=$'\033[34m' M=$'\033[90m' B=$'\033[1m' R=$'\033[0m'
+URLRE='^[A-Za-z][A-Za-z0-9+.-]*://'
+YTMODE=$STATE/list.yt
+export BOOKS_DIR=$LIB
+unset FZF_DEFAULT_OPTS FZF_DEFAULT_OPTS_FILE
+APP=books
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+
+lib() { python3 -I "$CONF/lib.py" "$@"; }
+trim() { local s=${1#"${1%%[![:space:]]*}"}; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+
+cols() {
+    local c=${FZF_COLUMNS:-}
+    [[ $c =~ ^[0-9]+$ ]] && [ "$c" -ge 20 ] || c=$(stty size 2>/dev/null </dev/tty | cut -d ' ' -f 2)
+    [[ $c =~ ^[0-9]+$ ]] || c=100
+    if [ "$c" -ge 90 ]; then echo $((c * 60 / 100 - 9)); else echo $((c - 9)); fi
+}
+
+reload_act() { printf 'reload-sync(python3 -I "%s" rows %s)' "$CONF/lib.py" "$(cols)"; }
+
+label() {
+    local n
+    n=$(lib count 2>/dev/null)
+    printf ' Books  ·  %s book%s ' "${n:-0}" "$([ "${n:-0}" = 1 ] || echo s)"
+}
+
+start_player() {
+    need mpv
+    mkdir -p "$STATE" "$LIB"
+    if ! alive; then
+        rm -f -- "$SOCK"
+        local s
+        local -a mpris=()
+        for s in /usr/lib/mpv-mpris/mpris.so /etc/mpv/scripts/mpris.so /usr/lib/mpv/mpris.so /usr/share/mpv/scripts/mpris.so; do
+            [ -e "$s" ] && { mpris=(--script="$s"); break; }
+        done
+        BOOKS_STATE=$STATE BOOKS_BIN=$SELF mpv --config-dir="$CONF" --input-ipc-server="$SOCK" --no-terminal --idle=yes \
+            "${mpris[@]}" </dev/null >/dev/null 2>&1 &
+        PID=$!
+
+        for _ in $(seq 50); do alive && break; sleep 0.1; done
+    else
+        PID=$(ipc get_property pid)
+    fi
+}
+
+open_book() {
+    local f
+    f=$(lib open "$@") || die "Can't find that book any more"
+    ipc script-message books-open "$f" ${BOOKS_PAUSED:+paused} >/dev/null || die "Couldn't reach the player"
+}
+
+play_loop() {
+    [ -t 0 ] && [ -t 1 ] || exit 0
+    trap 'ipc quit >/dev/null 2>&1; kill "$PID" 2>/dev/null; exit 0' HUP TERM
+    export BOOKS_BIN=$SELF
+    while :; do
+        python3 -I "$CONF/screen.py" "$SOCK" "$PID"
+        rc=$?
+        [ "$rc" = 10 ] && kill -0 "$PID" 2>/dev/null || { ipc quit >/dev/null 2>&1; exit "$rc"; }
+        BOOKS_HERE=1 picker || true
+        kill -0 "$PID" 2>/dev/null || exit 0
+    done
+}
+
+picker() {
+    local out sel key keyp rc
+    need fzf
+    mkdir -p "$STATE" "$LIB"
+    fzstyle
+    rm -f -- "$YTMODE"
+    out=$STATE/fzout
+    local -a tab=() lab=() pv=()
+    pv=(--preview="python3 -I \"$CONF/lib.py\" preview {1}" --preview-window="left,40%,border-rounded$NI,<36(hidden)" --preview-label=' Now ')
+    if [ -n "$TABLE" ]; then
+        tab=(--list-border=rounded --input-border=rounded --highlight-line '--margin=1,2%'
+            --color='bg+:4,fg+:0:bold,hl+:0:bold:underline,current-bg:4,current-fg:0,list-border:4,input-border:4,preview-border:4,list-label:4:bold,preview-label:4:bold')
+        lab=(--header="$(lib colhead "$(cols)")" --list-label="$(label)")
+    else
+        pv=(--preview="python3 -I \"$CONF/lib.py\" preview {1}" --preview-window="right,45%$NI")
+    fi
+    local lsock=${XDG_RUNTIME_DIR:-/tmp}/books-list.$$.sock refresher=''
+    local reload="transform(\"$SELF\" --reload-act)"
+    local -a listen=()
+    if command -v curl >/dev/null && fzf_has --listen="$lsock"; then
+        listen=(--listen="$lsock")
+        (
+            was=''
+            while sleep 3; do
+                now=$(lib making 2>/dev/null)
+                [ "${now:-0}" != 0 ] || [ -n "$was" ] || continue
+                [ "${now:-0}" != 0 ] && was=1 || was=''
+                [ -S "$lsock" ] && curl -s -m 2 --unix-socket "$lsock" --data-binary "$reload" http://localhost/ >/dev/null 2>&1
+            done
+        ) &
+        refresher=$!
+    fi
+    lib rows "$(cols)" | fzf "${FZS[@]}" "${PROMPT[@]}" "${tab[@]}" "${lab[@]}" "${pv[@]}" "${listen[@]}" --exact --delimiter='\t' --with-nth=3 \
+        --no-sort --expect=ctrl-r --print-query \
+        --bind "start,resize:execute-silent(\"$SELF\" --hold-size)+clear-screen${TABLE:++transform-header(\"$SELF\" --colhead)}+$reload" \
+        --bind "enter:transform:\"$SELF\" --enter {1}" \
+        --bind "ctrl-y:transform:\"$SELF\" --find" \
+        --bind "esc:transform:\"$SELF\" --esc" \
+        --bind "load:transform:\"$SELF\" --loaded" \
+        --bind "ctrl-e:execute(\"$SELF\" --rename {1})+$reload${TABLE:++transform-list-label(\"$SELF\" --label)}" \
+        --bind "alt-x:execute-silent(\"$SELF\" --cancel {1})+$reload" \
+        --bind "alt-s:execute-silent(python3 -I \"$CONF/lib.py\" pause)+$reload" \
+        --bind "ctrl-d:execute-silent(\"$SELF\" --delete {1})+$reload${TABLE:++transform-list-label(\"$SELF\" --label)}" \
+        --bind "alt-l:execute-silent(\"$SELF\" --link {1})" \
+        > "$out"
+    rc=$?
+    [ -n "$refresher" ] && kill "$refresher" 2>/dev/null
+    rm -f -- "$lsock"
+    rm -f -- "$YTMODE"
+    [ "$rc" = 130 ] && return 0
+    q=$(trim "$(sed -n 1p "$out")")
+    keyp=$(sed -n 2p "$out")
+    sel=$(sed -n 3p "$out")
+    key=${sel%%$'\t'*}
+    [ -z "$key" ] && [[ $q =~ $URLRE ]] && key=$q
+    if [[ $key =~ $URLRE ]]; then
+        play_link "$key" || { picker; return; }
+        [ -n "${BOOKS_HERE:-}" ] && return 0
+        play_loop
+    fi
+    case $key in
+        ''|:wait|:dl:*|:sep) return 0 ;;
+        :resume) key=$(lib last); [ -n "$key" ] || return 0 ;;
+        :new) make_book; [ -n "${BOOKS_HERE:-}" ] && { picker; return; }; exec "$SELF" ;;
+        :making:*) return 0 ;;
+    esac
+    start_player
+    if [ "$keyp" = ctrl-r ]; then open_book "$key" fresh; else open_book "$key"; fi
+    [ -n "${BOOKS_HERE:-}" ] && return 0
+    play_loop
+}
+
+enter_act() {
+    local q
+    q=$(trim "${FZF_QUERY:-}")
+    case ${FZF_LIST_LABEL:-} in *searching*) return ;; esac
+    if [[ $q =~ $URLRE ]]; then echo accept; return; fi
+    case ${1:-} in
+        :making:*|:dl:*|:wait|:sep) ;;
+        '') [ -n "$q" ] && find_act ;;
+        *) echo accept ;;
+    esac
+}
+
+find_act() {
+    local q
+    q=$(trim "${FZF_QUERY:-}")
+    [ -n "$q" ] || return 0
+    printf '%s' "execute-silent(: > '$YTMODE')+reload(\"$SELF\" --yt-search {q})+clear-query+first+change-prompt(YouTube › )+change-list-label( YouTube  ·  searching… )+transform-header(\"$SELF\" --colhead)"
+}
+
+esc_act() {
+    if [ -e "$YTMODE" ]; then
+        rm -f -- "$YTMODE"
+        printf '%s' "$(reload_act)+clear-query+first+change-prompt(› )+transform-header(\"$SELF\" --colhead)+transform-list-label(\"$SELF\" --label)"
+    else
+        echo abort
+    fi
+}
+
+loaded_act() {
+    case ${FZF_LIST_LABEL:-} in
+        *searching*) printf '%s' "$(reload_act)+change-list-label( YouTube )+first" ;;
+        ' YouTube ')
+            [ "${FZF_TOTAL_COUNT:-0}" = 0 ] || return 0
+            if [ -n "$(ip -brief link show type tun 2>/dev/null)" ]; then
+                printf '%s' 'change-list-label( YouTube  ·  nothing found )'
+            else
+                printf '%s' 'change-list-label( YouTube  ·  nothing found  ·  it hides some words in the UK: try again with the VPN on, Super+u )'
+            fi ;;
+    esac
+}
+
+yt_search() {
+    local q=$*
+    printf ':wait\t\t%s   searching YouTube…%s\n' "$M" "$R"
+    command -v yt-dlp >/dev/null || return 0
+    mkdir -p "$STATE"
+    shopt -s nocasematch
+    [[ $q == *audio* || $q == *podcast* || $q == *lecture* ]] || q+=" audiobook"
+    shopt -u nocasematch
+    yt-dlp --flat-playlist --no-warnings --ignore-config --print $'%(url)s\t%(title)s\t%(channel,uploader|)s\t%(duration|0)s' \
+        -- "ytsearch25:$q" 2>/dev/null > "$STATE/ytlast.tsv.part"
+    mv -f -- "$STATE/ytlast.tsv.part" "$STATE/ytlast.tsv"
+}
+
+play_link() {
+    local url=$1 f dl h k pct title line
+    f=$(lib ytfile "$url")
+    if [ -z "$f" ]; then
+        need yt-dlp
+        h=$(printf %s "$url" | md5sum)
+        dl=$STATE/dl/${h%% *}
+        setsid -f "$SELF" --yt-get "$url" </dev/null >/dev/null 2>&1
+        for _ in $(seq 30); do [ -f "$dl" ] && break; sleep 0.1; done
+        printf '\033[?25l'
+        while [ -f "$dl" ]; do
+            line=$(cat -- "$dl" 2>/dev/null)
+            IFS=$'\x1f' read -r _ title pct _ <<< "${line//$'\t'/$'\x1f'}"
+            printf '\033[H\033[2J\n  %sDownloading%s  %s\n\n  %s%s%s' "$B" "$R" "${title:-from YouTube…}" "$C" "${pct:-starting}" "$R"
+            read -rsn1 -t 0.5 k </dev/tty && [ "$k" = q ] && { printf '\033[?25h'; return 1; }
+        done
+        printf '\033[?25h'
+        f=$(lib ytfile "$url")
+        [ -n "$f" ] || return 1
+    fi
+    start_player
+    open_book "$f"
+}
+
+yt_get() {
+    local url=$1 h tmp dl title f name dest n pct
+    h=$(printf %s "$url" | md5sum)
+    h=${h%% *}
+    dl=$STATE/dl/$h
+    tmp=$LIB/.yt-$h
+    mkdir -p "$STATE/dl" "$LIB"
+    if [ -f "$dl" ]; then
+        kill -0 "$(cut -f4 "$dl")" 2>/dev/null && return 0
+    fi
+    [ -n "$(lib ytfile "$url")" ] && return 0
+    printf '%s\t\t\t%s\n' "$url" "$$" > "$dl"
+    # shellcheck disable=SC2064
+    trap "rm -rf -- '$tmp' '$dl'; exit 1" HUP INT TERM
+    title=$(awk -F'\t' -v u="$url" '$1 == u { print $2; exit }' "$STATE/ytlast.tsv" 2>/dev/null)
+    [ -n "$title" ] || title=$(yt-dlp --ignore-config --no-warnings --no-playlist --skip-download --print title -- "$url" 2>/dev/null | head -n 1)
+    title=${title//$'\t'/ }
+    printf '%s\t%s\t\t%s\n' "$url" "$title" "$$" > "$dl.part" && mv -f -- "$dl.part" "$dl"
+    rm -rf -- "$tmp"
+    mkdir -p "$tmp"
+    yt-dlp --ignore-config --no-warnings --no-playlist -f 'bestaudio[ext=m4a]/bestaudio' \
+        --embed-metadata --embed-chapters --embed-thumbnail --convert-thumbnails jpg \
+        --newline --progress-template 'download:%(progress._percent_str)s' \
+        -o "$tmp/%(title).150B.%(ext)s" -- "$url" 2>/dev/null |
+        while IFS= read -r pct; do
+            pct=$(trim "$pct")
+            [[ $pct == *% ]] && printf '%s\t%s\t%s\t%s\n' "$url" "$title" "$pct" "$$" > "$dl.part" && mv -f -- "$dl.part" "$dl"
+        done
+    f=''
+    for n in "$tmp"/*; do
+        case ${n,,} in *.m4a|*.m4b|*.opus|*.webm|*.mp3|*.ogg|*.mka|*.aac) f=$n; break ;; esac
+    done
+    if [ -z "$f" ]; then
+        rm -rf -- "$tmp" "$dl"
+        notify --urgency=critical "Books" "Couldn't download ${title:-it} from YouTube"
+        return 1
+    fi
+    name=${f##*/}
+    dest=$LIB/$name
+    n=2
+    while [ -e "$dest" ]; do dest="$LIB/${name%.*} ($n).${name##*.}"; n=$((n + 1)); done
+    mv -- "$f" "$dest"
+    rm -rf -- "$tmp"
+    lib ytdone "$url" "$dest"
+    rm -f -- "$dl"
+    notify "Books" "Downloaded ${title:-${name%.*}}: it's in your books"
+}
+
+link_book() {
+    local key=${1:-}
+    case $key in
+        :resume) key=$(lib last) ;;
+        :*|'') return 0 ;;
+    esac
+    [ -n "$key" ] && [ -e "$key" ] || return 0
+    setsid -f "$HOME/.local/bin/bookset" link audio "$key" </dev/null >/dev/null 2>&1
+}
+
+delete_book() {
+    local key=${1:-} name e
+    local -a items
+    case $key in
+        :making:*) lib cancel "${key#:making:}"; return 0 ;;
+        :dl:*) yt_cancel "${key#:dl:}"; return 0 ;;
+        ''|:*) return 0 ;;
+    esac
+    [ -e "$key" ] && [[ $key == "$LIB"/* ]] || return 0
+    name=$(lib info "$key" | cut -f2)
+    items=("$key")
+    if [ -f "$key" ]; then
+        for e in jpg jpeg png webp; do [ -f "${key%.*}.$e" ] && items+=("${key%.*}.$e"); done
+    fi
+    if alive && [ "$(now_playing)" = "$key" ]; then
+        ipc script-message books-close "$key" >/dev/null 2>&1
+        for _ in $(seq 10); do [ "$(now_playing)" = "$key" ] || break; sleep 0.1; done
+    fi
+    if rm -rf -- "${items[@]}"; then
+        lib forget "$key"
+        notify "Books" "Deleted ${name:-${key##*/}}"
+    else
+        notify --urgency=critical "Books" "Couldn't delete ${name:-${key##*/}}"
+    fi
+}
+
+now_playing() { ipc get_property user-data/music/now 2>/dev/null | jq -r '.path // empty' 2>/dev/null; }
+
+focus_window() {
+    local id
+    id=$(mmsg get all-clients 2>/dev/null | jq -r '[.clients[]? | select(.appid == "books")][0].id // empty' 2>/dev/null)
+    [ -n "$id" ] && ~/.config/mango/scripts/mm bring "$id" >/dev/null 2>&1
+}
+
+toggle_window() {
+    local id focused
+    read -r id focused < <(mmsg get all-clients 2>/dev/null |
+        jq -r '[.clients[]? | select(.appid == "books")][0] // empty | "\(.id) \(.is_focused == true and .is_minimized != true)"' 2>/dev/null)
+    [ -n "$id" ] || return 1
+    if [ "$focused" = true ]; then
+        mmsg dispatch minimized "client,$id" >/dev/null 2>&1
+    else
+        ~/.config/mango/scripts/mm bring "$id" >/dev/null 2>&1
+    fi
+}
+
+yt_cancel() {
+    local h p
+    h=$(printf %s "$1" | md5sum)
+    h=${h%% *}
+    p=$(cut -f4 "$STATE/dl/$h" 2>/dev/null)
+    [ -n "$p" ] && pkill -TERM -P "$p" 2>/dev/null
+    [ -n "$p" ] && kill "$p" 2>/dev/null
+    rm -rf -- "$LIB/.yt-$h" "$STATE/dl/$h"
+}
+
+rename_book() {
+    local key=${1:-} info a t na nt base ext name new now
+    case $key in ''|:*) return 0 ;; esac
+    [ -e "$key" ] && [[ $key == "$LIB"/* ]] || { notify "Books" "Only books in ${LIB/#$HOME/\~} can be renamed"; return 0; }
+    info=$(lib info "$key")
+    a=${info%%$'\t'*} t=${info#*$'\t'}
+    base=${key##*/}
+    ext=''
+    [ -f "$key" ] && { ext=.${base##*.}; base=${base%.*}; }
+    printf '\033[H\033[2J\n  %sRename this book%s\n\n' "$B" "$R"
+    read -r -e -i "$t" -p "  Title     › " nt || return 0
+    read -r -e -i "$a" -p "  Author    › " na || return 0
+    nt=$(trim "${nt//$'\t'/ }") na=$(trim "${na//$'\t'/ }")
+    [ -n "$nt" ] || return 0
+    name=$base
+    { [ "$na" != "$a" ] || [ "$nt" != "$t" ]; } && name=${na:+$na - }$nt
+    name=${name//\//-}
+    read -r -e -i "$name" -p "  ${ext:+File}${ext:-Folder} name › " name || return 0
+    name=$(trim "${name//\//-}")
+    [ -n "$name" ] || return 0
+    if { [ "$na" != "$a" ] || [ "$nt" != "$t" ]; } && ! lib retag "$key" "$nt" "$na" 2>/dev/null; then
+        notify --urgency=critical "Books" "Couldn't change the title and author in ${key##*/}"
+        return 1
+    fi
+    new=$key
+    if [ "$name" != "$base" ]; then
+        new=${key%/*}/$name$ext
+        [ -e "$new" ] && { notify --urgency=critical "Books" "There's already a ${new##*/}"; return 1; }
+        alive && ipc script-message books-rekey "$key" "$new" >/dev/null 2>&1
+        mv -- "$key" "$new" || { notify --urgency=critical "Books" "Couldn't rename ${key##*/}"; return 1; }
+        if [ -f "$new" ]; then
+            for e in jpg jpeg png webp; do [ -f "${key%.*}.$e" ] && mv -- "${key%.*}.$e" "${new%.*}.$e"; done
+        fi
+        lib rekey "$key" "$new"
+    fi
+    now=$(now_playing)
+    if [ -n "$now" ] && { [ "$now" = "$key" ] || [ "$now" = "$new" ]; }; then
+        [ "$(ipc get_property pause)" = true ] && export BOOKS_PAUSED=1
+        ipc set_property pause yes >/dev/null 2>&1
+        sleep 0.3
+        open_book "$new"
+    fi
+    notify "Books" "Renamed: $nt${na:+ by $na}"
+}
+
+SAMPLEPID=${XDG_RUNTIME_DIR:-/tmp}/books-sample.pid
+sample_stop() {
+    local p
+    p=$(cat -- "$SAMPLEPID" 2>/dev/null)
+    [ -n "$p" ] && kill -- "-$p" 2>/dev/null
+    rm -f -- "$SAMPLEPID"
+}
+
+sample() {
+    local v=${1:-} d=${XDG_CACHE_HOME:-$HOME/.cache}/books/voices f
+    case $v in ''|*/*) return 0 ;; esac
+    sample_stop
+    echo $$ > "$SAMPLEPID"
+    f=$d/$v.opus
+    if [ ! -s "$f" ]; then
+        mkdir -p "$d"
+        printf 'This is %s. White snow blankets the land as I travel alone through heaven and earth. Alone without any attachments, my solitary shadow travels freely.' "$v" |
+            DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null "$SPEAK" -v "$v" -o "$d/.$v.part.opus" - >/dev/null 2>&1 && mv -f -- "$d/.$v.part.opus" "$f" || {
+            rm -f -- "$d/.$v.part.opus"
+            notify --urgency=critical "Books" "Couldn't make a sample of $v"
+            return 1
+        }
+    fi
+    mpv --no-config --no-video --really-quiet -- "$f" </dev/null >/dev/null 2>&1
+    [ "$(cat -- "$SAMPLEPID" 2>/dev/null)" = $$ ] && rm -f -- "$SAMPLEPID"
+}
+
+make_book() {
+    local book voice sel out
+    [ -x "$SPEAK" ] || { notify --urgency=critical "Books" "speak isn't installed"; return 0; }
+    fzstyle
+    printf '\033[H\033[2J'
+    out=$(python3 -I "$CONF/lib.py" bookfiles | fzf "${FZS[@]}" "${PROMPT[@]}" --margin='1,3%' --delimiter='\t' --with-nth=3 --exact --print-query \
+        --header="$B""Make an audiobook$R") || [ $? = 1 ] || return 0
+    sel=$(sed -n 2p <<< "$out" | cut -f1)
+    if [ -z "$sel" ]; then
+        sel=$(sed -n 1p <<< "$out")
+        sel=${sel/#\~/$HOME}
+    fi
+    [ -n "$sel" ] && [ -f "$sel" ] || return 0
+    book=$sel
+    local sd=${XDG_DATA_HOME:-$HOME/.local/share}/speak
+    if [ ! -f "$sd/venv/.ok" ] || [ ! -s "$sd/kokoro-v1.0.onnx" ] || [ ! -s "$sd/voices-v1.0.bin" ]; then
+        printf '\033[H\033[2J'
+        local t
+        t=$(tty) || return 0
+        "$SPEAK" -l <"$t" >"$t" 2>&1 || return 0
+    fi
+    sel=$("$SPEAK" --voices-tsv 2>/dev/null |
+        awk -F'\t' -v C="$C" -v M="$M" -v R="$R" '{ printf "%s\t\t%s♪%s  %-8s %s%s%s%s\n", $1, C, R, $1, M, $2, ($3 == "default" ? "   (your usual)" : ""), R }' |
+        fzf "${FZS[@]}" --margin='1,3%' --delimiter='\t' --with-nth=3 --no-sort \
+            --header="$B""Make an audiobook$R   $M${book##*/}$R" \
+            --bind "tab:execute-silent(setsid -f \"$SELF\" --sample {1} </dev/null >/dev/null 2>&1)") || { sample_stop; return 0; }
+    sample_stop
+    voice=${sel%%$'\t'*}
+    [ -n "$voice" ] || return 0
+    "$SPEAK" --add -v "$voice" "$book" >/dev/null 2>&1 &
+    sleep 1
+    return 0
+}
+
+marks() {
+    local key=$1
+    need fzf
+    fzstyle
+    export BOOKS_KEY=$key
+    lib marks "$key" | fzf "${FZS[@]}" --margin='1,3%' --delimiter='\t' --with-nth=3 --no-sort --no-input \
+        --header="$B""Bookmarks$R" \
+        --bind 'j:down,k:up,g:first,G:last,q:abort' \
+        --bind "enter:execute-silent(\"$SELF\" --ipc script-message books-jump {1} {2})+abort" \
+        --bind "d,ctrl-x:execute-silent(python3 -I \"$CONF/lib.py\" delmark \"\$BOOKS_KEY\" {1} {2}; \"$SELF\" --ipc script-message books-marks-changed)+reload(python3 -I \"$CONF/lib.py\" marks \"\$BOOKS_KEY\")" \
+        >/dev/null
+    exit 0
+}
+
+skips() {
+    local key=$1
+    need fzf
+    fzstyle
+    export BOOKS_KEY=$key
+    lib skips "$key" | fzf "${FZS[@]}" --margin='1,3%' --delimiter='\t' --with-nth=3 --no-sort --no-input \
+        --header="$B""Skips$R" \
+        --bind 'j:down,k:up,g:first,G:last,q:abort' \
+        --bind "enter:execute-silent(\"$SELF\" --ipc script-message books-jump {1} {2})+abort" \
+        --bind "d,ctrl-x:execute-silent(python3 -I \"$CONF/lib.py\" delskip \"\$BOOKS_KEY\" {1} {2}; \"$SELF\" --ipc script-message books-skips-changed)+reload(python3 -I \"$CONF/lib.py\" skips \"\$BOOKS_KEY\")" \
+        >/dev/null
+    exit 0
+}
+
+hold_size() {
+    command -v mmsg >/dev/null 2>&1 && [ -n "${WAYLAND_DISPLAY:-}" ] || return 0
+    setsid -f python3 -I /dev/fd/3 "${XDG_CONFIG_HOME:-$HOME/.config}/mango/config.conf" "${XDG_RUNTIME_DIR:-/tmp}/books-size.lock" \
+        </dev/null >/dev/null 2>&1 3<<'EOF' || true
+import fcntl, json, re, subprocess, sys, time
+conf, lock = sys.argv[1:3]
+want = (980, 500)
+try:
+    for l in open(conf, encoding="utf-8", errors="replace"):
+        l = l.strip()
+        if l.startswith("window_rule") and re.search(r"app_id:\s*books\s*(,|$)", l):
+            w, h = re.search(r"width:\s*(\d+)", l), re.search(r"height:\s*(\d+)", l)
+            if w and h:
+                want = (int(w.group(1)), int(h.group(1)))
+except OSError:
+    pass
+try:
+    lk = open(lock, "w")
+    fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(0)
+
+def ours():
+    try:
+        r = subprocess.run(["mmsg", "get", "all-clients"], capture_output=True, text=True, timeout=2)
+        d = json.loads(r.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    cs = d.get("clients", []) if isinstance(d, dict) else d
+    return {c["id"]: (c.get("width"), c.get("height")) for c in cs if isinstance(c, dict) and c.get("appid") == "books"
+            and c.get("is_floating") and not c.get("is_fullscreen") and not c.get("is_maximized")
+            and not c.get("is_fakefullscreen") and "id" in c}
+
+prev = None
+for _ in range(40):
+    now = ours()
+    if now is None:
+        sys.exit(0)
+    if now == prev:
+        break
+    prev = now
+    time.sleep(0.35)
+for cid, wh in (prev or {}).items():
+    if wh != want:
+        subprocess.run(["mmsg", "dispatch", f"resizewin,{want[0]},{want[1]}", f"client,{cid}"], capture_output=True, timeout=2)
+EOF
+}
+
+case ${1:-} in
+    --enter) shift; enter_act "$@"; exit ;;
+    --reload-act) reload_act; exit ;;
+    --label) label; exit ;;
+    --sample) shift; sample "$@"; exit ;;
+    --delete) shift; delete_book "$@"; exit ;;
+    --link) shift; link_book "$@"; exit ;;
+    --cancel) shift; case ${1:-} in :making:*) lib cancel "${1#:making:}" ;; :dl:*) yt_cancel "${1#:dl:}" ;; esac; exit ;;
+    --find) find_act; exit ;;
+    --esc) esc_act; exit ;;
+    --loaded) loaded_act; exit ;;
+    --colhead) lib colhead "$(cols)"; exit ;;
+    --yt-search) shift; yt_search "$*"; exit ;;
+    --yt-get) shift; yt_get "$1"; exit ;;
+    --marks) shift; marks "$1" ;;
+    --skips) shift; skips "$1" ;;
+    --rename) shift; rename_book "$@"; exit ;;
+    --ipc) shift; ipc "$@" >/dev/null; exit ;;
+    --hold-size) hold_size; exit 0 ;;
+    --window) shift; term_exec --app-id=books-popup --title="$APP" "${WINDOW_OPTS[@]}" -e "${SELF:-$0}" "$@" ;;
+    --paused) shift; export BOOKS_PAUSED=1 ;;
+    -h|--help)
+        printf 'books            open the Books player (your audiobooks in %s)\n' "${LIB/#$HOME/\~}"
+        printf 'books FILE       play an audiobook file\n'
+        printf 'books --paused FILE   open it ready where you stopped, not playing\n'
+        printf 'books LINK       download a YouTube video into your books and play it\n'
+        exit 0 ;;
+esac
+
+if [ $# -gt 0 ] && [ -e "$1" ] && [ -z "${BOOKS_IN_WINDOW:-}" ] && alive; then
+    open_book "$(readlink -f -- "$1")"
+    focus_window && exit 0
+fi
+if [ $# -eq 0 ] && [ -z "${BOOKS_IN_WINDOW:-}" ] && toggle_window; then
+    exit 0
+fi
+
+if ! [ -t 0 ] || ! [ -t 1 ] || [[ $(tty 2>/dev/null) != /dev/pts/* ]]; then
+    export BOOKS_IN_WINDOW=1
+    window ${BOOKS_PAUSED:+--paused} "$@"
+fi
+if [ $# -gt 0 ] && [ -e "$1" ]; then
+    start_player
+    open_book "$(readlink -f -- "$1")"
+    play_loop
+fi
+if [ $# -gt 0 ] && [[ $1 =~ $URLRE ]]; then
+    play_link "$1" || exit 1
+    play_loop
+fi
+if alive; then
+    PID=$(ipc get_property pid)
+    play_loop
+fi
+picker

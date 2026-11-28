@@ -1,0 +1,101 @@
+#!/bin/bash
+# apphide NAME…: hides apps from the app launcher (Super+d) with a NoDisplay copy of their .desktop file in
+# ~/.local/share/applications; -u shows them again, -l lists them. The names are kept in ~/.config/apphide/hidden,
+# and sys-setup runs apphide --apply to hide them again on a new install
+L=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+# the names you hid (apphide --apply hides them again)
+LIST=${XDG_CONFIG_HOME:-$HOME/.config}/apphide/hidden
+SYS=(/usr/share/applications /var/lib/flatpak/exports/share/applications "$HOME/.local/share/flatpak/exports/share/applications")
+usage() { echo "Usage: apphide NAME…      hide apps from the launcher (exact name, else part of it)
+       apphide -u NAME…   show them again
+       apphide -l         list hidden apps
+       apphide --apply    hide everything in the saved list again (new machine, new apps)" >&2; exit 1; }
+
+remember() { mkdir -p "${LIST%/*}"; touch "$LIST"; grep -qixF -- "$1" "$LIST" || printf '%s\n' "$1" >> "$LIST"; }
+
+name() { grep -m1 '^Name=' "$1" 2>/dev/null | cut -d= -f2-; }
+lower() { tr '[:upper:]' '[:lower:]' <<< "$1"; }
+copy() { [ -f "$1" ] && { grep -q '^X-Apphide=true' "$1" || { grep -q '^NoDisplay=true' "$1" && ! grep -q '^Exec=' "$1"; }; }; }
+edited() { [ -f "$1" ] && grep -q '^X-Apphide=edited' "$1"; }
+own() { [ -f "$1" ] && ! copy "$1"; }
+
+find_app() {
+    local d f n want exact=() part=() files=("$L"/*.desktop)
+    want=$(lower "$1")
+    for d in "${SYS[@]}"; do files+=("$d"/*.desktop); done
+    for f in "${files[@]}"; do
+        [ -f "$f" ] || continue
+        [[ $f == "$L"/* ]] && { own "$f" || continue; }
+        [[ $f != "$L"/* ]] && own "$L/${f##*/}" && continue
+        n=$(lower "$(name "$f")")
+        if [ "$n" = "$want" ]; then exact+=("$f")
+        elif [[ $n == *"$want"* ]]; then part+=("$f"); fi
+    done
+    if [ ${#exact[@]} -gt 0 ]; then printf '%s\n' "${exact[@]}"
+    elif [ ${#part[@]} -gt 0 ]; then printf '%s\n' "${part[@]}"; fi
+}
+
+hidden_text() {
+    awk -v mark="$2" '
+        /^\[/ { if (sect == "[Desktop Entry]" && !done) { print "NoDisplay=true"; print "X-Apphide=" mark; done = 1 } sect = $0 }
+        sect == "[Desktop Entry]" && (/^NoDisplay=/ || /^X-Apphide=/ || (mark == "true" && /^Hidden=/)) { next }
+        { print }
+        END { if (sect == "[Desktop Entry]" && !done) { print "NoDisplay=true"; print "X-Apphide=" mark } }
+    ' "$1"
+}
+write() { hidden_text "$1" "$2" > "$3.new.$$" && mv -f "$3.new.$$" "$3"; }
+hide() {
+    if [[ $1 == "$L"/* ]]; then edited "$1" || write "$1" edited "$1"
+    else cmp -s <(hidden_text "$1" true) "$L/${1##*/}" || write "$1" true "$L/${1##*/}"; fi
+}
+unhide() {
+    if edited "$1"; then
+        grep -v -e '^NoDisplay=true$' -e '^X-Apphide=edited$' "$1" > "$1.new.$$" && mv -f "$1.new.$$" "$1"
+    else
+        rm -f -- "$1"
+    fi
+}
+forget() {
+    local app e
+    [ -f "$LIST" ] || return 0
+    app=$(lower "$1")
+    while IFS= read -r e; do
+        [ -n "$e" ] && [[ $app != *"$(lower "$e")"* ]] && [ "$(lower "$e")" != "$(lower "$2")" ] && printf '%s\n' "$e"
+    done < "$LIST" > "$LIST.new.$$"
+    mv -f "$LIST.new.$$" "$LIST"
+}
+
+[ $# -gt 0 ] || usage
+case $1 in
+    -l) for f in "$L"/*.desktop; do { copy "$f" || edited "$f"; } && name "$f"; done ;;
+    -u) shift; [ $# -gt 0 ] || usage
+        for n; do
+            hit=0 want=$(lower "$n")
+            for f in "$L"/*.desktop; do
+                copy "$f" || edited "$f" || continue
+                app=$(name "$f")
+                [[ $(lower "$app") == *"$want"* ]] || continue
+                echo "shown again: $app"; unhide "$f"; forget "$app" "$n"; hit=1
+            done
+            [ $hit = 1 ] || { forget "" "$n"; echo "\"$n\" isn't hidden" >&2; }
+        done ;;
+    --apply)
+        [ -s "$LIST" ] || exit 0
+        mkdir -p "$L"
+        while IFS= read -r n; do
+            [ -n "$n" ] || continue
+            find_app "$n" | while read -r f; do [ -n "$f" ] && hide "$f"; done
+        done < "$LIST" ;;
+    -*) usage ;;
+    *) mkdir -p "$L"
+        for n; do
+            hits=$(find_app "$n")
+            [ -n "$hits" ] || { echo "no app called \"$n\"" >&2; continue; }
+            remember "$n"
+            while read -r f; do
+                hide "$f" && echo "hidden: $(name "$f")"
+            done <<< "$hits"
+        done ;;
+esac
+command -v update-desktop-database >/dev/null && update-desktop-database -q "$L" 2>/dev/null
+exit 0

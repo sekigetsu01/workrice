@@ -1,0 +1,387 @@
+#!/bin/bash
+# sys-setup: puts everything outside your home folder in place (packages, firewall and hardening, services, login
+#   screen, hidden apps…), so a new machine ends up the same as this one. Safe to re-run; update runs it every time
+
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+failed=0 relog=0
+
+sudo_keep || { echo "sys-setup needs your password."; exit 1; }
+
+put() {
+    local new; new=$(cat)
+    [ "$(sudo cat "$1" 2>/dev/null)" = "$new" ] && return 1
+    sudo mkdir -p "${1%/*}" && printf '%s\n' "$new" | sudo tee "$1" >/dev/null && sudo chmod "$2" "$1" ||
+        { bad "couldn't write $1"; return 1; }
+    say "wrote $1"
+}
+
+PKGS=(zstd age rsync fd glow wtype nftables gitleaks python-evdev ffmpeg poppler zram-generator deno uv psmisc tesseract tesseract-data-eng openvpn jq wiremix imagemagick mpv-mpris tree-sitter-cli shellcheck shfmt prettier yt-dlp-ejs kio qt6-multimedia qt6-wayland wlr-randr hunspell-en_us)
+# a kernel update since boot (as during an install): the running kernel's modules are gone until the reboot, so zram
+# and the firewall can't start yet
+newkernel=false; [ -d "/usr/lib/modules/$(uname -r)" ] || newkernel=true
+has() { [ -e "$HOME/.local/bin/$1" ]; }
+has scrub && PKGS+=(mat2)
+has speak && PKGS+=(python-numpy)
+has books && PKGS+=(python-mutagen)
+has dangerzone && PKGS+=(podman)
+has transcribe && PKGS+=(whisper-cpp)
+{ has doc || has transcribe; } && PKGS+=(pandoc-cli)
+unlock_pacman
+missing=$(pacman -T "${PKGS[@]}")
+mapfile -t as_dep < <(pacman -Qqd "${PKGS[@]}" 2>/dev/null)
+[ ${#as_dep[@]} -gt 0 ] && sudo pacman -D --asexplicit "${as_dep[@]}" >/dev/null
+if [ -n "$missing" ]; then
+    missing=${missing//$'\n'/ }
+    say "installing: $missing"
+    # shellcheck disable=SC2086
+    sudo pacman -S --needed --noconfirm $missing >/dev/null || bad "couldn't install: $missing (run update, then sys-setup)"
+fi
+if has dangerzone && [ ! -x /usr/bin/dangerzone ]; then
+    say "installing Dangerzone (AUR)…"
+    yay -S --needed --noconfirm --answerclean None --answerdiff None --answeredit None dangerzone-bin ||
+        bad "couldn't install Dangerzone (try: yay -S dangerzone-bin)"
+fi
+if ! pacman -Q yt-dlp-git >/dev/null 2>&1; then
+    say "installing yt-dlp-git (AUR)…"
+    if pacman -Q yt-dlp >/dev/null 2>&1; then sudo pacman -Rdd --noconfirm yt-dlp >/dev/null; fi
+    yay -S --needed --noconfirm --answerclean None --answerdiff None --answeredit None --mflags --nocheck yt-dlp-git || {
+        sudo pacman -S --needed --noconfirm yt-dlp >/dev/null
+        bad "couldn't install yt-dlp-git (try: yay -S yt-dlp-git)"
+    }
+fi
+for p in ani-cli-git ani-skip-git; do
+    pacman -Q "$p" >/dev/null 2>&1 && continue
+    say "installing $p (AUR)…"
+    if [ "$p" = ani-cli-git ] && pacman -Q ani-cli >/dev/null 2>&1; then sudo pacman -Rdd --noconfirm ani-cli >/dev/null; fi
+    yay -S --needed --noconfirm --answerclean None --answerdiff None --answeredit None "$p" ||
+        bad "couldn't install $p (try: yay -S $p)"
+done
+if [ ! -x /usr/bin/wal ]; then
+    say "installing pywal16 (AUR): colours from the wallpaper…"
+    yay -S --needed --noconfirm --answerclean None --answerdiff None --answeredit None --removemake python-pywal16 ||
+        bad "couldn't install pywal16 (try: yay -S python-pywal16)"
+fi
+
+# only free software: no 7-Zip, no Fraunhofer AAC library
+is_pkg() { [ "$(pacman -Q "$1" 2>/dev/null | cut -d' ' -f1)" = "$1" ]; }
+for p in 7zip 7zip-free; do
+    if is_pkg "$p"; then sudo pacman -Rns --noconfirm "$p" >/dev/null && say "removed $p (archives go through bsdtar)"; fi
+done
+need=$(pacman -Qi pipewire-audio 2>/dev/null | grep -o 'libfdk-aac\.so=[^ ]*' | head -n 1)
+gave=$(pacman -Qi libfdk-aac-none 2>/dev/null | grep -o 'libfdk-aac\.so=[^ ]*' | head -n 1)
+if [ -n "$need" ] && { is_pkg libfdk-aac || [ "$need" != "$gave" ]; }; then
+    say "taking out the Fraunhofer AAC library…"
+    d=$(mktemp -d)
+    cat > "$d/PKGBUILD" <<PKG
+pkgname=libfdk-aac-none
+pkgver=1
+pkgrel=1
+pkgdesc='Stands in for the Fraunhofer AAC library (not free software); PipeWire only loses its Bluetooth AAC codec'
+arch=(any)
+license=(CC0-1.0)
+provides=(libfdk-aac '$need')
+PKG
+    if (cd "$d" && makepkg -f --noconfirm >"$d/log" 2>&1); then
+        is_pkg libfdk-aac && sudo pacman -Rdd --noconfirm libfdk-aac >/dev/null
+        sudo pacman -U --noconfirm "$d"/libfdk-aac-none-*.pkg.tar.* >/dev/null || bad "couldn't install the AAC stand-in"
+    else
+        tail -n 5 "$d/log" >&2
+        bad "couldn't build the AAC stand-in (libfdk-aac left as it is)"
+    fi
+    rm -rf "$d"
+fi
+
+# nothing goes online by itself: no NetworkManager online check, no weekly keyring timer
+put /etc/NetworkManager/conf.d/90-no-connectivity-check.conf 644 <<'EOF' && { sudo nmcli general reload conf 2>/dev/null || true; }
+[connectivity]
+enabled=false
+EOF
+if [ "$(systemctl is-enabled archlinux-keyring-wkd-sync.timer 2>/dev/null)" != masked ]; then
+    sudo systemctl mask --now archlinux-keyring-wkd-sync.timer >/dev/null 2>&1 && say "keyring refresh: with update now, not weekly by itself"
+fi
+if [ "$(timedatectl show -p NTP --value 2>/dev/null)" != yes ]; then
+    sudo timedatectl set-ntp true && say "clock: synced from a time server"
+fi
+
+# the firewall: nothing comes in unless this machine started it
+if put /etc/nftables.conf 644 <<'EOF'; then
+#!/usr/bin/nft -f
+# Written by sys-setup. Coming in: nothing unless this machine started the connection (replies to what you open
+# still get through). Other tables (libvirt, Docker, the VPN's vpnkill) are left alone.
+
+table inet filter
+delete table inet filter
+table inet filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        ct state established,related accept      # replies to your own connections
+        ct state invalid drop
+        iif lo accept                             # this machine talking to itself
+        meta l4proto { icmp, ipv6-icmp } accept   # ping, and what IPv6 needs to work
+        udp sport 67 udp dport 68 accept          # DHCP (getting an address)
+        udp sport 547 udp dport 546 accept        # DHCPv6
+        tcp dport 22 accept                       # SSH: answers only once send receive turned its server on
+        udp dport 5353 accept                     # finding computers by name (NAME.local): answers once send receive turned avahi on
+        tcp dport 22000 accept                    # Syncthing
+        udp dport { 22000, 21027 } accept         # Syncthing (and finding devices on your network)
+    }
+}
+EOF
+    if sudo nft -f /etc/nftables.conf; then say "firewall: on"
+    elif $newkernel; then say "firewall: on after the reboot (a new kernel was just installed)"
+    else bad "couldn't turn the firewall on (the error is just above)"; fi
+    sudo systemctl enable nftables >/dev/null 2>&1
+fi
+
+getent group uinput >/dev/null || { sudo groupadd -r uinput && say "added the uinput group"; }
+if ! id -nG "$USER" | grep -qw uinput; then sudo usermod -aG uinput "$USER" && say "added you to uinput"; relog=1; fi
+if ! id -nG "$USER" | grep -qw input; then sudo usermod -aG input "$USER" && say "added you to input (the clicker records without a password)"; relog=1; fi
+r=0
+put /etc/udev/rules.d/99-clicker-uinput.rules 644 <<'EOF' && r=1
+KERNEL=="uinput", GROUP="uinput", MODE="0660", OPTIONS+="static_node=uinput"
+EOF
+put /etc/modules-load.d/clicker-uinput.conf 644 <<'EOF'
+uinput
+EOF
+lsmod | grep -qw '^uinput' || sudo modprobe uinput 2>/dev/null || true
+if [ $r = 1 ]; then sudo udevadm control --reload; sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput; fi
+
+r=0
+put /etc/sysctl.d/90-no-tcp-timestamps.conf 644 <<'EOF' && r=1
+net.ipv4.tcp_timestamps = 0
+EOF
+put /etc/sysctl.d/90-harden.conf 644 < <(cat <<'EOF'
+kernel.yama.ptrace_scope = 1
+kernel.kptr_restrict = 2
+kernel.unprivileged_bpf_disabled = 1
+net.core.bpf_jit_harden = 2
+kernel.kexec_load_disabled = 1
+dev.tty.ldisc_autoload = 0
+fs.suid_dumpable = 0
+fs.protected_fifos = 2
+fs.protected_regular = 2
+EOF
+[ -e /etc/sysctl.d/dmesg.conf ] || echo 'kernel.dmesg_restrict = 1') && r=1
+put /etc/sysctl.d/99-zram.conf 644 <<'EOF' && r=1
+vm.swappiness = 180
+vm.watermark_boost_factor = 0
+vm.watermark_scale_factor = 125
+vm.page-cluster = 0
+EOF
+sysctl_off() {
+    local f k v
+    for f in /etc/sysctl.d/{90-no-tcp-timestamps,90-harden,99-zram}.conf; do
+        while read -r k _ v; do [ "$(sudo sysctl -n "$k" 2>/dev/null)" = "$v" ] || echo "$f $k $v"; done < "$f"
+    done
+}
+{ [ $r = 1 ] || [ -n "$(sysctl_off)" ]; } && { sudo sysctl -q --system || say "some kernel settings apply after a reboot"; }
+while read -r f k v; do
+    o=$(grep -lsE "^[[:space:]]*-?${k}[[:space:]]*=" /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /etc/sysctl.conf | grep -vxF "$f")
+    bad "$k is $(sudo sysctl -n "$k" 2>/dev/null), not $v${o:+: ${o//$'\n'/ } overrides it (take that line out, then run sys-setup again)}"
+done < <(sysctl_off)
+
+put /etc/systemd/coredump.conf.d/90-off.conf 644 <<'EOF' && sudo find /var/lib/systemd/coredump -type f -delete 2>/dev/null
+[Coredump]
+Storage=none
+ProcessSizeMax=0
+EOF
+put /etc/security/limits.d/90-no-core.conf 644 <<'EOF'
+* hard core 0
+EOF
+if put /etc/systemd/journald.conf.d/90-volatile.conf 644 <<'EOF'
+[Journal]
+Storage=volatile
+EOF
+then sudo systemctl restart systemd-journald; sudo find /var/log/journal -mindepth 1 -delete 2>/dev/null; fi
+
+if pacman -Q zram-generator >/dev/null 2>&1; then
+    put /etc/systemd/zram-generator.conf 644 <<'EOF' && { sudo systemctl daemon-reload; sudo systemctl start systemd-zram-setup@zram0.service || true; }
+[zram0]
+zram-size = min(ram / 2, 8192)
+compression-algorithm = zstd
+EOF
+    grep -q '^/dev/zram' /proc/swaps || sudo systemctl start systemd-zram-setup@zram0.service 2>/dev/null || true
+    if grep -q '^/dev/zram' /proc/swaps; then
+        if grep -qE '^[^#[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+swap[[:space:]]' /etc/fstab; then
+            fb=/etc/fstab.$(date +%F-%H%M%S).bak
+            fine=false; sudo findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1 && fine=true
+            if ! sudo cp -a /etc/fstab "$fb"; then
+                bad "couldn't save a copy of /etc/fstab, so disk swap is left on in it"
+            elif ! sudo sed -i -E '/^[^#[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+swap[[:space:]]/s/^/# /' /etc/fstab; then
+                sudo cp -a "$fb" /etc/fstab; bad "couldn't change /etc/fstab, so disk swap is left on in it"
+            elif $fine && ! sudo findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; then
+                sudo cp -a "$fb" /etc/fstab; bad "turning off disk swap broke /etc/fstab (sudo findmnt --verify says why), so the old one is back"
+            else
+                say "disk swap turned off in /etc/fstab (the old one is $fb)"
+            fi
+        fi
+        tail -n +2 /proc/swaps | while read -r dev type _; do
+            case $dev in /dev/zram*) continue ;; esac
+            if sudo swapoff "$dev"; then
+                if [ "$type" = file ]; then sudo rm -f -- "$dev" && say "removed the old swap file $dev"; else say "disk swap $dev is off (the partition is left as it is)"; fi
+            else
+                say "couldn't turn off disk swap $dev now (not enough free memory?): it's off after a reboot"
+            fi
+        done
+    else
+        if $newkernel; then say "zram starts after the reboot (a new kernel was just installed); disk swap left as it was"
+        else bad "zram didn't start; disk swap left as it was"; fi
+    fi
+fi
+# with zram running, swap partitions on this system's disk are switched off, zeroed and retyped
+rootdisks=$(lsblk -nrpso NAME,TYPE "$(findmnt -nvo SOURCE /)" 2>/dev/null | awk '$2 == "disk" { print $1 }')
+if grep -q '^/dev/zram' /proc/swaps && [ -n "$rootdisks" ] &&
+    ! grep -qE '^[^#[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+swap[[:space:]]' /etc/fstab; then
+    while read -r part disk fstype; do
+        n=$(cat "/sys/class/block/${part##*/}/partition" 2>/dev/null)
+        [ -n "$n" ] && [ -n "$disk" ] || continue
+        grep -q "^$part " /proc/swaps && { sudo swapoff "$part" || { bad "couldn't switch off $part (not enough free memory?)"; continue; }; }
+        if [ "$fstype" = swap ]; then
+            say "wiping the disk swap partition $part (memory written there could hold passwords)…"
+            sudo dd if=/dev/zero of="$part" bs=4M status=none conv=fsync 2>/dev/null
+            sudo wipefs -aq "$part" || { bad "couldn't wipe $part"; continue; }
+        fi
+        if why=$(sudo sfdisk -q --no-reread --part-type "$disk" "$n" 0FC63DAF-8483-4772-8E79-3D69D8477DE4 2>&1 >/dev/null); then
+            say "$part no longer swap (zram is the only swap)"
+        else
+            bad "couldn't retype $part, so booting still tries it as swap: ${why:-sfdisk failed} (sudo sfdisk --part-type $disk $n 0FC63DAF-8483-4772-8E79-3D69D8477DE4)"
+        fi
+    done < <(lsblk -nrpo NAME,TYPE,PARTTYPE,PKNAME,FSTYPE | awk -v disks="$rootdisks" 'BEGIN { split(disks, d, "\n"); for (i in d) root[d[i]] = 1 }
+        $2 == "part" && tolower($3) == "0657fd6d-a4ab-43c4-84e5-0933c84b4f4f" && ($4 in root) { print $1, $4, $5 }')
+fi
+
+if [ ! -e "${XDG_STATE_HOME:-$HOME/.local/state}/send/receive" ] &&
+    { systemctl is-enabled sshd >/dev/null 2>&1 || systemctl is-active sshd >/dev/null 2>&1; }; then
+    sudo systemctl disable --now sshd >/dev/null 2>&1 && say "SSH server off (nothing can log in from the network)"
+fi
+
+ids=()
+for k in uid gid; do
+    grep -q "^$USER:" "/etc/sub$k" 2>/dev/null && continue
+    start=100000
+    while grep -qE "^[^:]+:$start:" "/etc/sub$k" 2>/dev/null; do start=$((start + 65536)); done
+    ids+=("--add-sub${k}s" "$start-$((start + 65535))")
+done
+if [ ${#ids[@]} -gt 0 ]; then
+    sudo usermod "${ids[@]}" "$USER" && say "gave $USER container ID ranges" && podman system migrate >/dev/null 2>&1
+fi
+
+systemctl --user daemon-reload 2>/dev/null
+# new downloads have their hidden data cleaned (scrub-downloads)
+if has scrub-downloads && ! systemctl --user is-enabled -q scrub-downloads.path 2>/dev/null; then
+    "$HOME/.local/bin/scrub-downloads" --baseline
+    systemctl --user enable --now scrub-downloads.path >/dev/null 2>&1 && say "new downloads have their hidden data cleaned"
+fi
+systemctl --user is-enabled -q ssh-agent.socket 2>/dev/null || { systemctl --user enable --now ssh-agent.socket >/dev/null 2>&1 && say "turned on the ssh agent"; }
+if ! grep -qiE '^[[:space:]]*AddKeysToAgent[[:space:]]' "$HOME/.ssh/config" 2>/dev/null; then
+    install -d -m 700 "$HOME/.ssh" && (umask 077; printf '\nHost *\n\tAddKeysToAgent yes\n' >> "$HOME/.ssh/config") &&
+        say "ssh: the key's passphrase is asked once per login (~/.ssh/config)"
+fi
+
+if command -v nvim >/dev/null; then
+    nvim --headless +'if exists("g:pack_err") | cquit | endif' +qa >/dev/null 2>&1 || bad "nvim plugin install failed (open nvim to see why)"
+fi
+
+lyc=${XDG_CONFIG_HOME:-$HOME/.config}/ly/config.ini
+if [ -f "$lyc" ] && [ -d /etc/ly ]; then
+    put /etc/ly/config.ini 644 < <(grep -vE '^[[:space:]]*auto_login_(user|session)[[:space:]]*=' "$lyc"
+        grep -E '^[[:space:]]*auto_login_(user|session)[[:space:]]*=' /etc/ly/config.ini 2>/dev/null)
+fi
+
+if [ -d /usr/lib/libreoffice/share/registry ]; then
+put /usr/lib/libreoffice/share/registry/sys-setup.xcd 644 <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Your LibreOffice defaults, from sys-setup (dotfiles). Anything you change in Tools > Options still wins. -->
+<oor:data xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:oor="http://openoffice.org/2001/registry">
+  <dependency file="main"/>
+  <dependency file="writer" optional="true"/>
+  <dependency file="calc" optional="true"/>
+  <dependency file="impress" optional="true"/>
+  <oor:component-data oor:name="Common" oor:package="org.openoffice.Office">
+    <!-- saved files carry no author names, editing time, comment / tracked-change names or printer -->
+    <node oor:name="Security">
+      <node oor:name="Scripting">
+        <prop oor:name="RemovePersonalInfoOnSaving" oor:op="fuse"><value>true</value></prop>
+      </node>
+    </node>
+    <node oor:name="Save">
+      <node oor:name="Document">
+        <!-- no backup copy on every save; no "keep current format?" question for .docx -->
+        <prop oor:name="CreateBackup" oor:op="fuse"><value>false</value></prop>
+        <prop oor:name="WarnAlienFormat" oor:op="fuse"><value>false</value></prop>
+      </node>
+    </node>
+    <node oor:name="Misc">
+      <prop oor:name="ShowTipOfTheDay" oor:op="fuse"><value>false</value></prop>
+      <prop oor:name="ShowDonation" oor:op="fuse"><value>false</value></prop>
+      <prop oor:name="UseSystemFileDialog" oor:op="fuse"><value>true</value></prop>
+    </node>
+  </oor:component-data>
+  <oor:component-data oor:name="Infobar" oor:package="org.openoffice.Office.UI">
+    <node oor:name="Enabled">
+      <prop oor:name="Donate" oor:op="fuse"><value>false</value></prop>
+      <prop oor:name="GetInvolved" oor:op="fuse"><value>false</value></prop>
+      <prop oor:name="WhatsNew" oor:op="fuse"><value>false</value></prop>
+    </node>
+  </oor:component-data>
+  <oor:component-data oor:name="Setup" oor:package="org.openoffice">
+    <node oor:name="Product">
+      <prop oor:name="WhatsNew" oor:op="fuse"><value>false</value></prop>
+      <prop oor:name="WhatsNewDialog" oor:op="fuse"><value>false</value></prop>
+    </node>
+    <!-- save as Word / Excel / PowerPoint unless you pick otherwise -->
+    <node oor:name="Office">
+      <node oor:name="Factories">
+        <node oor:name="com.sun.star.text.TextDocument" oor:op="fuse">
+          <prop oor:name="ooSetupFactoryDefaultFilter" oor:op="fuse"><value>MS Word 2007 XML</value></prop>
+        </node>
+        <node oor:name="com.sun.star.sheet.SpreadsheetDocument" oor:op="fuse">
+          <prop oor:name="ooSetupFactoryDefaultFilter" oor:op="fuse"><value>Calc MS Excel 2007 XML</value></prop>
+        </node>
+        <node oor:name="com.sun.star.presentation.PresentationDocument" oor:op="fuse">
+          <prop oor:name="ooSetupFactoryDefaultFilter" oor:op="fuse"><value>Impress MS PowerPoint 2007 XML</value></prop>
+        </node>
+      </node>
+    </node>
+  </oor:component-data>
+</oor:data>
+EOF
+ooe=/usr/lib/libreoffice/program/ooenv
+if [ ! -e "$ooe" ] || ! pacman -Qoq "$ooe" >/dev/null 2>&1; then
+put "$ooe" 644 <<'EOF'
+case " $* " in
+    *" --headless "* | *" -headless "* | *" --convert-to "* | *" --cat "* | *" --print-to-file "*) ;;
+    *)
+        if [ -z "$SAL_USE_VCLPLUGIN" ] && [ -e "$sd_prog/libvclplug_kf6lo.so" ] && [ -e /usr/lib/libKF6KIOFileWidgets.so.6 ]; then
+            SAL_USE_VCLPLUGIN=kf6 OOO_FORCE_DESKTOP=plasma6 QT_QPA_PLATFORMTHEME=xdgdesktopportal
+            export SAL_USE_VCLPLUGIN OOO_FORCE_DESKTOP QT_QPA_PLATFORMTHEME
+        fi ;;
+esac
+EOF
+fi
+fi
+
+mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/wal"
+ah=$HOME/.config/quickshell/scripts/apphide
+[ -x "$ah" ] && "$ah" --apply >/dev/null 2>&1
+
+for src in /usr/share/applications/*.desktop; do
+    grep -qE '^Exec=(/usr/bin/)?dangerzone( |$)' "$src" 2>/dev/null || continue
+    dst=$HOME/.local/share/applications/${src##*/}
+    grep -q '^X-Apphide=true' "$dst" 2>/dev/null && continue
+    new=$(sed -E "/^TryExec=/d; s#^Exec=(/usr/bin/)?dangerzone#Exec=$HOME/.local/bin/dangerzone#" "$src")
+    if [ "$(cat "$dst" 2>/dev/null)" != "$new" ]; then
+        mkdir -p "${dst%/*}" && printf '%s\n' "$new" > "$dst" && say "Dangerzone now picks files with yazi"
+    fi
+done
+command -v update-desktop-database >/dev/null && update-desktop-database -q "$HOME/.local/share/applications" 2>/dev/null
+
+[ $relog = 1 ] && echo "  Log out and back in once so the clicker can click and record."
+if [ $failed = 0 ]; then
+    echo "  System settings are all in place."
+else
+    echo "  Some steps didn't finish (above); run sys-setup again after fixing them."
+    exit 1
+fi

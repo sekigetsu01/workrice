@@ -1,0 +1,214 @@
+# zsh's aliases and short commands, sourced by ~/.zshrc: f (fastfetch), yta, gcl, y (yazi), ls, cat, rm, mkcd, and an
+# alias for each folder in shell/dirs
+command -v nvim >/dev/null && alias vim="nvim" vimdiff="nvim -d"
+
+for command in mount umount pacman su shutdown poweroff reboot; do
+	alias $command="sudo $command"
+done; unset command
+
+se() {
+	local choice
+	choice="$(find ~/.local/bin ~/.config/*/scripts -mindepth 1 -maxdepth 1 -type f 2>/dev/null | sed "s#^$HOME#~#" | fzf)"
+	[ -n "$choice" ] && $EDITOR "${choice/#\~/$HOME}"
+}
+
+alias \
+	cp="cp -iv" \
+	mv="mv -iv" \
+	bc="bc -ql" \
+	rs="rsync -avh --partial --append-verify --progress" \
+	mkd="mkdir -pv" \
+	yt="yt-dlp --embed-metadata --sponsorblock-remove all -i" \
+	ytt="yt-transcript" \
+	apphide="$HOME/.config/quickshell/scripts/apphide" \
+	guide="$HOME/.config/mango/scripts/guide" \
+	ffmpeg="ffmpeg -hide_banner"
+
+# yta URL: audio only, with its cover; yta URL START-END: just that part
+yta() {
+	case ${2-} in
+	[0-9]*-[0-9]*) yt-dlp -x --embed-metadata --embed-thumbnail --convert-thumbnails jpg --exec "after_move:sh -c 'f=\$1 t=\${1%.*}.cut.\${1##*.}; ffmpeg -v error -y -ss \$2 -to \$3 -i \"\$f\" -c copy \"\$t\" && mv -f \"\$t\" \"\$f\"' _ {} ${2%-*} ${2#*-}" "$1" ;;
+	*) yt-dlp -x --embed-chapters --embed-metadata --embed-thumbnail --convert-thumbnails jpg --sponsorblock-remove music_offtopic "$@" ;;
+	esac
+}
+
+# fastfetch, without the logo when the window's too narrow
+f() {
+	local out
+	out=$(fastfetch --pipe false "$@")
+	if (( $(print -r -- "$out" | sed $'s/\e\\[[0-9;?]*[a-zA-Z]//g' | wc -L) > COLUMNS )); then
+		out=$(fastfetch --pipe false --logo none "$@")
+	fi
+	print -n '\e[?7l'
+	print -r -- "$out"
+	print -n '\e[?7h'
+}
+
+alias \
+	grep="grep --color=auto" \
+	diff="diff --color=auto" \
+	ip="ip -color=auto"
+
+# gcl NAME…: clone your GitHub repos into ./NAME (replacing it); also user/repo or a URL; git clone options go after the names
+_gcl_user() { command head -n1 -- "${XDG_STATE_HOME:-$HOME/.local/state}/ud/usernames" 2>/dev/null; }
+gcl() {
+	local -a repos failed
+	while (( $# )) && [[ $1 != -* ]]; do repos+=("$1"); shift; done
+	(( ${#repos} )) || { echo "Usage: gcl repo… [git clone options]   (repo: name, user/repo or url)" >&2; return 1; }
+	local src user name dest
+	for src in "${repos[@]}"; do
+		case $src in
+		*://*|git@*) ;;
+		*/*) src=https://github.com/$src ;;
+		*) user=$(_gcl_user)
+		   if [ -z "$user" ]; then
+			   read -r "user?Your GitHub username: " || return 1
+			   user=${user//[[:space:]]/}
+			   [[ $user =~ '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$' ]] || { echo "gcl: a GitHub username is letters, numbers and hyphens" >&2; return 1; }
+			   command mkdir -p -- "${XDG_STATE_HOME:-$HOME/.local/state}/ud" &&
+				   print -r -- "$user" > "${XDG_STATE_HOME:-$HOME/.local/state}/ud/usernames"
+		   fi
+		   src=https://github.com/$user/$src ;;
+		esac
+		name=${${src%/}##*/}; name=${name%.git}; dest=$PWD/$name
+		command rm -rf -- "$dest.new"
+		if GIT_TERMINAL_PROMPT=0 git clone "$@" -- "$src" "$dest.new"; then
+			command rm -rf -- "$dest" && command mv -f -- "$dest.new" "$dest" && print -r -- "${dest/#$HOME/~}"
+		else
+			command rm -rf -- "$dest.new"; echo "gcl: couldn't clone $src (no such repo, or it's private)" >&2
+			failed+=("$name")
+		fi
+	done
+	(( ${#failed} )) && { echo "gcl: not cloned: ${failed[*]}" >&2; return 1; }
+	return 0
+}
+
+# cat: files shown by bat; with an option, the real cat
+cat() {
+	[[ $1 == -?* ]] && { command cat "$@"; return; }
+	bat --style=numbers,changes,header --color=auto "$@"
+}
+
+alias \
+	ka="killall" \
+	mpvl="mpv --loop" \
+	v="nvim" \
+	sy="syncthing" \
+	Ss="command pacman -Ss" \
+	g="git" \
+	gin="git init" \
+	ga="git add ." \
+	gcm="git commit -m" \
+	gb="git branch -M main" \
+	gr="git remote add origin" \
+	gp="git push -f origin main" \
+	sdn="shutdown -h now" \
+	p="sudo pacman -Syu" \
+	pd="sudo pacman -Rns" \
+	cm="chmod +x" \
+	sip="curl ipinfo.io" \
+	xo="setsid -f yazi-xo" \
+	vp="vpn run" \
+	u="unzip" \
+	si="sioyek" \
+	i="swayimg"
+
+ipa() { ip route get 1.1.1.1 | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }'; }
+
+unalias ls rm y 2>/dev/null
+
+ls() {
+	local arg prev='' eza='' gnu=''
+	for arg in "$@"; do
+		case "$prev" in
+			--time|--time-style) arg=$prev=$arg ;;
+		esac
+		prev=$arg
+		case "$arg" in
+			--) break ;;
+			--absolute*|--accessed|--across|--binary|--blocksize|--bytes|--changed|--code|--color-scale*|--colour-scale*|\
+			--created|--extended|--flags|--follow-symlinks|--git*|--grid|--group|--group-directories-last|\
+			--header|--icons*|--ignore-glob*|--level*|--links|--loc|--long|--modified|--mounts|--no-filesize|\
+			--no-git|--no-icons|--no-permissions|--no-quotes|--no-symlinks|--no-time|--no-user|--numeric|\
+			--octal-permissions|--oneline|--only-dirs|--only-files|--recurse|--short-nix|--show-symlinks|\
+			--smart-group|--stdin|--total-size|--treat-dirs-as-files|--tree) eza=1 ;;
+			--time-style=relative|--time-style=default|--time=modified|--time=accessed|--time=changed|--time=created) eza=1 ;;
+			--sort=version|--sort=width|--time-style=locale|--time-style=posix-*) gnu=1 ;;
+			--all|--almost-all|--classify*|--colo*r*|--context|--dereference|--group-directories-first|\
+			--help|--hyperlink*|--inode|--reverse|--sort*|--time-style*|--version|--width*) ;;
+			--*) gnu=1 ;;
+			-*[TD@M]*) eza=1 ;;
+			-*[thSXcuUvsmkNQpqLCgofGBHb]*) gnu=1 ;;
+		esac
+	done
+	if [ -n "$gnu" ] && [ -z "$eza" ]; then
+		command ls --color=auto "$@"
+	else
+		eza --icons --group-directories-first "$@"
+	fi
+}
+
+rm() {
+	local arg a r=''
+	for arg; do
+		shift
+		a=${arg%"${arg##*[!/]}"}
+		[ -n "$a" ] && [ -L "$a" ] && arg=$a
+		[ -d "$arg" ] && [ ! -L "$arg" ] && r=-r
+		set -- "$@" "$arg"
+	done
+	command rm $r -f -v "$@"
+}
+
+mkcd() { mkdir -p -- "$1" && cd -- "$1" || return; }
+
+
+y() {
+	local tmp cwd
+	tmp=$(mktemp -t yazi-cwd.XXXXXX) || return
+	yazi "$@" --cwd-file="$tmp"
+	cwd=$(<$tmp)
+	command rm -f -- "$tmp"
+	[[ $cwd == search://*//* ]] && cwd=/${cwd#search://*//}
+	[[ -d $cwd && $cwd != "$PWD" ]] && cd -- "$cwd"
+	return 0
+}
+alias l=y
+alias a=ani-cli
+
+if command -v fzf >/dev/null 2>&1; then
+	export FZF_DEFAULT_COMMAND='fd --type f --hidden --exclude .git --exclude node_modules'
+	export FZF_ALT_C_COMMAND='fd --type d --hidden --exclude .git --exclude node_modules'
+	export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
+	export FZF_ALT_C_OPTS='--preview "eza --icons --color=always {}"'
+	export FZF_CTRL_R_OPTS='--preview "echo {}" --preview-window=down:3:wrap'
+
+	_walfzf() {
+		local f="${XDG_CACHE_HOME:-$HOME/.cache}/wal/colors" now=''
+		[[ -r $f ]] && now=$(<$f)
+		[[ $now == "${_walfzf_seen-x}" ]] && return
+		_walfzf_seen=$now
+		local -a c
+		[[ -n $now ]] && c=( "${(@f)now}" )
+		export FZF_DEFAULT_OPTS="--height=40% --layout=reverse --border=rounded --prompt='❯ ' --pointer='▶' --bind=ctrl-h:backward-kill-word${c[16]:+ --color=fg:$c[8],fg+:$c[16],bg+:$c[9],hl:$c[2],hl+:$c[2],info:$c[4],prompt:$c[5],pointer:$c[6],marker:$c[3],spinner:$c[7],header:$c[5],border:$c[9]}"
+	}
+	_walfzf
+	autoload -Uz add-zsh-hook
+	add-zsh-hook precmd _walfzf
+
+	_zcache fzf fzf --zsh
+fi
+
+_dirs="${XDG_CONFIG_HOME:-$HOME/.config}/shell/dirs"
+if [ -r "$_dirs" ]; then
+	while read -r _a _k _m _p; do
+		case $_p in "~"*) _p=$HOME${_p#"~"} ;; esac
+		[ -n "$_a" ] && [ "$_a" != - ] && alias "$_a=$_m \"$_p\""
+	done < "$_dirs"
+fi
+unset _dirs _a _k _m _p
+
+alias \
+	cfv="v ~/.config/nvim/init.vim" \
+	cfz="v ~/.zshrc" \
+	cfm="v ~/.config/mango/config.conf"

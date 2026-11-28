@@ -1,0 +1,4 @@
+# git: the name and email put on your commits
+[user]
+	email = you@example.com
+	name = Sekigetsu

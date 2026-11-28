@@ -1,0 +1,800 @@
+#!/bin/bash
+# kp: your KeePassXC passwords in a terminal: search, copy (the clipboard clears after 15 s), add, edit, generate
+#   kp toggle (Super+Shift+d) · kp open FILE.kdbx (yazi) · kp --pasted (Ctrl+V) brings kp back once a password is pasted
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/kp/config"
+CLEAR_AFTER=15
+FOLDER=$'\xef\x81\xbb' KEY=$'\xef\x82\x84'
+B=$'\e[1m' D=$'\e[2m' R=$'\e[0m'
+pick=(--color='bg+:8,fg+:15:bold,hl+:5:bold,pointer:4' --pointer='▶' --highlight-line)
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+
+HIDDEN="${XDG_RUNTIME_DIR:-/tmp}/kp-hidden-$UID"
+NEXT="${XDG_RUNTIME_DIR:-/tmp}/kp-next-$UID"
+CLIP_TOKEN="${XDG_RUNTIME_DIR:-/tmp}/kp-clip-$UID"
+OPEN_DB="${XDG_RUNTIME_DIR:-/tmp}/kp-db-$UID"
+win() {
+    python3 -I -c '
+import json, os, socket, sys
+mode = sys.argv[1]
+def ipc(cmd):
+    with socket.socket(socket.AF_UNIX) as s:
+        s.connect(os.environ["MANGO_INSTANCE_SIGNATURE"])
+        s.sendall(cmd.encode() + b"\n")
+        return json.loads(b"".join(iter(lambda: s.recv(65536), b"")))
+try:
+    cs = [c for c in ipc("get all-clients")["clients"] if c.get("appid") == "kp"]
+    if not cs:
+        sys.exit(1)
+    if mode == "close":
+        for c in cs:
+            ipc("dispatch killclient client,%d" % c["id"])
+        sys.exit(0)
+    if mode == "hide":
+        for c in cs:
+            if not c.get("is_minimized"):
+                ipc("dispatch minimized client,%d" % c["id"])
+        sys.exit(0)
+    c = next((c for c in cs if c.get("is_focused") and not c.get("is_minimized")), None)
+    if c and mode == "toggle":
+        ipc("dispatch minimized client,%d" % c["id"])
+    elif not c:
+        c = next((c for c in cs if c.get("is_visible") and not c.get("is_minimized")), cs[0])
+        mm = os.path.expanduser("~/.config/mango/scripts/mm")
+        os.execv(mm, [mm, "bring", str(c["id"])])
+except (KeyError, OSError, TypeError, ValueError):
+    sys.exit(1)
+' "$1" 2>/dev/null
+}
+
+if [ "${1:-}" = toggle ]; then
+    rm -f -- "$HIDDEN"
+    win toggle && exit 0
+    term_exec --app-id=kp -o background_opacity=1 -o listen_on=none -e "$HOME/.local/bin/kp"
+fi
+
+if [ "${1:-}" = open ]; then
+    f=$(realpath -e -- "${2:-}" 2>/dev/null) || exit 1
+    rm -f -- "$HIDDEN"
+    cur=$(cat "$OPEN_DB" 2>/dev/null)
+    [ "$cur" = "$f" ] && win show && exit 0
+    win close
+    term_exec --app-id=kp -o background_opacity=1 -o listen_on=none -e env KP_DB="$f" "$HOME/.local/bin/kp"
+fi
+
+if [ "${1:-}" = --pasted ]; then
+    if [ -p "$NEXT" ]; then
+        exec {w}<>"$NEXT"
+        echo paste >&"$w"
+        exit 0
+    fi
+    [ -e "$HIDDEN" ] || exit 0
+    IFS= read -r fp < "$HIDDEN"
+    rm -f -- "$HIDDEN"
+    [ -n "$fp" ] && [ "$(wl-paste -n 2>/dev/null | sha256sum)" = "$fp" ] || exit 0
+    sleep 0.15
+    win show
+    exit 0
+fi
+
+if [ "${1:-}" = --chain ]; then
+    IFS= read -r user; IFS= read -r -d '' pw
+    tok=$SRANDOM$SRANDOM
+    ours() { local t; read -r t < "$CLIP_TOKEN" && [ "$t" = "$tok" ]; }
+    same() { [ "$(wl-paste -n 2>/dev/null | sha256sum)" = "$1" ]; }
+    ufp=$(printf '%s' "$user" | sha256sum)
+    printf '%s\n' "$tok" > "$CLIP_TOKEN"
+    printf '%s' "$user" | wl-copy --sensitive
+    if [ -p "$NEXT" ]; then exec {o}<>"$NEXT"; echo stop >&"$o"; exec {o}>&-; fi
+    rm -f -- "$NEXT"; mkfifo -m 600 -- "$NEXT" || exit 1
+    exec {fd}<>"$NEXT"
+    ino=$(stat -c %i -- "$NEXT")
+    drop_next() { [ "$(stat -c %i -- "$NEXT" 2>/dev/null)" = "$ino" ] && rm -f -- "$NEXT"; }
+    trap drop_next EXIT
+    trap 'ours && wl-copy --clear; exit 1' TERM INT HUP
+    if IFS= read -r -t $((CLEAR_AFTER * 4)) -u "$fd" got && [ "$got" = paste ] && ours && same "$ufp"; then
+        drop_next
+        sleep 0.3
+        pfp=$(printf '%s' "$pw" | sha256sum)
+        printf '%s' "$pw" | wl-copy --sensitive
+        unset pw
+        printf '%s\n' "$pfp" > "$HIDDEN"   # pasting the password brings kp back, as a single copy does
+        sleep "$CLEAR_AFTER"
+        ours && same "$pfp" && wl-copy --clear
+    else
+        ours && same "$ufp" && wl-copy --clear
+    fi
+    exit 0
+fi
+
+if [ "${1:-}" = --preview ]; then
+    type=$2 path=$3
+    if [ "$type" = d ]; then
+        printf '%s%s %s%s\n\n' "$B" "$FOLDER" "${path:-Passwords}" "$R"
+        KPA_g="$path" awk -F'\t' -v f="$FOLDER" -v k="$KEY" -v b="$B" -v d="$D" -v r="$R" 'BEGIN { g = ENVIRON["KPA_g"] } 
+            { grp = $1 }
+            grp == g { print "  " k "  " $2 (length($3) ? "   " d $3 r : "") ; next }
+            (g == "" && grp != "") || index(grp, g "/") == 1 {
+                rest = (g == "") ? grp : substr(grp, length(g) + 2)
+                split(rest, p, "/"); sub_[p[1]]++ }
+            END { for (s in sub_) print "  " b f "  " s r "   " d sub_[s] r }' "$KP_DATA" | sort -k2
+    else
+        KPA_want="$path" awk -F'\t' -v b="$B" -v d="$D" -v r="$R" 'BEGIN { want = ENVIRON["KPA_want"] } 
+            $6 == want {
+                print b $2 r "\n"
+                print d "Folder    " r ($1 == "" ? "Passwords" : $1)
+                print d "Username  " r $3
+                print d "Password  " r "••••••••"
+                if (length($4)) print d "Website   " r $4
+                if (length($5)) { n = $5; gsub(/ ⏎ /, "\n          ", n); print d "Notes     " r n }
+                exit }' "$KP_DATA"
+    fi
+    exit 0
+fi
+
+GEN_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/kp/generator"
+gen_load() {
+    local a=() x
+    LEN=24 LOWER=1 UPPER=1 DIGITS=1 SYMBOLS=1 WORDS=0 NWORDS=6
+    [ -f "$GEN_CONF" ] && read -r -a a < "$GEN_CONF"
+    for x in "${a[@]}"; do
+        [[ $x =~ ^(LEN|LOWER|UPPER|DIGITS|SYMBOLS|WORDS|NWORDS)=([0-9]{1,3})$ ]] && printf -v "${BASH_REMATCH[1]}" %d "$((10#${BASH_REMATCH[2]}))"
+    done
+}
+gen_save() {
+    mkdir -p "${GEN_CONF%/*}"
+    printf 'LEN=%d LOWER=%d UPPER=%d DIGITS=%d SYMBOLS=%d WORDS=%d NWORDS=%d\n' \
+        "$LEN" "$LOWER" "$UPPER" "$DIGITS" "$SYMBOLS" "$WORDS" "$NWORDS" > "$GEN_CONF"
+}
+if [ "${1:-}" = --gen-set ]; then
+    gen_load
+    case $2 in
+        more) if [ "$WORDS" = 1 ]; then NWORDS=$((NWORDS < 20 ? NWORDS + 1 : 20)); else LEN=$((LEN < 128 ? LEN + 2 : 128)); fi ;;
+        less) if [ "$WORDS" = 1 ]; then NWORDS=$((NWORDS > 3 ? NWORDS - 1 : 3)); else LEN=$((LEN > 8 ? LEN - 2 : 8)); fi ;;
+        words) WORDS=$((1 - WORDS)) ;;
+        lower|upper|digits|symbols)
+            var=${2^^}
+            [ "$WORDS" = 1 ] && WORDS=0
+            printf -v "$var" '%d' $((1 - ${!var}))
+            [ "$LOWER$UPPER$DIGITS$SYMBOLS" = 0000 ] && printf -v "$var" 1 ;;
+    esac
+    gen_save
+    exit 0
+fi
+if [ "${1:-}" = --gen-list ]; then
+    gen_load
+    if [ "$WORDS" = 1 ]; then
+        new=$(keepassxc-cli diceware -W "$NWORDS" 2>/dev/null)
+    else
+        opts=(-L "$LEN")
+        [ "$LOWER" = 1 ] && opts+=(-l); [ "$UPPER" = 1 ] && opts+=(-U)
+        [ "$DIGITS" = 1 ] && opts+=(-n); [ "$SYMBOLS" = 1 ] && opts+=(-s)
+        new=$(keepassxc-cli generate "${opts[@]}" --every-group 2>/dev/null)
+    fi
+    bits=$(printf '%s\n' "$new" | keepassxc-cli estimate 2>/dev/null)
+    bits=${bits#*Entropy }; bits=${bits%%[!0-9]*}; bits=${bits:-0}
+    if   [ "$bits" -ge 100 ]; then strength="\e[32mexcellent"
+    elif [ "$bits" -ge 75 ];  then strength="\e[32mgood"
+    elif [ "$bits" -ge 40 ];  then strength="\e[33mweak"
+    else                           strength="\e[31mpoor"; fi
+    on=($'\e[2m[ ]\e[0m' $'\e[32m[x]\e[0m')
+    tab=$'\t'
+    printf '  \e[1m%s\e[0m%s%s\n' "$new" "$tab" "$new"
+    printf "  \e[2mstrength\e[0m  $strength\e[0m  \e[2m(%s bits)\e[0m%s%s\n" "$bits" "$tab" "$new"
+    printf '%s\n' "$tab$new"
+    if [ "$WORDS" = 1 ]; then
+        printf '  words     %d%s%s\n' "$NWORDS" "$tab" "$new"
+        printf '  %s words instead of characters%s%s\n' "${on[1]}" "$tab" "$new"
+    else
+        printf '  length    %d%s%s\n' "$LEN" "$tab" "$new"
+        printf '  %s a-z   %s A-Z   %s 0-9   %s !@#…%s%s\n' \
+            "${on[LOWER]}" "${on[UPPER]}" "${on[DIGITS]}" "${on[SYMBOLS]}" "$tab" "$new"
+        printf '  %s words instead of characters%s%s\n' "${on[0]}" "$tab" "$new"
+    fi
+    exit 0
+fi
+
+DB="" KEYFILE=""
+if [ -f "$CONF" ]; then
+    while IFS='=' read -r k v || [ -n "$k" ]; do
+        case $k in DB|KEYFILE) ;; *) continue ;; esac
+        if [[ $v == \'*\' ]]; then
+            v=${v:1:-1} v=${v//"'\\''"/"'"}
+        else
+            o=""
+            while [[ $v =~ ^([^\\]*)\\(.)(.*)$ ]]; do o+=${BASH_REMATCH[1]}${BASH_REMATCH[2]} v=${BASH_REMATCH[3]}; done
+            v=$o$v
+        fi
+        [[ $v == "~/"* ]] && v=$HOME/${v#"~/"}
+        printf -v "$k" %s "$v"
+    done < "$CONF"
+fi
+if [ -n "${KP_DB:-}" ]; then
+    [ -n "$DB" ] && [ "$(realpath -- "$DB" 2>/dev/null)" = "$KP_DB" ] || KEYFILE=""
+    DB=$KP_DB
+fi
+if [ "${1:-}" = --files ]; then
+    for f in "$DB" "$KEYFILE"; do [ -f "$f" ] && printf '%s\0' "$(realpath -- "$f")"; done
+    exit 0
+fi
+
+die() { echo "kp: $1" >&2; notify-send --urgency=critical --app-name=kp "Passwords" "$1" 2>/dev/null; sleep 2; exit 1; }
+for cmd in keepassxc-cli fzf wl-copy python3; do
+    command -v "$cmd" >/dev/null || die "$cmd isn't installed"
+done
+
+save_conf() {
+    home() { local p=$1; [[ $p == "$HOME"/* ]] && p="~/${p#"$HOME"/}"; printf "'%s'" "${p//\'/\'\\\'\'}"; }
+    mkdir -p "${CONF%/*}"
+    printf 'DB=%s\nKEYFILE=%s\n' "$(home "$DB")" "$([ -n "$KEYFILE" ] && home "$KEYFILE" || printf "''")" > "$CONF"
+}
+
+switch_db() {
+    local now f p
+    now=$(realpath -- "$DB" 2>/dev/null)
+    f=$(find "$HOME" -maxdepth 5 -name '*.kdbx' -not -path '*/.cache/*' 2>/dev/null | sort | while IFS= read -r p; do
+            if [ "$(realpath -- "$p")" = "$now" ]; then printf '%s\t%s   %s(open now)%s\n' "$p" "${p/#"$HOME"/\~}" "$D" "$R"
+            else printf '%s\t%s\n' "$p" "${p/#"$HOME"/\~}"; fi
+        done | fzf "${pick[@]}" --ansi --delimiter=$'\t' --with-nth=2 --no-multi --layout=reverse --info=hidden \
+            "$(if [[ $(fzf --help 2>&1) == *--no-input* ]]; then echo --no-input; else echo --disabled; fi)" \
+            --bind 'j:down,k:up,l:accept,g:first,G:last,q:abort' \
+            --header="${B}Open another database${R}  ${D}(j/k move · Enter or l opens · Esc or q: stay)${R}") || return 0
+    f=${f%%$'\t'*}
+    [ -n "$f" ] && [ "$(realpath -- "$f")" != "$now" ] || return 0
+    DB=$f KEYFILE=""
+    save_conf
+    rm -rf -- "$TMPD"
+    unset KP_DB PW
+    exec "$HOME/.local/bin/kp"
+}
+
+if [ ! -f "$DB" ]; then
+    mapfile -t found < <(find "$HOME" -maxdepth 5 -name '*.kdbx' -not -path '*/.cache/*' 2>/dev/null)
+    case ${#found[@]} in
+        0) die "no .kdbx database found in your home folder" ;;
+        1) DB=${found[0]} ;;
+        *) DB=$(printf '%s\n' "${found[@]}" | fzf "${pick[@]}" --prompt='Which database? ') || exit 0 ;;
+    esac
+    save_conf
+fi
+[ -z "$KEYFILE" ] || [ -r "$KEYFILE" ] || die "can't read the key file $KEYFILE (KEYFILE in $CONF)"
+
+umask 077
+TMPD=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/kp.XXXXXX") || die "couldn't make a temp folder"
+KP_DATA=$TMPD/entries KP_GROUPS=$TMPD/folders
+export KP_DATA
+setsid -f bash -c 'tail --pid="$1" -f /dev/null; rm -rf -- "$2"' _ $$ "$TMPD" </dev/null >/dev/null 2>&1
+realpath -- "$DB" > "$OPEN_DB" 2>/dev/null
+trap 'rm -rf "$TMPD"; [ "$(cat "$OPEN_DB" 2>/dev/null)" = "$(realpath -- "$DB" 2>/dev/null)" ] && rm -f -- "$OPEN_DB"' EXIT
+trap 'exit 1' INT HUP
+{ printf 'set convert-meta off\nset input-meta on\n'
+  for c in {1..9} {11..31} 127; do printf '"\\%03o": self-insert\n' "$c"; done
+} > "$TMPD/inputrc"
+
+PY='
+import os, re, subprocess, sys
+db, key, d = sys.argv[1:]
+with open(d + "/err", "wb") as err:
+    p = subprocess.Popen(["keepassxc-cli", "open", *(["-k", key] if key else []), "--", db],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
+                         env=dict(os.environ, TERM="dumb", COLUMNS="100000", INPUTRC=d + "/inputrc"))
+def send(lines):
+    p.stdin.write("".join(l + "\n" for l in lines).encode())
+    p.stdin.flush()
+def until(done):
+    buf = b""
+    while not done(buf):
+        chunk = os.read(p.stdout.fileno(), 1 << 16)
+        if not chunk:
+            sys.exit(1)
+        buf += chunk
+    return buf
+p.stdin.write(sys.stdin.buffer.read())
+p.stdin.flush()
+prompt = until(lambda b: b.endswith(b"> "))
+send(["ls -R -f"])
+out = until(lambda b: b == prompt or b.endswith(b"\n" + prompt))[:-len(prompt)].decode(errors="replace")
+echo = out.startswith("ls -R -f\n")
+seen, groups, ents = set(), [""], []
+for line in out.split("\n")[echo:]:
+    if not line or line.startswith("Recycle Bin/") or line.rpartition("/")[2] == "[empty]":
+        continue
+    if line.endswith("/"):
+        groups.append(line[:-1])
+    elif line in seen:
+        ents[[e[0] for e in ents].index(line)][1] = "1"
+    else:
+        seen.add(line)
+        ents.append([line, ""])
+fields = ("UserName", "URL", "Notes")
+quote = lambda s: re.sub(r"([\\\" \t])", r"\\\1", s)
+asked = [e for e in ents if not re.search(r"[\x00-\x08\x0a-\x1f\x7f]", e[0])]
+segs = p.communicate("".join("show -a %s %s\n" % (f, quote(e[0])) for e in asked for f in fields).encode())[0].split(prompt)
+got = {}
+if len(segs) > len(asked) * len(fields):
+    for i, seg in enumerate(segs[:len(asked) * len(fields)]):
+        v = seg.decode(errors="replace")
+        v = v.split("\n", 1)[1] if echo and "\n" in v else "" if echo else v
+        got[asked[i // 3][0], fields[i % 3]] = v[:-1] if v.endswith("\n") else v
+clean = lambda s: s.replace("\t", " ").replace("\r", "").replace("\n", " ⏎ ")
+with open(d + "/folders.new", "w") as f:
+    for g in groups:
+        f.write(clean(g) + "\t/" + (g + "/" if g else "") + "\n")
+with open(d + "/entries.new", "w") as f:
+    for path, dup in ents:
+        folder, _, title = path.rpartition("/")
+        f.write("\t".join([clean(folder), clean(title)] + [clean(got.get((path, k), "")) for k in fields]
+                          + [path, dup]) + "\n")
+for n in ("folders", "entries"):
+    os.replace(d + "/" + n + ".new", d + "/" + n)
+'
+load() {
+    local sig rc
+    sig=$(dbsig)
+    printf '%s\n' "$PW" | python3 -I -c "$PY" "$DB" "$KEYFILE" "$TMPD"; rc=$?
+    why=$(<"$TMPD/err"); why=${why#*$'\n'}
+    [ "$rc" = 0 ] || { TRIED=$sig; return 1; }
+    SIG=$sig
+}
+dbsig() { stat -L -c '%d %i %s %y %z' -- "$DB" 2>/dev/null; }
+reload() {
+    local old=$PW
+    load && return 0
+    printf '\n\e[31mCouldn'"'"'t read %s again: %s\e[0m\n' "${DB##*/}" "${why:-it wouldn’t open}"
+    while :; do
+        IFS= read -r -s -p 'Master password (Enter: keep using it as it was): ' PW; echo
+        if [ -z "$PW" ]; then
+            PW=$old KEPT=$TRIED
+            note "Showing ${DB##*/} as it was (it couldn't be read again)"
+            return 1
+        fi
+        load && return 0
+        printf '\e[31m%s\e[0m\n' "${why:-It wouldn’t open.}"
+    done
+}
+fresh() { local s; s=$(dbsig); [ "$s" = "$SIG" ] || [ "$s" = "${KEPT-}" ] || reload; return 0; }
+get() { printf '%s\n' "$PW" | keepassxc-cli show -q -a "$2" ${KEYFILE:+-k "$KEYFILE"} -- "$DB" "$1" 2>/dev/null; }
+
+q() {
+    local s=${1//$'\r\n'/$'\n'}
+    s=${s//[$'\001'-$'\010'$'\013'-$'\037'$'\177']/}
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}; s=${s// /\\ }; s=${s//$'\t'/\\$'\t'}
+    printf '%s' "${s//$'\n'/\\\\n}"
+}
+kx() {
+    local rd wr pid err rc
+    trap '' PIPE
+    coproc KX { exec 2>&1; INPUTRC=$TMPD/inputrc exec keepassxc-cli open ${KEYFILE:+-k "$KEYFILE"} "$DB" >/dev/null; }
+    pid=$KX_PID
+    exec {rd}<&"${KX[0]}" {wr}>&"${KX[1]}"
+    eval "exec ${KX[0]}<&- ${KX[1]}>&-"
+    printf '%s\n' "$PW" 1>&"$wr"
+    IFS= read -r -u "$rd" _
+    printf '%s\n' "$@" 1>&"$wr" 2>/dev/null
+    exec {wr}>&-
+    err=""; IFS= read -r -d '' -u "$rd" err; exec {rd}<&-
+    wait "$pid"; rc=$?
+    trap - PIPE
+    [ "$rc" = 0 ] && [ -z "$err" ]
+}
+
+unset TMOUT
+read_pw() {
+    local c
+    PW=""
+    printf 'Master password: '
+    while IFS= read -r -s -n 1 c; do
+        case $c in
+            '') echo; return 0 ;;
+            $'\x0f') echo; return 2 ;;
+            $'\e') echo; exit 0 ;;
+            $'\x7f'|$'\b') PW=${PW%?} ;;
+            $'\x15') PW="" ;;
+            *) PW+=$c ;;
+        esac
+    done
+    echo
+    exit 0
+}
+unlock_line() { printf 'Unlock %s  %s(Ctrl+O: another database · Esc: close)%s\n' "${DB##*/}" "$D" "$R"; }
+unlock_line
+while :; do
+    read_pw
+    if [ $? = 2 ]; then switch_db; unlock_line; continue; fi
+    [ -n "$PW" ] || exit 0
+    load && break
+    printf '\e[31m%s\e[0m\n' "${why:-It wouldn’t open.}"
+done
+
+list_folder() {
+    KPA_g="$1" awk -F'\t' -v f="$FOLDER" -v k="$KEY" -v b="$B" -v d="$D" -v r="$R" 'BEGIN { g = ENVIRON["KPA_g"] }
+        { grp = $1; ent = FNR != NR }
+        ent && grp == g { printf "%s  %s  %s%s%s\te\t%s\n", k, $2, d, $3, r, $6; next }
+        (g == "" && grp != "") || index(grp, g "/") == 1 {
+            rest = (g == "") ? grp : substr(grp, length(g) + 2)
+            split(rest, p, "/"); n[p[1]] += ent }
+        END { for (s in n) printf "%s%s  %s%s  %s%d%s\td\t%s\n", b, f, s, r, d, n[s], r, (g == "" ? s : g "/" s) }
+        ' "$KP_GROUPS" "$KP_DATA" | sort -t$'\t' -k2,2 -k1,1
+}
+list_all() {
+    awk -F'\t' -v k="$KEY" -v d="$D" -v r="$R" '{
+        where = ($1 == "" ? "" : $1 " › "); gsub("/", " › ", where)
+        printf "%s  %s%s%s%s  %s%s%s\te\t%s\n", k, d, where, r, $2, d, $3, r, $6 }' "$KP_DATA" | sort
+}
+field_of() {
+    KPA_id="$1" awk -F'\t' -v n="$2" 'BEGIN { id = ENVIRON["KPA_id"] } $6 == id { print $n; exit }' "$KP_DATA"
+}
+split_out() {
+    key=${out%%$'\n'*} line=""
+    if [[ $out == *$'\n'* ]]; then line=${out#*$'\n'}; line=${line%%$'\n'*}; fi
+}
+exists() {
+    KPA_g="$1" KPA_t="$2" awk -F'\t' 'BEGIN { g = ENVIRON["KPA_g"]; t = ENVIRON["KPA_t"] } $1 == g && $2 == t { found = 1; exit } END { exit !found }' "$KP_DATA"
+}
+
+self=$(realpath "$0")
+if [[ $(fzf --help 2>&1) == *--no-input* ]]; then NOINPUT=--no-input; else NOINPUT=--disabled; fi
+look=("${pick[@]}" --ansi --delimiter=$'\t' --with-nth=1 --no-multi --layout=reverse --info=hidden
+      --preview "'$self' --preview {2} {3}" --preview-window='right,45%,border-left')
+
+browse() {
+    fzf "${look[@]}" "$NOINPUT" --header="$1" --expect=u,ctrl-u,a,/,ctrl-f,ctrl-o,q,esc,n,p,space,e,D \
+        --bind "load:pos(${2:-1})" \
+        --bind 'j:down,k:up,l:accept,right:accept,h:abort,left:abort,bspace:abort,g:first,G:last'
+}
+search() {
+    fzf "${look[@]}" --prompt='/ ' --header="$1" --expect=ctrl-u,ctrl-a,ctrl-e,ctrl-d,esc --print-query --query="${2:-}" \
+        --bind 'bspace:backward-delete-char/eof'
+}
+
+generate() {
+    local list="'$self' --gen-list" set="'$self' --gen-set" out
+    out=$("$self" --gen-list | fzf "${pick[@]}" --ansi --delimiter=$'\t' --with-nth=1 --no-multi --layout=reverse \
+        --info=hidden --no-sort "$NOINPUT" --pointer=' ' \
+        --header="${B}Password generator${R}" \
+        --bind "r:reload($list)" \
+        --bind "+:execute-silent($set more)+reload($list),=:execute-silent($set more)+reload($list)" \
+        --bind "-:execute-silent($set less)+reload($list)" \
+        --bind "l:execute-silent($set more)+reload($list),right:execute-silent($set more)+reload($list)" \
+        --bind "h:execute-silent($set less)+reload($list),left:execute-silent($set less)+reload($list)" \
+        --bind "1:execute-silent($set lower)+reload($list),2:execute-silent($set upper)+reload($list)" \
+        --bind "3:execute-silent($set digits)+reload($list),4:execute-silent($set symbols)+reload($list)" \
+        --bind "w:execute-silent($set words)+reload($list)" \
+        --bind 'j:down,k:up,q:abort') || return 0
+    printf '%s\n' "${out#*$'\t'}"
+}
+
+stop_chain() {
+    local o
+    [ -p "$NEXT" ] || return 0
+    exec {o}<>"$NEXT"; echo stop >&"$o"; exec {o}>&-
+}
+
+copy_secret() {
+    local tok=$SRANDOM$SRANDOM
+    printf '%s\n' "$tok" > "$CLIP_TOKEN"
+    stop_chain
+    printf '%s' "$1" | wl-copy --sensitive >/dev/null 2>&1
+    printf '%s' "$1" | sha256sum | KP_TOK=$tok KP_F=$CLIP_TOKEN setsid -f bash -c "IFS= read -r fp; sleep $CLEAR_AFTER; "'
+        read -r t < "$KP_F"; [ "$t" = "$KP_TOK" ] && [ "$(wl-paste -n 2>/dev/null | sha256sum)" = "$fp" ] && wl-copy --clear' >/dev/null 2>&1
+    notify-send --app-name=kp -t $((CLEAR_AFTER * 1000)) "Copied $2" "Clears in ${CLEAR_AFTER}s" 2>/dev/null
+    printf '%s' "$1" | sha256sum > "$HIDDEN"
+    win hide || rm -f -- "$HIDDEN"
+}
+
+copy_login() {
+    local title user pw
+    fresh
+    title=$(field_of "$1" 2) user=$(field_of "$1" 3)
+    [ -n "$user" ] || { note "$title has no username: Enter copies the password"; return 1; }
+    pw=$(get "$1" Password)
+    [ -n "$pw" ] || { note "$title has no password"; return 1; }
+    { printf '%s\n' "$user"; printf '%s' "$pw"; } | setsid -f "$self" --chain >/dev/null 2>&1
+    unset pw
+    notify-send --app-name=kp -t 4000 "Copied $title username" "Paste it, and the password is copied in its place" 2>/dev/null
+    note "Copied $title username, then the password once you pasted it"
+    rm -f -- "$HIDDEN"
+    win hide
+}
+
+ask() {
+    local first
+    IFS= read -r -s -n 1 -p "$1" first
+    if [ "$first" = $'\e' ]; then echo; return 1; fi
+    if [ -z "$first" ]; then REPLY=""; echo; return 0; fi
+    printf '\r\e[K'
+    IFS= read -r -e -i "$first" -p "$1" REPLY
+}
+pause() { read -r -s -n 1 -p "${D}(any key)${R}"; echo; }
+
+new_password() {
+    local again
+    while :; do
+        IFS= read -r -s -n 1 -p "$1${2:+$D$2$R }" new
+        if [ "$new" = $'\e' ]; then echo; new=""; return 1; fi
+        if [ -n "$new" ]; then IFS= read -r -s again; new=$new$again; fi
+        echo
+        if [ -z "$new" ]; then
+            new=$(generate)
+            [ -n "$new" ] || return 2
+            printf '%s%s(made: %d characters)%s\n' "$1" "$D" "${#new}" "$R"
+            return 0
+        fi
+        printf -v again '%-*s' "${#1}" 'Again:'
+        IFS= read -r -s -p "$again" again; echo
+        [ "$new" = "$again" ] && return 0
+        printf '\e[31mThey don'"'"'t match; try again.\e[0m\n'
+    done
+}
+
+new_entry() {
+    local where=$1 title user notes new kg
+    kg=$(KPA_g="$where" awk -F'\t' 'BEGIN { g = ENVIRON["KPA_g"] } $1 == g { print $2; exit }' "$KP_GROUPS")
+    [ -n "$kg" ] || { note "Can't add here: keepassxc-cli would find another folder by this name"; return 0; }
+    clear
+    printf '%sNew entry in %s%s\n\n' "$B" "Passwords${where:+ / ${where//\// / }}" "$R"
+    while :; do
+        ask 'Title:    ' || return 0
+        title=${REPLY//\//-}
+        [ -n "$title" ] || return 0
+        exists "$where" "$title" || break
+        printf '\e[31mThere is already a "%s" here; pick another title.\e[0m\n' "$title"
+    done
+    ask 'Username: ' || return 0
+    user=$REPLY
+    until new_password 'Password: ' '(type one · Enter: the generator · Esc: cancel)'; do
+        [ $? = 1 ] && { echo "(cancelled)"; sleep 0.6; return 0; }
+    done
+    while :; do
+        ask 'Notes:    ' || { unset new; return 0; }
+        notes=$REPLY
+        no_backslash_n "$notes" && break
+    done
+    if kx "add -q ${user:+--username=$(q "$user")} ${notes:+--notes=$(q "$notes")} -p -- $(q "$kg$title")" "$new"; then
+        notify-send --app-name=kp "Added $title" "${where:-Passwords}" 2>/dev/null
+    else
+        printf '\e[31mCouldn'"'"'t add it (is KeePassXC holding the database locked for writing?).\e[0m\n'
+        pause
+    fi
+    unset new
+}
+
+change() {
+    if kx "edit -q --$1=$(q "$2") -- $(q "$id")"; then done_note="${D}Changed the $3${R}"$'\n'
+    else printf '\e[31mCouldn'"'"'t change it.\e[0m\n'; pause; return 1; fi
+}
+no_backslash_n() {
+    [[ $1 != *'\n'* ]] && return 0
+    printf '\e[31mNotes can'"'"'t contain \\n (a backslash, then n): keepassxc-cli would turn it into a new line.\e[0m\n'
+    return 1
+}
+cant_empty() { printf 'keepassxc-cli can'"'"'t empty a field, so it'"'"'s left as it was.\n'; pause; }
+
+# Shift+D: the entry deleted for good, after Enter (Esc or q keeps it). With a Recycle Bin on, keepassxc-cli's rm only
+# moves an entry there, so it's given a name of its own first (not to hit another of the same name in the bin), moved
+# there, and taken out of there too
+delete_entry() {
+    local id=$1 title tmp moved info a ok
+    title=$(field_of "$id" 2)
+    clear
+    printf '%sDelete %s?%s   %sIt'"'"'s gone for good: it doesn'"'"'t go to the Recycle Bin%s\n\n' "$B" "$title" "$R" "$D" "$R"
+    printf 'Enter deletes it · Esc or q keeps it '
+    while :; do
+        IFS= read -r -s -n 1 a || { echo; note "Kept $title"; return 1; }
+        case $a in
+            '') break ;;
+            # (an arrow or F-key starts with Esc too: the rest of it is read here, not left for the next screen)
+            $'\e') read -r -s -t 0.05 -n 8 _; echo; note "Kept $title"; return 1 ;;
+            q | Q) echo; note "Kept $title"; return 1 ;;
+        esac
+    done
+    echo
+    info=$(printf '%s\n' "$PW" | keepassxc-cli db-info -q ${KEYFILE:+-k "$KEYFILE"} -- "$DB" 2>/dev/null)
+    # (one step at a time, stopping at the first that fails: keepassxc-cli, not finding a path, takes any entry of
+    # that title, so nothing runs after a step that missed)
+    ok=""
+    if [[ $info == *"Recycle bin is enabled"* ]]; then
+        tmp=kp-deleting-$SRANDOM$SRANDOM
+        if [[ $id == */* ]]; then moved=${id%/*}/$tmp; else moved=$tmp; fi
+        kx "edit -q --title=$(q "$tmp") -- $(q "$id")" && kx "rm -- $(q "$moved")" && kx "rm -- $(q "Recycle Bin/$tmp")" && ok=1
+    else
+        kx "rm -- $(q "$id")" && ok=1
+    fi
+    if [ -n "$ok" ]; then
+        notify-send --app-name=kp "Deleted $title" 2>/dev/null
+        note "Deleted $title"
+        fresh
+        return 0
+    fi
+    printf '\e[31mCouldn'"'"'t delete it (is KeePassXC holding the database locked for writing?). Check it in KeePassXC.\e[0m\n'
+    pause
+    return 1
+}
+
+edit_entry() {
+    local id=$1 show="" out key line field folder title user url notes dup row=1 new old done_note="" locked
+    local -a ed
+    while :; do
+        fresh
+        IFS=$'\x1f' read -r folder title user url notes dup < <(
+            KPA_id="$id" awk -F'\t' -v OFS=$'\x1f' 'BEGIN { id = ENVIRON["KPA_id"] } $6 == id { print $1, $2, $3, $4, $5, $7; exit }' "$KP_DATA") || break
+        locked=""
+        [ -z "$dup" ] || locked="${D}Another entry has the same folder and title, so kp can only reach this one; rename one in KeePassXC${R}"$'\n'
+        out=$({
+            printf '  %sTitle%s     %s\ttitle\n' "$D" "$R" "$title"
+            printf '  %sUsername%s  %s\tusername\n' "$D" "$R" "$user"
+            if [ -n "$show" ]; then printf '  %sPassword%s  %s\tpassword\n' "$D" "$R" "$show"
+            else printf '  %sPassword%s  ••••••••\tpassword\n' "$D" "$R"; fi
+            printf '  %sWebsite%s   %s\turl\n' "$D" "$R" "$url"
+            printf '  %sNotes%s     %s\tnotes\n' "$D" "$R" "${notes:0:80}"
+        } | fzf "${pick[@]}" --ansi --delimiter=$'\t' --with-nth=1 --no-multi --layout=reverse --info=hidden --no-sort \
+                "$NOINPUT" --header="${said}${done_note}${locked}${B}${FOLDER} ${folder:-Passwords} / ${title}${R}" \
+                --expect=space,l,s,y,u,a,h,esc,q,D --bind "j:down,k:up,left:abort,load:pos($row)")
+        [ $? = 130 ] && break
+        done_note="" said=""
+        split_out; field=${line##*$'\t'}
+        case $field in title) row=1 ;; username) row=2 ;; password) row=3 ;; url) row=4 ;; notes) row=5 ;; esac
+        case $key in
+            h|esc|q) break ;;
+            s)
+                if [ -n "$show" ]; then show=""; else fresh; show=$(get "$id" Password); fi
+                row=3; continue ;;
+            y)
+                fresh; new=$(get "$id" Password)
+                [ -n "$new" ] && copy_secret "$new" "$title password" && done_note="${D}Copied the password (clears in ${CLEAR_AFTER}s)${R}"$'\n'
+                unset new; continue ;;
+            u)
+                [ -n "$user" ] && copy_secret "$user" "$title username" && done_note="${D}Copied the username (clears in ${CLEAR_AFTER}s)${R}"$'\n'
+                continue ;;
+            D)
+                delete_entry "$id" && break
+                continue ;;
+            a)
+                copy_login "$id" && done_note="${D}Copied the username; the password follows once you paste it${R}"$'\n'
+                continue ;;
+        esac
+        clear
+        if [ "$field" = password ]; then
+            printf '%sChange %s: password%s   %s(type a new one, or Enter for the generator; Esc keeps the old one)%s\n\n' "$B" "$title" "$R" "$D" "$R"
+        elif [ "$field" = notes ]; then
+            printf '%sChange %s: notes%s   %s(in your editor: save and quit when done)%s\n\n' "$B" "$title" "$R" "$D" "$R"
+        else
+            printf '%sChange %s: %s%s\n\n' "$B" "$title" "$field" "$R"
+        fi
+        case $field in
+            title)
+                IFS= read -r -e -i "$title" -p 'Title:    ' new
+                new=${new//\//-}
+                if [ -n "$new" ] && [ "$new" != "$title" ]; then
+                    if exists "$folder" "$new"; then
+                        printf '\e[31mThere is already a "%s" in this folder.\e[0m\n' "$new"; pause
+                    else
+                        change title "$new" title && id=${id%"$title"}$new
+                    fi
+                fi ;;
+            username)
+                IFS= read -r -e -i "$user" -p 'Username: ' new
+                if [ -z "$new" ] && [ -n "$user" ]; then cant_empty
+                elif [ "$new" != "$user" ]; then change username "$new" username; fi ;;
+            url)
+                IFS= read -r -e -i "$url" -p 'Website:  ' new
+                if [ -z "$new" ] && [ -n "$url" ]; then cant_empty
+                elif [ "$new" != "$url" ]; then change url "$new" website; fi ;;
+            password)
+                new_password 'New password: '
+                case $? in
+                    1) echo "(kept the old one)" ;;
+                    2) echo "(none made; the old one stays)" ;;
+                    *)  if kx "edit -q -p -- $(q "$id")" "$new"; then
+                            done_note="${D}Changed the password${R}"$'\n'
+                            [ -n "$show" ] && show=$new
+                        else
+                            printf '\e[31mCouldn'"'"'t change it.\e[0m\n'; pause
+                        fi ;;
+                esac
+                unset new ;;
+            notes)
+                fresh; new=$(get "$id" Notes)
+                printf '%s' "$new" > "$TMPD/notes"
+                old=$(<"$TMPD/notes")
+                read -r -a ed <<< "${VISUAL:-${EDITOR:-nvim}}"
+                command -v "${ed[0]}" >/dev/null || ed=(vi)
+                case ${ed[0]##*/} in
+                    nvim|vim) ed+=(-n -i NONE -c 'set nobackup nowritebackup noundofile | setlocal noswapfile') ;;
+                esac
+                "${ed[@]}" "$TMPD/notes"
+                new=$(<"$TMPD/notes"); rm -f "$TMPD/notes"
+                if [ "$new" != "$old" ]; then
+                    if [ -z "$new" ]; then cant_empty
+                    elif no_backslash_n "$new"; then change notes "$new" notes
+                    else pause; fi
+                fi
+                unset new old ;;
+        esac
+    done
+    show=""
+}
+
+cur="" mode="" query="" at=1 said=""
+note() { said="${D}$1${R}"$'\n'; }
+line_of() { list_folder "$cur" | KPA_p="$1" awk -F'\t' 'BEGIN { p = ENVIRON["KPA_p"] } $3 == p { print NR; exit }'; }
+while :; do
+    fresh
+    if [ "$mode" = all ]; then
+        out=$(list_all | search "${said}${B}Search all entries${R}" "$query")
+        rc=$?
+        query=${out%%$'\n'*}
+        if [[ $out == *$'\n'* ]]; then out=${out#*$'\n'}; else out=""; fi
+    else
+        crumb="Passwords${cur:+ / ${cur//\// / }}"
+        out=$(list_folder "$cur" | browse "${said}${B}${FOLDER} ${crumb}${R}" "$at")
+        rc=$?
+    fi
+    said=""
+    split_out
+    rest=${line#*$'\t'}; type=${rest%%$'\t'*}; path=${rest#*$'\t'}
+
+    if [ "$mode" = all ]; then
+        if [ "$rc" = 130 ] || [ "$key" = esc ]; then mode=""; query=""; continue; fi
+        if [ "$key" = ctrl-e ] && [ -n "$line" ]; then edit_entry "$path"; continue; fi
+        if [ "$key" = ctrl-a ] && [ -n "$line" ]; then copy_login "$path"; continue; fi
+        if [ "$key" = ctrl-d ] && [ -n "$line" ]; then delete_entry "$path"; continue; fi
+    else
+        if [ "$rc" = 130 ]; then
+            [[ "$cur" == */* ]] && cur=${cur%/*} || cur=""
+            at=1
+            continue
+        fi
+        case $key in
+            q|esc) exit 0 ;;
+            /|ctrl-f) mode=all; query=""; continue ;;
+            ctrl-o) switch_db; continue ;;
+            n) new_entry "$cur"; continue ;;
+            a)
+                [ -n "$line" ] || continue
+                if [ "$type" = d ]; then note "That's a folder: a copies an entry's username, then its password"; continue; fi
+                copy_login "$path"
+                at=$(line_of "$path")
+                continue ;;
+            D)
+                [ -n "$line" ] || continue
+                if [ "$type" = d ]; then note "That's a folder: Shift+D deletes an entry (delete folders in KeePassXC)"; continue; fi
+                at=$(line_of "$path")   # (the next one along takes its row)
+                delete_entry "$path"
+                continue ;;
+            space|e)
+                [ -n "$line" ] || continue
+                if [ "$type" = d ]; then cur=$path; at=1; continue; fi
+                edit_entry "$path"
+                at=$(line_of "$path")
+                continue ;;
+            p)
+                made=$(generate)
+                if [ -n "$made" ]; then
+                    copy_secret "$made" "a new password"
+                    note "Copied a new password (clears in ${CLEAR_AFTER}s)"
+                fi
+                unset made
+                continue ;;
+        esac
+    fi
+    [ -n "$line" ] || continue
+
+    if [ "$type" = d ]; then cur=$path; at=1; continue; fi
+    case $key in u|ctrl-u) what=username field=UserName ;; *) what=password field=Password ;; esac
+    [ "$mode" = all ] || at=$(line_of "$path")
+
+    title=$(field_of "$path" 2)
+    secret=""
+    fresh
+    if [ "$field" = UserName ]; then secret=$(field_of "$path" 3); else secret=$(get "$path" Password); fi
+    if [ -n "$secret" ]; then
+        copy_secret "$secret" "$title $what"
+        note "Copied $title $what (clears in ${CLEAR_AFTER}s)"
+    else
+        note "$title has no $what"
+    fi
+    unset secret
+done

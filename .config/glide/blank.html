@@ -1,0 +1,25 @@
+<!doctype html>
+<!-- Glide's new tab page, in the wallpaper's colours -->
+<meta charset="utf-8">
+<title>New Tab</title>
+<link id="wal" rel="stylesheet" href="../../.cache/wal/colors.css">
+<style>
+  html, body { margin: 0; height: 100%; background: var(--background, #0a1218); color: var(--foreground, #c1c3c5); }
+</style>
+<script>
+  const CSS = "../../.cache/wal/colors.css";
+  let busy = false;
+  // the new copy is loaded beside the old one and swapped in once it's there, so the page never flashes
+  function refresh() {
+    if (busy) return;
+    busy = true;
+    const old = document.getElementById("wal");
+    const next = old.cloneNode();
+    next.href = CSS + "?" + Date.now();
+    next.onload = () => { old.remove(); busy = false; };
+    next.onerror = () => { next.remove(); busy = false; };
+    old.after(next);
+  }
+  setInterval(refresh, 1000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+</script>

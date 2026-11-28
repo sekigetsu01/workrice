@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# Quick capture (Alt+i): a small nvim window to jot something down; it's then added to the end of a note picked from
+# a list (a vimwiki note, or a file open in nvim). Alt+i again while it's focused saves and closes it
+sockets() {
+    for d in "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" "${TMPDIR:-/tmp}"; do
+        find "$d" -maxdepth 2 -type s -path '*nvim*' 2>/dev/null
+    done | sort -u
+}
+WIKI=$HOME/sync/notes/vimwiki
+RUN=${XDG_RUNTIME_DIR:-/tmp}
+item='^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]'
+gap() {
+    ! [[ "$1" =~ $item && "$2" =~ $item ]]
+}
+trimmed() {
+    awk '{ l[NR] = $0 } NF { if (!first) first = NR; last = NR } END { for (i = first; i && i <= last; i++) print l[i] }' "$1"
+}
+append_to() {
+    local note=$1 file=$2 new old last sep=""
+    new=$(trimmed "$file")
+    [ -n "$new" ] || return 1
+    mkdir -p "$(dirname "$note")" || return 1
+    old=$(awk '{ l[NR] = $0 } NF { last = NR } END { for (i = 1; i <= last; i++) print l[i] }' "$note" 2>/dev/null)
+    if [ -n "$old" ]; then
+        last=${old##*$'\n'}
+        gap "$last" "${new%%$'\n'*}" && sep=$'\n'
+        printf '%s\n%s%s\n' "$old" "$sep" "$new" > "$note"
+    else
+        printf '%s\n' "$new" > "$note"
+    fi
+}
+ask() {
+    timeout 2 nvim --headless --clean --server "$1" --remote-expr "$2" 2>/dev/null
+}
+
+list() {
+    local expr s
+    expr="join(map(filter(getbufinfo({'buflisted': 1}), {_, b -> !empty(b.windows) && (b.name =~# '^/' || b.name ==# '') && getbufvar(b.bufnr, '&buftype') ==# '' && getbufvar(b.bufnr, '&modifiable')}), {_, b -> get(g:, 'focused_at', 0) . \"\\t\" . b.lastused . \"\\t\" . b.bufnr . \"\\t\" . (empty(b.name) ? '-' : b.name)}), \"\\n\")"
+    for s in $(sockets); do
+        { ask "$s" "$expr"; echo; } | while IFS=$'\t' read -r focused used buf path; do
+            [ -n "$path" ] || continue
+            [ "$path" = - ] && path=""
+            printf '%s\t%s\t%s\t%s\t%s\n' "$focused" "$used" "$s" "$buf" "$path"
+        done
+    done | sort -t$'\t' -k1,1nr -k2,2nr | cut -f3- | awk -F'\t' '!seen[$3 == "" ? $1 "\t" $2 : $3]++'
+}
+
+case "${1:-}" in
+list) list ;;
+add-file)
+    s=$2 b=$3
+    [ -S "$s" ] && [[ "$b" =~ ^[0-9]+$ ]] && [ -f "${4:-}" ] || exit 1
+    tmp=$(mktemp) || exit 1
+    trimmed "$4" > "$tmp"
+    [ -s "$tmp" ] || { rm -f "$tmp"; exit 1; }
+    f=${tmp//\'/\'\'}
+    unsaved=$(ask "$s" "getbufvar($b, '&modified')") || { rm -f "$tmp"; exit 1; }
+    shape=$(ask "$s" "join(map(getbufline($b, 1, '\$'), {_, l -> l =~ '^\\s*\$' ? '0' : '1'}), '')") || { rm -f "$tmp"; exit 1; }
+    text=${shape%1*}1; [[ "$shape" == *1* ]] || text=""
+    last=${#text}
+    gap=""
+    if [ "$last" != 0 ]; then
+        lastline=$(ask "$s" "get(getbufline($b, $last), 0, '')") || { rm -f "$tmp"; exit 1; }
+        gap "$lastline" "$(head -n1 "$tmp")" && gap="['']"
+    fi
+    if [ "$last" = 0 ]; then
+        expr="string([deletebufline($b, 1, '\$'), setbufline($b, 1, readfile('$f'))])"
+    elif [ "${#shape}" -gt "$last" ]; then
+        expr="string([deletebufline($b, $((last + 1)), '\$'), appendbufline($b, $last, ${gap:+$gap + }readfile('$f'))])"
+    else
+        expr="string([appendbufline($b, $last, ${gap:+$gap + }readfile('$f'))])"
+    fi
+    ask "$s" "$expr" > /dev/null
+    rc=$?
+    rm -f "$tmp"
+    [ "$rc" = 0 ] || exit 1
+    if [ "$unsaved" = 0 ]; then
+        ask "$s" "win_execute(win_findbuf($b)[0], 'silent! update')" > /dev/null || true
+    fi
+    exit 0
+    ;;
+popup)
+    read -r id focused < <(mmsg get all-clients 2>/dev/null | python3 -I -c 'import json, sys
+for c in json.load(sys.stdin).get("clients", []):
+    if c.get("appid") == "qs-capture":
+        print(c["id"], int(bool(c.get("is_focused"))))
+        break')
+    if [ -n "$id" ]; then
+        [ "$focused" = 1 ] || exec ~/.config/mango/scripts/mm bring "$id"
+        for s in $(sockets); do
+            if [[ "$(ask "$s" "expand('%:p')")" == "$RUN"/capture.* ]]; then
+                ask "$s" 'execute("SaveQuit")' > /dev/null
+                exit 0
+            fi
+        done
+        exec "$HOME/.config/mango/scripts/close" --id "$id"
+    fi
+    exec flock -n -o "$RUN/qs-capture.lock" kitty --class=qs-capture --title="Quick capture" "$0" write
+    ;;
+write)
+    name() { local p=${1##*/vimwiki/}; printf '%s' "${p%.md}"; }
+    notes=() others=()
+    while IFS=$'\t' read -r s b p; do
+        if [ -z "$p" ]; then
+            first=$(ask "$s" "get(filter(getbufline($b, 1, 50), {_, l -> l =~ '\\S'}), 0, '')")
+            first=${first#"${first%%[![:space:]]*}"}
+            first=${first//$'\t'/ }
+            others+=("[unsaved]${first:+ ${first:0:50}}"$'\t'"$s"$'\t'"$b"$'\t'"$p")
+        elif [[ "$p" =~ /vimwiki/.*\.md$ ]]; then
+            notes+=("$(name "$p")"$'\t'"$s"$'\t'"$b"$'\t'"$p")
+        elif [[ "$p" != "$RUN"/capture.* ]]; then
+            l=$p; [[ "$p" == "$HOME"/* ]] && l="~/${p#"$HOME"/}"
+            others+=("$l"$'\t'"$s"$'\t'"$b"$'\t'"$p")
+        fi
+    done < <(list)
+    pick="" note=""
+    if [ "${#notes[@]}" -eq 0 ]; then
+        out=$({ [ "${#others[@]}" -gt 0 ] && printf '%s\n' "${others[@]}"
+                cd "$WIKI" 2>/dev/null && find . -name '*.md' -printf '%T@\t%P\n' | sort -rn | cut -f2 | sed 's/\.md$//'; } |
+            fzf --print-query --delimiter=$'\t' --with-nth=1 --prompt="Add to > " --height=100% --reverse)
+        [ $? = 130 ] && exit 0
+        sel=$(printf '%s\n' "$out" | sed -n 2p)
+        if [[ "$sel" == *$'\t'* ]]; then
+            pick=$sel
+        else
+            note=${sel:-$(printf '%s\n' "$out" | sed -n 1p)}
+            note=${note%.md}
+            [ -n "$note" ] || exit 0
+        fi
+    elif [ "${#others[@]}" -eq 0 ] && [ "${#notes[@]}" -eq 1 ]; then
+        pick=${notes[0]}
+    else
+        pick=$(printf '%s\n' "${others[@]}" "${notes[@]}" |
+            fzf --delimiter=$'\t' --with-nth=1 --prompt="Add to > " --height=100% --reverse) || exit 0
+        [ -n "$pick" ] || exit 0
+    fi
+    if [ -n "$pick" ]; then
+        IFS=$'\t' read -r to s b p <<< "$pick"
+    else
+        to=$note
+    fi
+    tmp=$(mktemp "$RUN/capture.XXXXXX.md") || exit 1
+    bar=${to//%/%%}
+    bar=" → ${bar//\'/\'\'}"
+    trap '' HUP
+    nvim -c "let &l:winbar = '$bar'" -c 'startinsert' "$tmp"
+    for _ in $(seq 150); do pgrep -f -- "--embed .*$tmp" >/dev/null || break; sleep 0.02; done
+    first=$(grep -m1 '[^[:space:]]' "$tmp")
+    if [ -n "$first" ]; then
+        if [ -n "$pick" ]; then
+            "$0" add-file "$s" "$b" "$tmp" || {
+                notify-send --urgency=critical --app-name=Capture "Not added" "Couldn't reach nvim for $to (what you wrote is in $tmp)"
+                exit 1
+            }
+        else
+            append_to "$WIKI/$note.md" "$tmp" || {
+                notify-send --urgency=critical --app-name=Capture "Not added" "Couldn't write $note (what you wrote is in $tmp)"
+                exit 1
+            }
+        fi
+        notify-send --app-name=Capture "Added to $to" "$first"
+    fi
+    rm -f "$tmp"
+    ;;
+*)
+    echo "usage: qs-capture popup | list | add-file SOCKET BUFFER FILE" >&2
+    exit 1
+    ;;
+esac

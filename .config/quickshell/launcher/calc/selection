@@ -1,0 +1,32 @@
+#!/bin/bash
+# the text the calculator's Ctrl+s adds up: lines highlighted in nvim, else the highlight selection, else the clipboard
+run=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+expr='mode() =~# "^[vV\x16]" ? expand("%:t") . "\n" . join(getregion(getpos("v"), getpos("."), #{type: mode()}), "\n") : ""'
+found=() names=()
+for s in "$run"/nvim.*.0; do
+    [ -S "$s" ] || continue
+    out=$(timeout 1 nvim --server "$s" --remote-expr "$expr" 2>/dev/null) || continue
+    [ -n "$out" ] || continue
+    names+=("${out%%$'\n'*}")
+    found+=("${out#*$'\n'}")
+done
+if [ ${#found[@]} -eq 1 ]; then
+    printf '%s\n' "${found[0]}"
+    exit 0
+elif [ ${#found[@]} -gt 1 ]; then
+    title=$(mmsg get all-clients 2>/dev/null | python3 -I -c '
+import json, sys
+try:
+    print(next((c["title"] for c in json.load(sys.stdin)["clients"] if c.get("is_focused")), ""))
+except Exception:
+    pass')
+    for i in "${!found[@]}"; do
+        if [ -n "${names[$i]}" ] && [[ $title == *"${names[$i]}"* ]]; then
+            printf '%s\n' "${found[$i]}"
+            exit 0
+        fi
+    done
+    printf '%s\n' "${found[0]}"
+    exit 0
+fi
+wl-paste --primary --no-newline 2>/dev/null || wl-paste --no-newline 2>/dev/null

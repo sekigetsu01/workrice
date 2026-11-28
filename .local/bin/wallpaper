@@ -1,0 +1,299 @@
+#!/bin/bash
+# The wallpaper, and the colours of everything with it (pywal):
+#   wallpaper                          a random one from the wallpapers folder, a night/ one at night (Super+b; held: keeps changing)
+#   wallpaper --last                   the last one again if it suits the time of day, else a random one (login, night switch)
+#   wallpaper IMAGE [transition] [s]   that picture (the selector, yazi's b, the image viewer's b)
+#   wallpaper FOLDER                   a random picture from it or its subfolders (hidden ones skipped), not the current one
+#   wallpaper dir                      the wallpapers folder in use (~/wallpapers unless another is chosen)
+#   wallpaper dir pick                 choose one with yazi (quit with q inside it) and print it
+#   wallpaper dir set DIR session|always   use DIR until you restart / from now on (~/wallpapers again: back to normal)
+#   wallpaper warm [DIR|FILE…]         work out pywal's colours ahead of time, so changing wallpaper is instant
+APP=wallpaper
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+SELF=$HOME/.local/bin/wallpaper
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/setwp
+RUN=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+LAST_WALLPAPER=$STATE/last_wallpaper
+WAL=${XDG_CACHE_HOME:-$HOME/.cache}/wal
+DEFAULT_DIR=$HOME/wallpapers
+KEPT_DIR=$STATE/dir
+SESSION_DIR=$RUN/setwp-dir
+Q=$RUN/setwp.queue
+
+fail() {
+    echo "Error: $1" >&2
+    notify --urgency=critical "Wallpaper not changed" "$1"
+    exit 1
+}
+images() {
+    find "$1/" -mindepth 1 \( -type d -name '.*' -prune \) -o -type f \( -iname '*.jpg' -o -iname '*.jpeg' \
+        -o -iname '*.png' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp' \) -print
+}
+last() { { cat -- "$LAST_WALLPAPER"; } 2>/dev/null; }
+
+dir_current() {
+    local f d
+    for f in "$SESSION_DIR" "$KEPT_DIR"; do
+        { read -r d < "$f"; } 2>/dev/null
+        [ -n "$d" ] && [ -d "$d" ] && { echo "$d"; return; }
+    done
+    echo "$DEFAULT_DIR"
+}
+dir_pick() {
+    local tmp d=
+    need yazi
+    tmp=$(mktemp -d) || exit 1
+    # shellcheck disable=SC2064
+    trap "rm -rf -- '$tmp'" EXIT
+    kitty --class=wpdir --title=wpdir yazi --cwd-file="$tmp/cwd" --chooser-file="$tmp/chosen" "$(dir_current)"
+    if [ -s "$tmp/chosen" ]; then
+        d=$(head -n 1 "$tmp/chosen")
+        [ -d "$d" ] || d=${d%/*}
+    elif [ -s "$tmp/cwd" ]; then
+        d=$(< "$tmp/cwd")
+    fi
+    [ -n "$d" ] && [ -d "$d" ] || exit 1
+    echo "$d"
+}
+dir_set() {
+    local d mode=${2:-}
+    d=$(realpath -e -- "${1:-}" 2>/dev/null) && [ -d "$d" ] || die "Not a folder: ${1:-}"
+    case $mode in
+        session) printf '%s\n' "$d" > "$SESSION_DIR" ;;
+        always)
+            rm -f -- "$SESSION_DIR"
+            if [ "$d" = "$(realpath -m -- "$DEFAULT_DIR")" ]; then rm -f -- "$KEPT_DIR"
+            else mkdir -p -- "$STATE" && printf '%s\n' "$d" > "$KEPT_DIR"; fi ;;
+        *) die "wallpaper dir set DIR session|always" ;;
+    esac
+}
+
+warm() {
+    local paths=("$@") now=
+    [ "${1:-}" = --now ] && now=1 && paths=("${@:2}")
+    [ ${#paths[@]} -gt 0 ] || paths=("$(dir_current)" "$DEFAULT_DIR")
+    WARM_NOW=$now python3 -I - "${paths[@]}" <<'EOF'
+import fcntl, json, os, subprocess, sys
+EXT = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
+LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "walwarm.lock")
+NOW = os.environ.get("WARM_NOW") == "1"
+# readable text: the contrast every colour (and the dim grey) needs against the background
+TEXT, DIM, MARK = 4.5, 3.0, "4.5/3"
+
+
+def lum(h):
+    c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    c = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+
+def ratio(a, b):
+    la, lb = sorted((lum(a), lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def mix(h, t):
+    c = [int(h[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(round(x + (255 - x) * t) for x in c)
+
+
+def readable(name):
+    with open(name) as f:
+        s = json.load(f)
+    if s.get("readable") == MARK:
+        return
+    bg = s["special"]["background"]
+    for k, h in s["colors"].items():
+        n = int(k[5:])
+        need = DIM if n == 8 else TEXT
+        if n == 0 or ratio(h, bg) >= need:
+            continue
+        lo, hi = 0.0, 1.0
+        for _ in range(20):
+            mid = (lo + hi) / 2
+            lo, hi = (lo, mid) if ratio(mix(h, mid), bg) >= need else (mid, hi)
+        s["colors"][k] = mix(h, hi)
+    s["special"]["foreground"] = s["colors"]["color7"]
+    s["special"]["cursor"] = s["colors"]["color7"]
+    s["readable"] = MARK
+    with open(name + ".new", "w") as f:
+        json.dump(s, f, indent=4)
+    os.replace(name + ".new", name)
+
+def pictures(paths):
+    for p in paths:
+        if os.path.isfile(p):
+            yield os.path.realpath(p)
+            continue
+        for d, _, names in os.walk(p):
+            for n in sorted(names):
+                if n.lower().endswith(EXT) and not n.startswith("."):
+                    yield os.path.realpath(os.path.join(d, n))
+
+paths = [x for x in dict.fromkeys(sys.argv[1:]) if x and os.path.exists(x)]
+if not NOW:
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    except OSError:
+        sys.exit()
+    os.nice(19)
+    try:
+        subprocess.run(["ionice", "-c", "3", "-p", str(os.getpid())], capture_output=True)
+    except OSError:
+        pass
+import logging
+logging.disable(logging.CRITICAL)
+from pywal import colors
+done = 0
+for img in dict.fromkeys(pictures(paths)):
+    try:
+        name = os.path.join(*colors.cache_fname(img, None, False, colors.CACHE_DIR, None, c16=False))
+        if not os.path.isfile(name):
+            colors.get(img, False, None, sat=None, c16=False, cst=None)
+            done += 1
+        readable(name)
+    except (Exception, SystemExit) as e:
+        print("wallpaper warm: %s: %s" % (img, e), file=sys.stderr)
+if done and os.isatty(1) and os.ttyname(1).startswith("/dev/pts/"):
+    print("wallpaper warm: %d new" % done)
+EOF
+}
+
+set_image() {
+    local cached=false image transition duration seq me waiting applied post t=(center grow fade)
+    [ "${1:-}" = --cached ] && cached=true && shift
+    [ -f "$1" ] || fail "File not found: $1"
+    image=$(readlink -f "$1")
+    transition=${2:-${t[RANDOM % 3]}}
+    duration=${3:-1.5}
+
+    mkdir -p "$Q"
+    exec 8<>"$Q.seq"
+    flock 8
+    read -r seq <&8
+    printf -v seq '%012d' $(( 10#${seq:-0} + 1 ))
+    echo "$seq" > "$Q.seq"
+    exec 8>&-
+    me="$Q/$seq-$$"
+    : > "$me"
+    # shellcheck disable=SC2064
+    trap "rm -f '$me'" EXIT
+    exec 9>"$Q.lock"
+    flock -w 30 9 || fail "another wallpaper change is still running"
+    for f in "$Q"/*; do kill -0 "${f##*-}" 2>/dev/null || rm -f "$f"; done
+    waiting=("$Q"/*)
+    [ "${waiting[-1]}" = "$me" ] || exit 0
+    { read -r applied < "$Q.applied"; } 2>/dev/null
+    [ "${applied:-0}" -lt "$seq" ] || exit 0
+    echo "$seq" > "$Q.applied"
+
+    if ! timeout 2 awww query &>/dev/null && ! pgrep -x awww-daemon >/dev/null; then
+        setsid -f awww-daemon --no-cache &>/dev/null 9>&-
+    fi
+    for _ in {1..50}; do
+        [ -n "$(timeout 2 awww query 2>/dev/null)" ] && break
+        sleep 0.1
+    done
+
+    timeout 10 awww img "$image" \
+        --transition-type "$transition" \
+        --transition-duration "$duration" \
+        --transition-fps 60 || fail "awww could not set ${image##*/}"
+
+    mkdir -p "$STATE"
+    echo "$image" > "$LAST_WALLPAPER"
+
+    if $cached && [ -s "$WAL/colors" ] && [ "$(< "$WAL/wal")" = "$image" ]; then exit 0; fi 2>/dev/null
+    timeout 60 "$SELF" warm --now "$image"
+    timeout 60 wal -q -n -t -e -i "$image" >/dev/null 2>&1 ||
+        fail "pywal could not generate colours from ${image##*/}"
+    timeout 5 mmsg dispatch reload_config &>/dev/null
+    post=$HOME/.config/wal/postrun
+    [ -x "$post" ] && "$post"
+
+    setsid -f "$SELF" warm </dev/null &>/dev/null 9>&-
+    exit 0
+}
+
+from_folder() {
+    local all pool f cur
+    mapfile -t all < <(images "$1")
+    [ ${#all[@]} -gt 0 ] || { notify "No images in this folder" "${1##*/}"; exit 1; }
+    cur=$(last)
+    pool=()
+    for f in "${all[@]}"; do [ "$(readlink -f -- "$f")" != "$cur" ] && pool+=("$f"); done
+    [ ${#pool[@]} -gt 0 ] || pool=("${all[@]}")
+    set_image "${pool[RANDOM % ${#pool[@]}]}"
+}
+
+random_one() {
+    local start end hhmm n s e now night previous dir all f suited picked current pool pick
+    times_load
+    start=${TIMES[night_start]-21:00} end=${TIMES[night_end]-05:00}
+    hhmm='^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
+    [[ $start =~ $hhmm ]] || start=21:00
+    [[ $end =~ $hhmm ]] || end=05:00
+    mins() { echo $(( 10#${1%:*} * 60 + 10#${1#*:} )); }
+    printf -v now '%(%H:%M)T' -1
+    n=$(mins "$now") s=$(mins "$start") e=$(mins "$end")
+    if (( s > e ? n >= s || n < e : n >= s && n < e )); then night=true; else night=false; fi
+    suits_now() { if [[ $1 == */night/* ]]; then $night; else ! $night; fi; }
+
+    if [ "${1:-}" != --last ]; then
+        flock -n "$Q.lock" true 2>/dev/null || exit 0
+    fi
+
+    previous=$(last)
+    any_suits() {
+        local f
+        while IFS= read -r f; do suits_now "$f" && return 0; done < <(images "$(readlink -f "$(dir_current)")")
+        return 1
+    }
+    if [ "${1:-}" = --last ] && [ -f "$previous" ] && { suits_now "$previous" || ! any_suits; }; then
+        set_image --cached "$previous" none 0
+    fi
+
+    dir=$(dir_current)
+    [ -d "$dir" ] || fail "Wallpapers folder not found: $dir"
+    mapfile -t all < <(find "$(readlink -f "$dir")" -type f \( -iname '*.jpg' -o -iname '*.jpeg' \
+        -o -iname '*.png' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp' \))
+    [ ${#all[@]} -gt 0 ] || fail "No images found in $dir"
+
+    suited=()
+    for f in "${all[@]}"; do suits_now "$f" && suited+=("$f"); done
+    [ ${#suited[@]} -gt 0 ] && all=("${suited[@]}")
+
+    picked=$RUN/setbg.picked
+    { current=$(< "$picked"); } 2>/dev/null
+    pool=()
+    for f in "${all[@]}"; do [ "$f" != "$previous" ] && [ "$f" != "$current" ] && pool+=("$f"); done
+    [ ${#pool[@]} -gt 0 ] || pool=("${all[@]}")
+    pick=${pool[RANDOM % ${#pool[@]}]}
+    echo "$pick" > "$picked"
+    set_image "$pick" wipe 0.5
+}
+
+case ${1:-} in
+    '' | --last) random_one "$@" ;;
+    dir)
+        shift
+        case ${1:-} in
+            '') dir_current ;;
+            pick) dir_pick ;;
+            set) shift; dir_set "$@" ;;
+            *) echo "wallpaper dir | wallpaper dir pick | wallpaper dir set DIR session|always" >&2; exit 2 ;;
+        esac ;;
+    warm) shift; warm "$@" ;;
+    -*) echo "Usage: wallpaper [--last | IMAGE [transition] [seconds] | FOLDER | dir … | warm …]" >&2; exit 2 ;;
+    *)
+        if [ -d "$1" ]; then from_folder "$1"
+        else
+            [ -f "$1" ] || fail "File not found: $1"
+            case $(file -b --mime-type -- "$1") in
+                image/*) set_image "$@" ;;
+                *) fail "Not an image: ${1##*/}" ;;
+            esac
+        fi ;;
+esac

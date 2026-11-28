@@ -1,0 +1,109 @@
+#!/bin/bash
+# watermark FILE: brush out a watermark (or anything) with IOPaint's AI fill, in its own window; Save replaces FILE
+#   w in swayimg, Shift+w in the screenshot tool. Stops after saving, on closing the window, or after two hours unused
+set -o pipefail
+SELF=$(readlink -f "$0")
+D=${XDG_DATA_HOME:-$HOME/.local/share}/iopaint
+RUN=${XDG_RUNTIME_DIR:-/tmp}
+PIDF=$RUN/watermark.pid
+IDLE=7200
+APP=watermark
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+
+need curl
+[ -n "${1:-}" ] || die "Usage: watermark FILE [SWAYIMG_PID]"
+f=$(readlink -f -- "$1")
+[ -f "$f" ] || die "No such picture: $1"
+
+if [ ! -f "$D/venv/.ok" ]; then
+    { [[ $(tty) == /dev/pts/* ]] && [ -t 1 ]; } || window "$@"
+    need uv
+    echo "First run: installing IOPaint (about 1.7 GB: PyTorch for the CPU and the LaMa model)…"
+    rm -rf "$D/venv"
+    mkdir -p "$D"
+    if ! { uv venv -q --python 3.11 "$D/venv" &&
+        uv pip install -q --python "$D/venv/bin/python" --extra-index-url https://download.pytorch.org/whl/cpu \
+            --index-strategy unsafe-best-match torch torchvision iopaint PyQt6 PyQt6-WebEngine &&
+        "$D/venv/bin/iopaint" download --model=lama &&
+        touch "$D/venv/.ok"; }; then
+        rm -rf "$D/venv"
+        read -r -p "The install failed. Enter closes this window. "
+        exit 1
+    fi
+    setsid -f "$SELF" "$@" </dev/null >/dev/null 2>&1
+    exit 0
+fi
+
+if old=$(cat "$PIDF" 2>/dev/null) && [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+    kill "$old" 2>/dev/null
+    sleep 0.5
+fi
+echo $$ > "$PIDF"
+
+port=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])') || die "No free port"
+out=$(mktemp -d "$RUN/watermark.XXXXXX") || die "Couldn't make a folder in $RUN"
+log=$out.log
+srv= win=
+cleanup() {
+    [ -n "$win" ] && kill "$win" 2>/dev/null
+    [ -n "$srv" ] && kill "$srv" 2>/dev/null
+    rm -rf -- "$out" "$log"
+    [ "$(cat "$PIDF" 2>/dev/null)" = $$ ] && rm -f "$PIDF"
+}
+trap cleanup EXIT
+trap 'exit 0' TERM INT HUP
+
+"$D/venv/bin/iopaint" start --model=lama --device=cpu --host=127.0.0.1 --port="$port" \
+    --input="$f" --output-dir="$out" >"$log" 2>&1 &
+srv=$!
+url=http://127.0.0.1:$port
+for _ in $(seq 120); do
+    curl -fsS -o /dev/null "$url/api/v1/server-config" 2>/dev/null && break
+    kill -0 "$srv" 2>/dev/null || die "IOPaint didn't start: $(tail -n 1 "$log")"
+    sleep 0.5
+done
+curl -fsS -o /dev/null "$url/api/v1/server-config" 2>/dev/null || die "IOPaint didn't start in time"
+
+"$D/venv/bin/python" -I "$HOME/.local/lib/webapp-window" "$url" "Remove a watermark" iopaint "$out" >/dev/null 2>&1 &
+win=$!
+
+got=
+last=$EPOCHSECONDS checked=0
+while :; do
+    kill -0 "$srv" 2>/dev/null || exit 0
+    kill -0 "$win" 2>/dev/null || exit 0
+    for g in "$out"/*; do
+        [ -s "$g" ] || continue
+        s1=$(stat -c %s "$g"); sleep 0.5; s2=$(stat -c %s "$g" 2>/dev/null)
+        [ "$s1" = "$s2" ] && got=$g && break 2
+    done
+    now=$EPOCHSECONDS
+    if (( now - checked >= 30 )); then
+        checked=$now
+        t=$(stat -c %Y -- "$log" 2>/dev/null) && (( t > last )) && last=$t
+        [[ $(mmsg get focusing-client 2>/dev/null) == *'"appid":"iopaint"'* ]] && last=$now
+        (( now - last < IDLE )) || exit 0
+    fi
+    sleep 0.5
+done
+[ -n "$got" ] || exit 0
+
+tmp=$f.watermark-tmp
+ext=${f##*.}
+if [ "${got##*.}" = "$ext" ] || [ "$(file -b --mime-type -- "$got")" = "$(file -b --mime-type -- "$f")" ]; then
+    cp -f -- "$got" "$tmp"
+elif command -v magick >/dev/null; then
+    magick "$got" "${ext}:$tmp"
+else
+    convert "$got" "${ext}:$tmp"
+fi || { rm -f -- "$tmp"; die "Couldn't save over $(short "$f")"; }
+mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; die "Couldn't save over $(short "$f")"; }
+notify "Watermark removed" "$(short "$f")"
+
+P=${2:-}
+if [ -n "$P" ] && [ "$(cat "/proc/$P/comm" 2>/dev/null)" = swayimg ]; then
+    printf '%s\n' "$f" > "$RUN/qs_edit_$P"
+    kill -USR1 "$P"
+fi
+exit 0

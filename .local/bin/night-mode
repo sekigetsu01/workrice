@@ -1,0 +1,93 @@
+#!/bin/bash
+# Night mode, from dim_start to night_end in times.conf: the screen goes 40% red and dim; full brightness at dim_end
+#   night-mode          what dim.service runs: red + dim at night, normal colours by day
+#   night-mode off      normal colours now (back on at the next night start)
+#   night-mode up|down  redder / less red (Super+Right / Super+Left)
+conf=${XDG_CONFIG_HOME:-$HOME/.config}/times.conf
+# the last line for each wins, and one that isn't HH:MM uses its default, as settimes does
+hhmm='^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
+start=$(awk '$1=="dim_start"{v=$2} END{print v}' "$conf" 2>/dev/null); [[ $start =~ $hhmm ]] || start=01:00
+end=$(awk '$1=="night_end"{v=$2} END{print v}' "$conf" 2>/dev/null); [[ $end =~ $hhmm ]] || end=05:00
+bright=$(awk '$1=="dim_end"{v=$2} END{print v}' "$conf" 2>/dev/null); [[ $bright =~ $hhmm ]] || bright=06:00
+LEVEL_FILE=${XDG_STATE_HOME:-$HOME/.local/state}/nightred/level
+STEP=10
+# the level dim_start brings
+AUTO_LEVEL=40
+
+m() { local h=${1%%:*} mi=${1##*:}; echo $((10#$h * 60 + 10#$mi)); }
+now=$(m "$(date -d "+1 min" +%H:%M)") s=$(m "$start") e=$(m "$end") b=$(m "$bright")
+if (( s > e ? now >= s || now < e : now >= s && now < e )); then night=true; else night=false; fi
+if (( b > s ? now >= b || now < s : now >= b && now < s )); then day=true; else day=false; fi
+lead=$(date -d "+1 min" +%s)
+last_start=$(date -d "$(date -d "@$lead" +%F) $start" +%s)
+((last_start > lead)) && last_start=$(date -d "$(date -d "@$lead" +%F) $start -1 day" +%s)
+btime=$(awk '$1=="btime"{print $2}' /proc/stat)
+if ((${btime:-0} > last_start)); then fresh_boot=true; else fresh_boot=false; fi
+
+red_on() {
+    pgrep -xu "$USER" nightred >/dev/null && return
+    if [ -n "${INVOCATION_ID:-}" ]; then
+        systemd-run --user --quiet --collect --unit=nightred "$HOME/.local/bin/nightred" >/dev/null 2>&1
+    else
+        setsid -f "$HOME/.local/bin/nightred" >/dev/null 2>&1
+    fi
+}
+red_off() { pkill -xu "$USER" nightred; }
+
+auto_red() {
+    # no Wayland yet (the timer catching up as the user manager starts): nightred has no screen to tint
+    [ -S "${XDG_RUNTIME_DIR:-/run/user/$UID}/${WAYLAND_DISPLAY:-none}" ] || return
+    mkdir -p "${LEVEL_FILE%/*}"
+    if ! pgrep -xu "$USER" nightred >/dev/null; then
+        echo "$AUTO_LEVEL" > "$LEVEL_FILE"
+        red_on
+    elif (( (now - s + 1440) % 1440 <= 1 )); then
+        echo "$AUTO_LEVEL" > "$LEVEL_FILE"
+        pkill -USR1 -xu "$USER" nightred
+    fi
+}
+
+level() { local l; read -r l 2>/dev/null < "$LEVEL_FILE"; [[ $l =~ ^[0-9]+$ ]] || l=60; echo "$l"; }
+
+step() {
+    local l old msg
+    l=$(level)
+    if pgrep -xu "$USER" nightred >/dev/null; then
+        old=$l
+        l=$((l + $1))
+        ((l > 100)) && l=100
+        ((l == old)) && return
+        if ((l <= 0)); then
+            echo "$STEP" > "$LEVEL_FILE"
+            red_off
+            msg="off"
+        else
+            echo "$l" > "$LEVEL_FILE"
+            pkill -USR1 -xu "$USER" nightred
+            msg="$l%"
+        fi
+    elif (($1 > 0)); then
+        ((l < STEP)) && l=$STEP
+        mkdir -p "${LEVEL_FILE%/*}"
+        echo "$l" > "$LEVEL_FILE"
+        red_on
+        msg="$l%"
+    else
+        return
+    fi
+    # the sync tag makes each step replace the last card (the notifications here don't go by replace ids)
+    notify-send -a "Night mode" -t 1500 -h string:x-canonical-private-synchronous:night-mode "Red screen: $msg"
+}
+
+case $1 in
+    off) red_off ;;
+    up) step $STEP ;;
+    down) step -$STEP ;;
+    *)
+        if $night && ! $fresh_boot; then auto_red; else red_off; fi
+        # a boot at night also gets full brightness: systemd-backlight brings back the level the PC shut down at, dim if
+        # that was in night mode
+        if $day || { $night && $fresh_boot; }; then brightnessctl -q set 100%; elif $night; then brightnessctl -q -n1 set 0; fi
+        ;;
+esac
+exit 0

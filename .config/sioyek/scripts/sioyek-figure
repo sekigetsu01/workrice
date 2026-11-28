@@ -1,0 +1,47 @@
+#!/bin/bash
+# sioyek's Y: saves the figure under the mouse as a picture in the notes wiki's images folder and adds it to the
+# book's note (through sioyek-note)
+shopt -s extglob
+WIKI="$HOME/sync/notes/vimwiki"
+IMAGES="$WIKI/images"
+LAST="${XDG_RUNTIME_DIR:-/tmp}/sioyek-figure.last"
+
+notify() { notify-send --app-name=sioyek "$@" 2>/dev/null; }
+
+doc=$1
+n=${2%% *}
+case $n in '' | *[!0-9]*) n=0 ;; esac
+page=$((n + 1))
+title=${doc:-notes}
+title=${title##*/}
+title=${title%.*}
+slug=${title,,}
+slug=${slug//+([^a-z0-9])/-}
+slug=${slug#-}
+slug=${slug%-}
+slug=${slug:0:40}
+slug=${slug%-}
+printf -v now '%(%Y%m%d-%H%M%S)T' -1
+file="$IMAGES/${slug:-figure}-p$page-$now.png"
+[ -e "$file" ] && file="${file%.png}-$$.png"
+mkdir -p "$IMAGES"
+
+last=
+read -r last 2>/dev/null < "$LAST"
+sleep 0.3
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    wl-paste --no-newline --type image/png > "$file" 2>/dev/null
+    if [ "$(head -c 4 "$file")" = $'\x89PNG' ]; then
+        sum=$(cksum < "$file")
+        [ "$sum" != "$last" ] && break
+    fi
+    rm -f "$file"
+    sleep 0.15
+done
+if [ ! -s "$file" ]; then
+    notify --urgency=critical "Figure not saved" "Nothing came through from sioyek"
+    exit 1
+fi
+printf '%s\n' "$sum" > "$LAST"
+
+"${0%/*}/sioyek-note" "$doc" "$title, p. $page" "$file"

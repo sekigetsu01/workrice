@@ -1,0 +1,251 @@
+#!/bin/bash
+# scrub FILE|FOLDER…: strips the hidden data that can identify you (GPS, camera and serial, dates, names, thumbnails), in place
+#   x in yazi · scrub --check FILE… shows it without changing anything · -r random names · -p hides the camera · scrub -h
+
+RAW_TAGS=(-Location:all '-*Serial*' '-*Owner*' -Artist -Creator -By-line -Copyright
+          -Rights -CopyrightNotice)
+
+SHAPE='(Exif)?Image(Width|Height|Size)|ImagePixelDepth|BitDepth|BitsPer(Sample|Pixel)|SamplesPerPixel'\
+'|Color(Type|Components|ResolutionDepth|Space|Profiles|Primaries)|Compression|Filter|Interlace'\
+'|Orientation|Interop(Index|Version)|WhitePoint[XY]?|(Red|Green|Blue)[XY]|PrimaryChromaticities'\
+'|YCbCr[A-Za-z]*|[XY]Resolution|ResolutionUnit|ExifVersion|FlashpixVersion|SRGBRendering|Gamma'\
+'|PixelsPer[A-Za-z]*|PixelUnits|PixelAspectRatio|Megapixels|EncodingProcess|Palette|Transparency'\
+'|TransparentColor|Background(Color)?|HasColorMap|AnimationIterations|Frame(Count|Rate)'\
+'|[A-Za-z]*Duration|GIFVersion|VP8[A-Za-z]*|WebP_Flags|(Horizontal|Vertical)Scale|ImageOffset'\
+'|Alpha[A-Za-z]*|ImageSpatialExtent|PrimaryItemReference|ItemPropertyContainer|[A-Za-z]*Configuration'\
+'|Chroma[A-Za-z]*|HEVC[A-Za-z]*|AV1[A-Za-z]*|TransferCharacteristics|MatrixCoefficients|Rotation'\
+'|SubfileType|PhotometricInterpretation|FillOrder|Strip(Offsets|ByteCounts)|RowsPerStrip|PageNumber'\
+'|Tile(Width|Length|Offsets|ByteCounts)|SampleFormat|ExtraSamples|Predictor|ReferenceBlackWhite'\
+'|MajorBrand|MinorVersion|CompatibleBrands|MediaData(Size|Offset)|MovieHeaderVersion|TimeScale'\
+'|Preferred(Rate|Volume)|MatrixStructure|(Preview|Poster|Selection|Current)Time|NextTrackID'\
+'|Track(Number|UID|Language|Default|Type|HeaderVersion|ID|Layer|Volume)|TagTrackUID'\
+'|Media(HeaderVersion|TimeScale|LanguageCode)|Handler(Class|Description|Type|VendorID)|Balance'\
+'|Audio(Format|Channels|BitsPerSample|SampleRate)|Video(FrameRate|ScanType|FullRangeFlag)'\
+'|GraphicsMode|OpColor|Compressor(ID|Name)|VendorID|SourceImage(Width|Height)|PurchaseFileFormat'\
+'|LayoutFlags|(Average|Max)Bitrate|BufferSize|EBML[A-Za-z]*|DocType[A-Za-z]*|TimecodeScale'\
+'|MuxingApp|WritingApp|CodecID|AttachedFile[A-Za-z]*'
+
+usage() {
+    cat <<'EOF'
+scrub: strips the hidden data from files that can identify you or where you
+were: GPS location, camera / phone make, model and serial number, dates and
+times, editing software, author and computer names, thumbnails, comments,
+document history…
+
+  scrub FILE|FOLDER…   clean those now (folders: everything inside except
+                       hidden files and folders)
+  scrub --check FILE…  show what a file gives away, without changing it
+  scrub -r FILE…       also give the files random names (a name like
+                       IMG_20261007_142233.jpg gives away the date and time)
+  scrub -p FILE…       also hide which camera took a photo (its sensor's noise
+                       pattern): a few random pixels cropped off each edge,
+                       scaled down a little (Lanczos, so it stays sharp) and
+                       saved again at high quality (jpg, png, webp, tif, heic,
+                       avif, jxl; not RAW). Only photos with camera data:
+                       screenshots and already-cleaned photos are left as
+                       they are. Can be used with -r.
+
+Cleaning is permanent. Camera RAW files only lose their location, serial
+numbers and names (Nikon's serial number stays); bmp holds no hidden data;
+old .doc/.xls/.ppt can't be cleaned.
+Needs: perl-image-exiftool, mat2, mkvtoolnix-cli or ffmpeg.
+EOF
+}
+
+have() { command -v "$1" >/dev/null || { echo "$1 missing (sudo pacman -S $2)" >&2; return 1; }; }
+
+kind() {
+    K= FMT=
+    local e=${1##*/}
+    [[ $e == ?*.* ]] && e=${e##*.} || e=
+    case ${e,,} in
+        jpg|jpeg|jpe|jfif|pjpeg|pjp) K=img FMT=jpg ;;
+        png|webp|tif|tiff|heic|heif|avif|gif|jxl) K=img FMT=${e,,} ;;
+        3fr|arw|cr2|cr3|crw|dcr|dng|erf|fff|iiq|kdc|mef|mos|mrw|nef|nrw|orf|pef|raf|raw|rw2|rwl|sr2|srf|srw|x3f) K=raw ;;
+        bmp) K=bmp ;;
+        mov|m4a) K=qt ;;
+        mkv|webm) K=mkv ;;
+        doc|xls|ppt) K=old ;;
+        pdf|docx|xlsx|pptx|odt|ods|odp|odg|epub|mp3|flac|ogg|opus|wav|aif|aiff|mp4|m4v|avi|wmv|svg|torrent|zip|tar) K=mat ;;
+    esac
+    [ -n "$K" ] || [ ! -f "$1" ] && return
+    case $(file -b --mime-type -- "$1" 2>/dev/null) in
+        image/jpeg) K=img FMT=jpg ;;
+        image/png|image/webp|image/gif|image/tiff|image/heic|image/heif|image/avif|image/jxl)
+            K=img FMT=$(file -b --mime-type -- "$1"); FMT=${FMT#image/} ;;
+        image/bmp|image/x-ms-bmp) K=bmp ;;
+    esac
+}
+
+clean_one() {
+    local f=$1 out
+    kind "$f"
+    [ -n "$K" ] || return 2
+    [ -f "$f" ] && [ ! -L "$f" ] || { echo "not a file: $f" >&2; return 1; }
+    [ -s "$f" ] || { echo "empty, skipped: ${f/#$HOME/\~}"; return 3; }
+    case $K in
+        img) have exiftool perl-image-exiftool || return 1
+             if $PRNU && [ "$FMT" != gif ] && camera "$f"; then
+                 prnu "$f" || { echo "couldn't clean $f: ${out##*$'\n'}" >&2; return 1; }
+             fi
+             out=$(exiftool -q -q -m -all= -CommonIFD0= -IFD0:HostComputer= -IFD0:DocumentName= \
+                   -IFD0:PageName= -tagsFromFile @ -Orientation -ColorSpaceTags \
+                   -overwrite_original -P -- "$f" 2>&1) ;;
+        raw) have exiftool perl-image-exiftool || return 1
+             out=$(exiftool -q -q -m "${RAW_TAGS[@]/%/=}" -overwrite_original -P -- "$f" 2>&1) ;;
+        qt)  have exiftool perl-image-exiftool || return 1
+             out=$(exiftool -q -q -m -all= -overwrite_original -P \
+                   "-QuickTime:"{Create,Modify,TrackCreate,TrackModify,MediaCreate,MediaModify}"Date=1904:01:01 00:00:00" \
+                   -- "$f" 2>&1) ;;
+        mkv) if command -v mkvpropedit >/dev/null || ! command -v ffmpeg >/dev/null; then
+                 have mkvpropedit mkvtoolnix-cli || return 1
+                 out=$(mkvpropedit -q "$f" --tags all: --edit info --delete title --delete date 2>&1)
+                 [ $? -le 1 ]
+             else
+                 remux "$f"
+             fi ;;
+        mat) have mat2 mat2 || return 1
+             local light=()
+             [[ ${f,,} == *.pdf ]] && light=(--lightweight)
+             out=$(mat2 "${light[@]}" --inplace -- "$f" 2>&1) ;;
+        bmp) echo "nothing to clean: bmp holds no hidden data (${f/#$HOME/\~})"; return 3 ;;
+        old) out="old Office files can't be cleaned: save it as .docx/.xlsx/.pptx"; false ;;
+    esac || { echo "couldn't clean $f: ${out##*$'\n'}" >&2; return 1; }
+}
+
+TMPF=""
+trap '[ -n "$TMPF" ] && rm -f -- "$TMPF"' EXIT
+trap 'exit 130' INT TERM HUP
+
+camera() {
+    [ -n "$(exiftool -q -q -m -s3 -Make -Model -SerialNumber -InternalSerialNumber -LensModel -ExposureTime \
+            -FNumber -ISO -- "$1" 2>/dev/null)" ]
+}
+
+prnu() {
+    local f=$1 dir=. im=magick pct
+    command -v magick >/dev/null || im=convert
+    have "$im" imagemagick || return 1
+    [[ $f == */* ]] && dir=${f%/*}
+    local tmp=$dir/.scrub-$$.$FMT
+    TMPF=$tmp
+    printf -v pct '%d.%02d%%' $((92 + SRANDOM % 7)) $((SRANDOM % 100))
+    if out=$("$im" "$f" -auto-orient \
+             -gravity West -chop $((1 + SRANDOM % 8))x0 -gravity East -chop $((1 + SRANDOM % 8))x0 \
+             -gravity North -chop 0x$((1 + SRANDOM % 8)) -gravity South -chop 0x$((1 + SRANDOM % 8)) \
+             +gravity +repage -filter Lanczos -resize "$pct" -quality 95 \
+             "${tmp##*.}:$tmp" 2>&1) && { [ -s "$tmp" ] || { out="ImageMagick can't write .$FMT files here"; false; }; } &&
+        chmod --reference="$f" -- "$tmp" && touch -r "$f" -- "$tmp" && mv -f -- "$tmp" "$f"; then
+        TMPF=""
+        return 0
+    fi
+    rm -f -- "$tmp"; TMPF=""
+    return 1
+}
+
+remux() {
+    local f=$1 dir=. i t l meta=()
+    [[ $f == */* ]] && dir=${f%/*}
+    local tmp=$dir/.scrub-$$.${f##*.}
+    TMPF=$tmp
+    while IFS=, read -r i t l; do
+        if [ "$t" = attachment ]; then meta+=("-map_metadata:s:$i" "0:s:$i")
+        elif [ -n "$l" ]; then meta+=("-metadata:s:$i" "language=$l"); fi
+    done < <(ffprobe -v error -show_entries stream=index,codec_type:stream_tags=language -of csv=p=0 "file:$f" 2>/dev/null)
+    if out=$(ffmpeg -nostdin -v error -i "file:$f" -map 0 -c copy -map_metadata -1 "${meta[@]}" \
+             -fflags +bitexact "file:$tmp" 2>&1) &&
+        chmod --reference="$f" -- "$tmp" && touch -r "$f" -- "$tmp" && mv -f -- "$tmp" "$f"; then
+        TMPF=""
+        return 0
+    fi
+    rm -f -- "$tmp"; TMPF=""
+    return 1
+}
+
+random_name() {
+    local f=$1 dir=. base=${1##*/} ext="" new="" c=abcdefghijklmnopqrstuvwxyz0123456789
+    [[ $f == */* ]] && dir=${f%/*}
+    [[ $base == ?*.* ]] && ext=.${base##*.} && ext=${ext,,}
+    while ((${#new} < 12)); do new+=${c:SRANDOM%36:1}; done
+    mv -n -- "$f" "$dir/$new$ext" && echo "$dir/$new$ext"
+}
+
+clean_paths() {
+    local rename=false cleaned=0 failed=0 f
+    PRNU=false
+    while [[ ${1:-} == -[rp] || ${1:-} == -rp || ${1:-} == -pr || ${1:-} == -- ]]; do
+        [ "$1" = -- ] && { shift; break; }
+        [[ $1 == *r* ]] && rename=true
+        [[ $1 == *p* ]] && PRNU=true
+        shift
+    done
+    local a=()
+    for f; do [[ $f == -* ]] && f=./$f; a+=("$f"); done
+    set -- "${a[@]}"
+    [ $# -gt 0 ] || { echo "scrub: nothing to clean (give it files or folders)" >&2; return 1; }
+    for f; do
+        if [ ! -e "$f" ]; then echo "no such file: $f" >&2; failed=$((failed + 1))
+        elif [ ! -d "$f" ] && { kind "$f"; [ -z "$K" ]; }; then echo "can't clean this kind of file: $f" >&2; failed=$((failed + 1)); fi
+    done
+    local arg n
+    for arg; do
+        [ -e "$arg" ] || continue
+        n=0
+        while IFS= read -r -d '' f; do
+            clean_one "$f" </dev/null
+            case $? in
+                0) cleaned=$((cleaned + 1)) n=$((n + 1))
+                   if $rename; then
+                       f=$(random_name "$f") && [ ! -d "$arg" ] && echo "cleaned → ${f/#$HOME/\~}"
+                   elif [ ! -d "$arg" ]; then
+                       echo "cleaned  ${f/#$HOME/\~}"
+                   fi ;;
+                1) failed=$((failed + 1)) ;;
+            esac
+        done < <(if [ -d "$arg" ]; then find -H "$arg" -mindepth 1 -name '.*' -prune -o -type f -print0 2>/dev/null
+                 else printf '%s\0' "$arg"; fi)
+        if [ -d "$arg" ]; then
+            arg=$(realpath -s -- "$arg")
+            echo "cleaned  ${arg/#$HOME/\~}  ($n file$([ "$n" = 1 ] || echo s)$($rename && echo ", given random names"))"
+        fi
+    done
+    if [ "$failed" -gt 0 ]; then printf '\n%d cleaned, %d couldn'\''t be\n' "$cleaned" "$failed"; return 1; fi
+    printf '\n%d cleaned\n' "$cleaned"
+}
+
+show() {
+    local l n=0
+    while read -r l; do [ -n "$l" ] && echo "  $l" && n=1; done <<<"$1"
+    ((n)) || echo "  nothing"
+}
+
+check() {
+    local f out rc=0
+    for f; do
+        printf '\e[1m%s\e[0m\n' "$f"
+        [ -e "$f" ] || { echo "  no such file"; rc=1; continue; }
+        kind "$f"
+        if [ "$K" = mat ]; then have mat2 mat2; else have exiftool perl-image-exiftool; fi || { rc=1; continue; }
+        case $K in
+            mat) if out=$(mat2 --show -- "$f" 2>/dev/null); then
+                     show "$(grep -v -i -E "no metadata|^\[\+\] Metadata for|^\s*\$|^\s*(format|$SHAPE):|-date: -1\$" <<<"$out")"
+                 else echo "  (mat2 can't read this)"; fi ;;
+            raw) show "$(exiftool -q -q -m -G1 -s -a "${RAW_TAGS[@]}" --Nikon:SerialNumber --Composite:all -- "$f" 2>/dev/null)" ;;
+            *)   show "$(exiftool -q -q -m -G1 -s -a --File:all --System:all --ExifTool:all --Composite:all \
+                        --JFIF:all --ICC_Profile:all --ICC-header:all --ICC-view:all --ICC-meas:all -- "$f" 2>/dev/null |
+                        grep -v -E "\] +($SHAPE) +:|: 0000:00:00 00:00:00\$")" ;;
+        esac
+        case ${f##*/} in
+            *20[0-9][0-9][01][0-9][0-3][0-9]*|*20[0-9][0-9]-[01][0-9]-[0-3][0-9]*)
+                echo "  its name has a date in it (scrub -r gives it a random one)" ;;
+        esac
+    done
+    return $rc
+}
+
+case ${1:-} in
+    --check) shift; check "$@" ;;
+    -h|--help) usage ;;
+    "") usage >&2; exit 1 ;;
+    *) clean_paths "$@" ;;
+esac

@@ -1,0 +1,10 @@
+# The default for audio files: mpv-audio plays them (hidden from the launcher)
+[Desktop Entry]
+Type=Application
+Name=mpv (audio)
+Comment=Play audio: ~/Audiobooks in Books, anything else in a small window (closing it stops the sound)
+Exec=mpv-audio %F
+Icon=mpv
+Terminal=false
+NoDisplay=true
+MimeType=audio/mpeg;audio/mp4;audio/x-m4a;audio/aac;audio/flac;audio/x-flac;audio/ogg;audio/x-vorbis+ogg;audio/opus;audio/x-opus+ogg;audio/wav;audio/x-wav;audio/vnd.wave;audio/webm;audio/x-ms-wma;audio/x-aiff;audio/aiff;audio/x-matroska;audio/x-ape;audio/x-wavpack;audio/midi;audio/mp3;audio/x-mp3;

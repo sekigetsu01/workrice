@@ -1,0 +1,885 @@
+#!/usr/bin/env python3
+# clicker: auto-clicker and mouse/key macros (Super+F6 on/off, Super+Shift+F6 speed, Super+F10 record, Super+F11 pick)
+#   clicker -h lists every command; running one again stops it
+import os, sys, shlex, grp, pwd, glob, time, json, math, random, shutil, signal, socket, select, argparse, itertools, subprocess
+
+USAGE = """usage: clicker [toggle] [-i MS] [-b left|right|middle] [-j JITTER_MS] [-n COUNT]
+       clicker speed
+       clicker play [NAME] [-r TIMES | -l | -t SECONDS] [-s SPEED]
+       clicker pick [-s SPEED]
+       clicker record [NAME]
+       clicker list
+       clicker edit [NAME]
+       clicker check
+every command except list and check toggles: run it again to stop
+defaults: ~/.config/clicker/config   macros: ~/.config/clicker/macros/NAME
+macro lines: wait MS | move X Y | click [BUTTON] | down BUTTON|KEY | up BUTTON|KEY
+             key COMBO | type TEXT | scroll N | repeat N ... end | # comment"""
+
+HOME = os.path.expanduser('~')
+CFG = os.path.join(os.environ.get('XDG_CONFIG_HOME') or HOME + '/.config', 'clicker')
+MAC = CFG + '/macros'
+LAST = os.path.join(os.environ.get('XDG_STATE_HOME') or HOME + '/.local/state', 'clicker', 'last')
+RUN = os.environ.get('XDG_RUNTIME_DIR') or '/tmp'
+SELF = os.path.realpath(__file__)
+WIN = os.environ.pop('CLICKER_WIN', None)
+UI = '/dev/uinput'
+DEF = {'interval': '100', 'button': 'left', 'jitter': '0', 'count': '0'}
+BTNS = ('left', 'right', 'middle')
+MODN = {'ctrl': 'LEFTCTRL', 'alt': 'LEFTALT', 'altgr': 'RIGHTALT', 'shift': 'LEFTSHIFT', 'super': 'LEFTMETA'}
+ALIAS = {'control': 'leftctrl', 'return': 'enter', 'escape': 'esc', 'win': 'leftmeta', 'meta': 'leftmeta',
+         'prior': 'pageup', 'next': 'pagedown', 'pgup': 'pageup', 'pgdn': 'pagedown', 'del': 'delete',
+         'ins': 'insert', 'period': 'dot', 'bracketleft': 'leftbrace', 'bracketright': 'rightbrace',
+         'print': 'sysrq', 'menu': 'compose', 'caps': 'capslock', 'arrowleft': 'left', 'arrowright': 'right'}
+SKIP = {'super+f6', 'super+f10', 'super+f11', 'shift+super+f6', 'shift+super+f11'}
+PAIRS = [(c, c + c.upper()) for c in 'abcdefghijklmnopqrstuvwxyz'] + list(zip('1234567890', [a + b for a, b in zip('1234567890', '!"£$%^&*()')])) + [
+    ('minus', '-_'), ('equal', '=+'), ('leftbrace', '[{'), ('rightbrace', ']}'), ('semicolon', ';:'),
+    ('apostrophe', "'@"), ('backslash', '#~'), ('grave', '`¬'), ('102nd', '\\|'), ('comma', ',<'),
+    ('dot', '.>'), ('slash', '/?'), ('space', ' ')]
+R = 32767
+WARM = .6
+HOLD = .01
+KD = .004
+HELD = .3
+MOTION = .015
+GLIDE = .25
+QUICK = .12
+STEP = .008
+
+class SetupError(ValueError):
+    pass
+
+e = UInput = AbsInfo = InputDevice = list_devices = BTN = BNAME = MODC = MODS = CH = REV = None
+
+def need(ui=False):
+    global e, UInput, AbsInfo, InputDevice, list_devices, BTN, BNAME, MODC, MODS, CH, REV
+    m = ui and uerr()
+    if m:
+        raise SetupError(m)
+    if e:
+        return
+    try:
+        from evdev import UInput, AbsInfo, InputDevice, list_devices, ecodes as e
+    except Exception as x:
+        raise SetupError(f'python-evdev missing or broken for python {sys.version.split()[0]}: {x}') from None
+    BTN = {b: e.ecodes['BTN_' + b.upper()] for b in BTNS}
+    BNAME = {v: k for k, v in BTN.items()}
+    MODC = {k: e.ecodes['KEY_' + v] for k, v in MODN.items()}
+    MODS = {**{v: k for k, v in MODC.items()}, e.KEY_RIGHTCTRL: 'ctrl', e.KEY_RIGHTSHIFT: 'shift', e.KEY_RIGHTMETA: 'super'}
+    CH = {ch: (e.ecodes['KEY_' + k.upper()], m) for k, s in PAIRS for ch, m in zip(s, ((), ('shift',)))}
+    CH['€'] = (e.KEY_4, ('altgr',))
+    REV = {v: k for k, v in CH.items()}
+
+def note(*a):
+    try:
+        subprocess.Popen(['notify-send', '--app-name=clicker', *a])
+    except OSError:
+        pass
+
+def ctty():
+    try:
+        return os.ttyname(0).startswith('/dev/pts/') and sys.stdout.isatty()
+    except OSError:
+        return False
+
+def pause():
+    if WIN:
+        import tty
+        print('\npress a key to close', end='', flush=True)
+        try:
+            tty.setcbreak(0)
+            os.read(0, 1)
+        except Exception:
+            pass
+
+def ugroup():
+    try:
+        g = grp.getgrnam('uinput')
+    except KeyError:
+        return None, False, False
+    me = pwd.getpwuid(os.getuid())
+    return g.gr_gid, g.gr_gid in os.getgroups() or os.getgid() == g.gr_gid, me.pw_name in g.gr_mem or me.pw_gid == g.gr_gid
+
+def uerr():
+    if not os.path.exists(UI):
+        return f'no {UI}: uinput module not loaded (sudo modprobe uinput)'
+    if os.access(UI, os.R_OK | os.W_OK):
+        return None
+    gid, now, listed = ugroup()
+    st = os.stat(UI)
+    if gid is None:
+        return 'no uinput group: run sys-setup'
+    if st.st_gid != gid or st.st_mode & 0o060 != 0o060:
+        return f'{UI} is not rw for group uinput: udev rule missing, run sys-setup'
+    if not listed:
+        return 'you are not in the uinput group: run sys-setup'
+    return 'uinput group added after login: log out and back in'
+
+def ipc(cmd):
+    p = os.environ.get('MANGO_INSTANCE_SIGNATURE')
+    if not p:
+        raise SetupError('MANGO_INSTANCE_SIGNATURE not set: not running under mango')
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(p)
+            s.sendall(cmd.encode() + b'\n')
+            return json.loads(b''.join(iter(lambda: s.recv(65536), b'')))
+    except OSError as x:
+        raise SetupError(f'mango IPC failed: {x}') from None
+
+def pos():
+    p = ipc('get cursorpos')
+    return math.floor(p['x']), math.floor(p['y'])
+
+def layout():
+    m = ipc('get all-monitors')['monitors']
+    x, y = min(i['x'] for i in m), min(i['y'] for i in m)
+    return x, y, max(i['x'] + i['width'] for i in m) - x, max(i['y'] + i['height'] for i in m) - y
+
+def hide():
+    global WIN
+    try:
+        c = ipc('get focusing-client')
+        if c.get('appid') == 'clicker':
+            ipc(f"dispatch minimized client,{c['id']}")
+            WIN = None
+    except (OSError, KeyError, ValueError):
+        pass
+
+def conf():
+    os.makedirs(MAC, exist_ok=True)
+    c = dict(DEF)
+    try:
+        with open(CFG + '/config') as f:
+            for line in f:
+                k, _, v = line.partition('=')
+                if k.strip() in c:
+                    c[k.strip()] = v.strip()
+    except FileNotFoundError:
+        save(c)
+    return c
+
+def save(c):
+    with open(CFG + '/config', 'w') as f:
+        f.write(''.join(f'{k}={v}\n' for k, v in c.items()))
+
+def mpath(n):
+    if not n or n != os.path.basename(n) or n[0] == '.':
+        raise ValueError(f'bad macro name: {n!r}')
+    return f'{MAC}/{n}'
+
+def names():
+    ns = [n for n in os.listdir(MAC) if n[0] != '.'] if os.path.isdir(MAC) else []
+    return sorted(ns, key=lambda n: os.path.getmtime(f'{MAC}/{n}'), reverse=True)
+
+def last():
+    try:
+        with open(LAST) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        raise ValueError('no macro recorded or played yet') from None
+
+def setlast(n):
+    os.makedirs(os.path.dirname(LAST), exist_ok=True)
+    with open(LAST, 'w') as f:
+        f.write(n)
+
+def pidf(role):
+    return f'{RUN}/clicker-{role}.pid'
+
+def running(role):
+    try:
+        with open(pidf(role)) as f:
+            pid = int(f.read())
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            return pid if pid != os.getpid() and b'clicker' in f.read() else None
+    except (OSError, ValueError):
+        return None
+
+def guard(role):
+    pid = running(role)
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        sys.exit()
+
+def bye(*_):
+    raise SystemExit
+
+def claim(role):
+    with open(pidf(role), 'w') as f:
+        f.write(str(os.getpid()))
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, bye)
+
+def release(role):
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, signal.SIG_IGN)
+    if running(role) is None and os.path.exists(pidf(role)):
+        os.remove(pidf(role))
+
+def term(*opts):
+    if not ctty():
+        try:
+            r = subprocess.run(['mmsg', 'get', 'all-clients'], capture_output=True, text=True, timeout=3)
+            w = next((c for c in json.loads(r.stdout)['clients'] if c.get('appid') == 'clicker' and not c.get('is_minimized')), None)
+        except (OSError, KeyError, ValueError, subprocess.SubprocessError):
+            w = None
+        if w:
+            if w.get('is_focused'):
+                subprocess.run(['mmsg', 'dispatch', 'killclient', f"client,{w['id']}"], capture_output=True)
+            else:
+                subprocess.run([os.path.expanduser('~/.config/mango/scripts/mm'), 'bring', str(w['id'])], capture_output=True)
+            sys.exit()
+        t = os.path.expanduser('~/.local/bin/kitty')
+        os.execve(t, [t, '--class=clicker', *opts, sys.executable, SELF, *sys.argv[1:]], {**os.environ, 'CLICKER_WIN': '1'})
+
+def kname(c):
+    if c in MODS:
+        return MODS[c]
+    n = e.KEY.get(c)
+    if n is None:
+        return str(c)
+    return (n if isinstance(n, str) else min(n, key=len))[4:].lower()
+
+def key1(n):
+    if n in CH:
+        c, m = CH[n]
+        return [MODC[x] for x in m] + [c]
+    n = n.lower()
+    if n in MODC:
+        return [MODC[n]]
+    if n.isdigit():
+        return [int(n)]
+    n = ALIAS.get(n, n).upper()
+    for k in ('KEY_' + n, 'KEY_' + n.replace('_', '')):
+        if k in e.ecodes:
+            return [e.ecodes[k]]
+    raise ValueError(n)
+
+def combo(s):
+    return list(dict.fromkeys(c for p in s.split('+') for c in key1(p)))
+
+def parse(text):
+    root = []
+    st = [root]
+    for i, raw in enumerate(text.splitlines(), 1):
+        ln = raw.strip()
+        if not ln or ln[0] == '#':
+            continue
+        w, _, a = ln.partition(' ')
+        a = a.strip()
+        try:
+            if w == 'repeat':
+                st[-1].append(('repeat', int(a), []))
+                st.append(st[-1][-1][2])
+                continue
+            if w == 'end' and len(st) > 1:
+                st.pop()
+                continue
+            if w == 'wait':
+                x = ('wait', float(a) / 1000)
+                if not x[1] >= 0:
+                    raise ValueError
+            elif w == 'move':
+                x = ('move', *map(int, a.split()))
+                if len(x) != 3:
+                    raise ValueError
+            elif w == 'click':
+                x = (w, BTN[a or 'left'])
+            elif w in ('down', 'up'):
+                x = (w, [BTN[a or 'left']] if (a or 'left') in BTN else combo(a))
+            elif w == 'key':
+                x = ('key', combo(a))
+            elif w == 'type':
+                x = ('type', [CH[c] for c in raw.lstrip()[5:]])
+            elif w == 'scroll':
+                x = ('scroll', int(a))
+            else:
+                raise ValueError
+        except (ValueError, KeyError):
+            raise ValueError(f'line {i}: {ln}') from None
+        st[-1].append(x)
+    if len(st) > 1:
+        raise ValueError('repeat without end')
+    return root
+
+class Clock:
+    def __init__(s, sleep=time.sleep):
+        s.t, s.sleep = time.monotonic(), sleep
+
+    def wait(s, w, j=0.0):
+        s.t += w
+        n = time.monotonic()
+        if s.t < n - .25:
+            s.t = n
+        if s.t + j > n:
+            s.sleep(s.t + j - n)
+
+class Dev:
+    def __init__(s):
+        ab = AbsInfo(0, 0, R, 0, 0, 0)
+        try:
+            s.u = UInput({e.EV_KEY: [*range(1, 249), *BTN.values()], e.EV_ABS: [(e.ABS_X, ab), (e.ABS_Y, ab)],
+                          e.EV_REL: [e.REL_WHEEL]}, name='clicker')
+        except Exception as x:
+            raise SetupError(f'uinput: {x}') from None
+        s.held = set()
+        s.at = (0, 0)
+        s.kb, s.meta = [], set()
+        metas = (e.KEY_LEFTMETA, e.KEY_RIGHTMETA)
+        for p in list_devices():
+            try:
+                d = InputDevice(p)
+                if d.name != 'clicker' and e.KEY_LEFTMETA in d.capabilities().get(e.EV_KEY, []):
+                    s.kb.append(d)
+                    s.meta |= {(d.fd, k) for k in d.active_keys() if k in metas}
+                else:
+                    d.close()
+            except OSError:
+                pass
+        time.sleep(WARM)
+
+    def poll(s, t=0):
+        if not s.kb:
+            if t:
+                time.sleep(t)
+            return
+        for d in select.select(s.kb, [], [], t)[0]:
+            try:
+                for v in d.read():
+                    if v.type == e.EV_KEY and v.code in (e.KEY_LEFTMETA, e.KEY_RIGHTMETA) and v.value < 2:
+                        (s.meta.add if v.value else s.meta.discard)((d.fd, v.code))
+            except OSError:
+                s.kb.remove(d)
+                s.meta = {m for m in s.meta if m[0] != d.fd}
+
+    def gate(s):
+        s.poll()
+        if not s.meta:
+            return
+        held = list(s.held)
+        for c in held:
+            s.raw(e.EV_KEY, c, 0)
+        while s.meta and s.kb:
+            s.poll(None)
+        for c in held:
+            if c not in BNAME:
+                s.raw(e.EV_KEY, c, 1)
+            else:
+                s.held.discard(c)
+
+    def sleep(s, t):
+        end = time.monotonic() + t
+        while True:
+            s.gate()
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            s.poll(left)
+
+    def raw(s, t, c, v):
+        s.u.write(t, c, v)
+        s.u.syn()
+
+    def ev(s, t, c, v):
+        s.gate()
+        s.raw(t, c, v)
+
+    def key(s, c, v):
+        s.ev(e.EV_KEY, c, int(v))
+        (s.held.add if v else s.held.discard)(c)
+
+    def click(s, b, h=HOLD):
+        s.key(b, 1)
+        s.sleep(h)
+        s.key(b, 0)
+
+    def combo(s, cs):
+        cs = [c for c in cs if c not in s.held]
+        for c in cs:
+            s.key(c, 1)
+            s.sleep(KD)
+        for c in reversed(cs):
+            s.key(c, 0)
+            s.sleep(KD)
+
+    def absw(s, x, y):
+        s.gate()
+        s.u.write(e.EV_ABS, e.ABS_X, x)
+        s.u.write(e.EV_ABS, e.ABS_Y, y)
+        s.u.syn()
+
+    def move(s, x, y, box):
+        bx, by, w, h = box
+        v = (min(R, max(0, int((x - bx + .5) * (R + 1) / w))), min(R, max(0, int((y - by + .5) * (R + 1) / h))))
+        if v == s.at:
+            s.absw(v[0] + (1 if v[0] < R else -1), v[1])
+        s.absw(*v)
+        s.at = v
+
+    def close(s):
+        for c in list(s.held):
+            s.raw(e.EV_KEY, c, 0)
+        s.u.close()
+        for d in s.kb:
+            d.close()
+
+class Player:
+    def __init__(s, d, speed):
+        s.d, s.k, s.box, s.c, s.cur, s.pre = d, speed, None, Clock(d.sleep), None, False
+
+    def glide(s, x, y, t):
+        s.box = s.box or layout()
+        x0, y0 = s.cur or pos()
+        n = max(1, round(t / STEP))
+        at = (x0, y0)
+        for i in range(1, n + 1):
+            s.c.wait(t / n)
+            p = (round(x0 + (x - x0) * i / n), round(y0 + (y - y0) * i / n))
+            if p != at or i == n:
+                s.d.move(*p, s.box)
+                at = p
+        s.cur = (x, y)
+
+    def run(s, acts):
+        d = s.d
+        for i, a in enumerate(acts):
+            k = a[0]
+            if k == 'wait':
+                w = a[1] / s.k
+                nxt = acts[i + 1] if i + 1 < len(acts) else None
+                if nxt and nxt[0] == 'move':
+                    g = min(w, GLIDE / s.k)
+                    s.c.wait(w - g)
+                    s.glide(nxt[1], nxt[2], g)
+                    s.pre = True
+                else:
+                    s.c.wait(w)
+            elif k == 'move':
+                if s.pre:
+                    s.pre = False
+                else:
+                    s.glide(a[1], a[2], QUICK / s.k)
+            elif k == 'click':
+                d.click(a[1])
+            elif k in ('down', 'up'):
+                for c in a[1]:
+                    d.key(c, k == 'down')
+            elif k == 'key':
+                d.combo(a[1])
+            elif k == 'type':
+                for c, m in a[1]:
+                    d.combo([MODC[x] for x in m] + [c])
+            elif k == 'scroll':
+                for _ in range(abs(a[1])):
+                    d.ev(e.EV_REL, e.REL_WHEEL, 1 if a[1] > 0 else -1)
+                    d.sleep(KD)
+            elif k == 'repeat':
+                for _ in range(a[1]):
+                    s.run(a[2])
+
+class Rec:
+    def __init__(s, pos):
+        s.pos, s.out, s.t, s.at, s.mods, s.lone, s.btn, s.dn = pos, [], None, None, [], None, {}, set()
+        s.keys = {}
+
+    def emit(s, t, line):
+        if s.t is not None and round((t - s.t) * 1000) > 0:
+            s.out.append(f'wait {round((t - s.t) * 1000)}')
+        s.out.append(line)
+        s.t = t
+
+    def place(s, t, p=None):
+        p = p or s.pos()
+        if p != s.at:
+            s.at = p
+            s.emit(t, 'move %d %d' % p)
+
+    def hold(s, t):
+        s.lone = None
+        for m in s.mods:
+            if m not in s.dn:
+                s.dn.add(m)
+                s.emit(t, 'down ' + m)
+
+    def feed(s, t, ty, c, v):
+        prev = s.out[-1] if s.out else ''
+        if ty == e.EV_REL and c != e.REL_WHEEL:
+            s.place(t)
+            return
+        if ty == e.EV_REL or c in BNAME and v:
+            s.hold(t)
+        if ty == e.EV_REL:
+            if prev.startswith('scroll ') and t - s.t < .5:
+                s.out[-1] = f'scroll {int(prev[7:]) + v}'
+                s.t = t
+            else:
+                s.place(t)
+                s.emit(t, f'scroll {v}')
+        elif c in BNAME:
+            if v:
+                s.place(t)
+                s.emit(t, 'down ' + BNAME[c])
+                s.btn[c] = (len(s.out), t)
+            elif c in s.btn:
+                i, t0 = s.btn.pop(c)
+                p = s.pos()
+                if i == len(s.out) and t - t0 < .5 and p == s.at:
+                    s.out[-1] = 'click ' + BNAME[c]
+                else:
+                    s.place(t, p)
+                    s.emit(t, 'up ' + BNAME[c])
+        elif c in MODS:
+            m = MODS[c]
+            if v:
+                if m not in s.mods:
+                    s.mods.append(m)
+                s.lone = (m, t)
+            else:
+                if m in s.dn:
+                    s.dn.discard(m)
+                    s.emit(t, 'up ' + m)
+                elif s.lone and s.lone[0] == m:
+                    s.emit(s.lone[1], 'key ' + m)
+                s.lone = None
+                if m in s.mods:
+                    s.mods.remove(m)
+        elif v:
+            s.lone = None
+            ms = tuple(x for x in MODC if x in s.mods)
+            ch = REV.get((c, ms))
+            name = '+'.join(ms + (kname(c),))
+            if ch and prev.startswith('type ') and t - s.t < 2:
+                s.out[-1] += ch
+                s.t = t
+            elif ch:
+                s.emit(t, 'type ' + ch)
+            elif name not in SKIP:
+                s.emit(t, 'key ' + name)
+            else:
+                return
+            s.keys[c] = (t, len(s.out) - 1, len(s.out[-1]) - 5 - len(ch) if ch else None,
+                         {'left': 'arrowleft', 'right': 'arrowright'}.get(name, name))
+        elif c in s.keys:
+            t0, i, at, name = s.keys.pop(c)
+            if t - t0 > HELD:
+                s.held(i, at, name, t)
+
+    def held(s, i, at, name, t):
+        line = s.out[i]
+        if at is None:
+            new = ['down ' + name]
+        else:
+            text = line[5:]
+            before, after = text[:at], text[at + 1:]
+            new = (['type ' + before] if before else []) + ['down ' + name] + (['type ' + after] if after else [])
+        s.out[i:i + 1] = new
+        moved = len(new) - 1
+        if moved:
+            first = i + (1 if at else 0) + 1
+            for k, (t0, j, a, n) in list(s.keys.items()):
+                if j > i:
+                    s.keys[k] = (t0, j + moved, a, n)
+                elif j == i and a is not None and at is not None and a > at:
+                    s.keys[k] = (t0, first, a - at - 1, n)
+            for b, (j, t0) in list(s.btn.items()):
+                if j > i:
+                    s.btn[b] = (j + moved, t0)
+        s.emit(t, 'up ' + name)
+
+    def lines(s):
+        out = []
+        for ln in s.out:
+            body = ln[5:]
+            if ln.startswith('type ') and body.endswith(' '):
+                kept = body.rstrip(' ')
+                out += (['type ' + kept] if kept else []) + ['key space'] * (len(body) - len(kept))
+            else:
+                out.append(ln)
+        return out
+
+def reader():
+    need()
+    ds = {}
+    for p in list_devices():
+        try:
+            d = InputDevice(p)
+            k = d.capabilities().get(e.EV_KEY, [])
+        except OSError:
+            continue
+        if d.name != 'clicker' and (e.KEY_A in k or e.BTN_LEFT in k):
+            ds[d.fd] = d
+        else:
+            d.close()
+    if not ds:
+        sys.exit('clicker: no keyboard or mouse in /dev/input')
+    if os.getuid() == 0:
+        os.setgroups([])
+        os.setgid(int(os.environ['SUDO_GID']))
+        os.setuid(int(os.environ['SUDO_UID']))
+    print('ready', flush=True)
+    moved, sent = None, 0.0
+    while True:
+        r = select.select([0, *ds], [], [], MOTION if moved else None)[0]
+        if not r and moved:
+            print(moved, e.EV_REL, e.REL_X, 0, flush=True)
+            sent, moved = moved, None
+        for f in r:
+            if f == 0:
+                if not os.read(0, 64):
+                    return
+                continue
+            try:
+                for v in ds[f].read():
+                    # (a touchpad's touches come as BTN_TOUCH, BTN_TOOL_FINGER…: not keys, so left out)
+                    if v.type == e.EV_KEY and v.value < 2 and (v.code in BNAME or v.code not in e.BTN) or \
+                            v.type == e.EV_REL and v.code == e.REL_WHEEL:
+                        print(v.timestamp(), v.type, v.code, v.value, flush=True)
+                    elif v.type == e.EV_REL and v.code in (e.REL_X, e.REL_Y) or v.type == e.EV_ABS and v.code in (
+                            e.ABS_X, e.ABS_Y, e.ABS_MT_POSITION_X, e.ABS_MT_POSITION_Y):
+                        t = v.timestamp()
+                        if t - sent >= MOTION:
+                            print(t, e.EV_REL, e.REL_X, 0, flush=True)
+                            sent, moved = t, None
+                        else:
+                            moved = t
+            except OSError:
+                del ds[f]
+
+def toggle(o):
+    guard('click')
+    need(True)
+    b, n, iv, j = BTN[o.b], o.n, o.i / 1000, o.j / 1000
+    claim('click')
+    i, d = 0, None
+    note('Autoclicker on', f'{o.b} every {o.i:g} ms' + (f', {n} clicks' if n else ''))
+    try:
+        d = Dev()
+        c = Clock(d.sleep)
+        while True:
+            d.click(b, min(HOLD, iv / 2))
+            i += 1
+            if i == n:
+                break
+            c.wait(iv, random.uniform(-j, j))
+    except SystemExit:
+        pass
+    finally:
+        if d:
+            d.close()
+        release('click')
+        note('Autoclicker off', f'{i} clicks')
+
+def play(o):
+    guard('play')
+    need(True)
+    name = o.name or last()
+    try:
+        with open(mpath(name), encoding='utf-8') as f:
+            acts = parse(f.read())
+    except FileNotFoundError:
+        raise ValueError(f'no macro called {name} (clicker list)') from None
+    except ValueError as x:
+        raise ValueError(f'macro {name}, {x}') from None
+    if not acts:
+        raise ValueError(f'{name} is empty')
+    setlast(name)
+    claim('play')
+    d, msg = None, 'finished'
+    note('Playing ' + name, ('infinite loop' if o.l else f'for {dur(o.t)}' if o.t else 'once' if o.r == 1 else f'{o.r} times')
+         + (', Super+F11 stops it' if o.l or o.t or o.r > 1 else '')
+         + (f' at {o.s:g}x speed' if o.s != 1 else ''))
+    try:
+        d = Dev()
+        p = Player(d, o.s)
+        end = time.monotonic() + o.t
+        for _ in itertools.count() if o.l or o.t else range(o.r):
+            if o.t and time.monotonic() >= end:
+                break
+            p.run(acts)
+    except SystemExit:
+        msg = 'stopped'
+    finally:
+        if d:
+            d.close()
+        release('play')
+        note(f'Macro {name} {msg}')
+
+def dur(t):
+    return next(f'{t / u:g}{c}' for u, c in ((3600, 'h'), (60, 'm'), (1, 's')) if t >= u and t % u == 0 or u == 1)
+
+def ask(name):
+    while True:
+        a = input(f'\nLoop {name}: 5 = five times, 30s / 10m / 1h = for that long\n> ').strip().lower()
+        if not a:
+            return None
+        try:
+            if a[-1] in 'smh':
+                t = float(a[:-1]) * {'s': 1, 'm': 60, 'h': 3600}[a[-1]]
+                if t > 0:
+                    return ['-t', str(t)]
+            elif int(a) > 0:
+                return ['-r', a]
+        except ValueError:
+            pass
+        print(f'not a number or length: {a}')
+
+def pick(o):
+    guard('play')
+    term('-o', r'map shift+enter send_text all \x1b\r')
+    r = subprocess.run(['fzf', '--no-input', '--expect=alt-enter,R', '--no-sort', '--layout=reverse', '--info=hidden',
+                        '--pointer=▶', '--highlight-line', '--color=bg+:8,fg+:15:bold,pointer:4',
+                        '--bind=j:down,k:up,g:first,G:last,q:abort',
+                        '--header=j/k: move\nEnter: play\nShift+Enter: loop\nShift+R: times or how long\nShift+D: delete',
+                        f'--bind=D:execute-silent(rm -f -- {shlex.quote(MAC)}/{{}})+reload({shlex.quote(sys.executable)} {shlex.quote(SELF)} list)',
+                        f'--preview=cat {shlex.quote(MAC)}/{{}}', '--preview-window=right,55%'],
+                       input='\n'.join(names()), stdout=subprocess.PIPE, text=True).stdout.split('\n')
+    k, n = (r + ['', ''])[:2]
+    n = n.strip()
+    if not n:
+        return
+    how = ['-l'] if k == 'alt-enter' else ask(n) if k == 'R' else []
+    if how is None:
+        return
+    subprocess.Popen([sys.executable, SELF, 'play', n, *how, *sys.argv[2:]],
+                     start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def record(o):
+    pid = running('rec')
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        return
+    term()
+    need()
+    pos()
+    direct = all(os.access(d, os.R_OK) for d in glob.glob('/dev/input/event*'))
+    if not direct and not shutil.which('sudo'):
+        raise ValueError('sudo not found: recording reads /dev/input as root')
+    name = o.name or input('Macro name [last]: ').strip() or 'last'
+    path = mpath(name)
+    claim('rec')
+    r = Rec(pos)
+    p = subprocess.Popen(([] if direct else ['sudo']) + [sys.executable, '-I', SELF, '_rec'],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        if p.stdout.readline().strip() != 'ready':
+            raise SetupError('recorder did not start (sudo failed or evdev missing for root)')
+        hide()
+        note('Recording ' + name)
+        for line in p.stdout:
+            t, ty, c, v = line.split()
+            r.feed(float(t), int(ty), int(c), int(v))
+    except SystemExit:
+        pass
+    finally:
+        p.terminate()
+        release('rec')
+        if r.out:
+            out = r.lines()
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(out) + '\n')
+            setlast(name)
+            note('Saved macro ' + name, f'{len(out)} lines')
+        else:
+            note('Nothing recorded')
+
+def speed(o):
+    term()
+    c = conf()
+    print('Auto-clicker settings: Super+F6 then clicks with these until you press it again.\n'
+          '\x1b[2mEnter keeps the value in [brackets]. Super+Shift+F6 now: cancel.\x1b[0m\n')
+    v = input(f'Click every [{c["interval"]}] ms: ').strip() or c['interval']
+    b = input(f'Button left/right/middle [{c["button"]}]: ').strip() or c['button']
+    if not float(v) > 0 or b not in BTNS:
+        raise ValueError(f'bad interval or button: {v} {b}')
+    c.update(interval=v, button=b)
+    save(c)
+    note('Autoclicker default', f'{b} every {v} ms')
+
+def edit(o):
+    term()
+    os.execvp('nvim', ['nvim', mpath(o.name or last())])
+
+def check(o):
+    term()
+    fails = 0
+
+    def row(ok, k, v):
+        nonlocal fails
+        fails += not ok
+        print(f'{"ok  " if ok else "FAIL"} {k:7} {v}')
+
+    try:
+        need()
+        row(1, 'evdev', f'python {sys.version.split()[0]} {sys.executable}')
+    except ValueError as x:
+        row(0, 'evdev', f'{x} (pacman -S python-evdev)')
+    m = uerr()
+    row(not m, 'uinput', m or f'{UI} writable')
+    gid, now, listed = ugroup()
+    row(now, 'group', 'uinput in this session' if now else 'in /etc/group, not this session: log out and back in'
+        if listed else 'not in the uinput group: run sys-setup')
+    try:
+        row(1, 'mango', f"{ipc('get version').get('version')} {os.environ['MANGO_INSTANCE_SIGNATURE']}")
+    except (OSError, ValueError) as x:
+        row(0, 'mango', f'IPC failed: {x}')
+    if shutil.which('sudo'):
+        n = subprocess.run(['sudo', '-n', 'true'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        row(1, 'sudo', 'no password needed now' if n == 0 else 'record will ask for your password')
+    else:
+        row(0, 'sudo', 'not found: record needs it')
+    n = len(glob.glob('/dev/input/event*'))
+    row(n, 'input', f'{n} devices in /dev/input')
+    try:
+        ok = os.access(MAC, os.W_OK)
+        row(ok, 'macros', f'{len(names())} in {MAC}' + ('' if ok else ' (not writable)'))
+    except OSError as x:
+        row(0, 'macros', x)
+    miss = [t for t in ('notify-send', 'fzf', 'nvim') if not shutil.which(t)]
+    miss += [] if os.access('/usr/bin/kitty', os.X_OK) else ['kitty']
+    row(not miss, 'tools', 'missing: ' + ' '.join(miss) if miss else 'notify-send fzf nvim kitty')
+    pause()
+    sys.exit(fails and 1)
+
+CMD = {'toggle': toggle, 'speed': speed, 'play': play, 'pick': pick, 'record': record, 'edit': edit, 'check': check,
+       'list': lambda o: print(*names(), sep='\n')}
+
+def bad(m):
+    raise ValueError(f'{m} (clicker -h for usage)')
+
+def main():
+    a = sys.argv[1:]
+    if a == ['_rec']:
+        return reader()
+    cmd = a.pop(0) if a and a[0] in CMD else 'toggle'
+    if cmd == 'toggle' and a and not a[0].startswith('-'):
+        bad(f'no command {a[0]!r}')
+    if '-h' in a or '--help' in a:
+        return print(USAGE)
+    c = conf()
+    p = argparse.ArgumentParser(add_help=False)
+    p.error = bad
+    p.add_argument('name', nargs='?')
+    p.add_argument('-i', type=float, default=float(c['interval']))
+    p.add_argument('-b', choices=BTNS, default=c['button'])
+    p.add_argument('-j', type=float, default=float(c['jitter']))
+    p.add_argument('-n', type=int, default=int(c['count']))
+    p.add_argument('-r', type=int, default=1)
+    p.add_argument('-l', action='store_true')
+    p.add_argument('-t', type=float, default=0.0)
+    p.add_argument('-s', type=float, default=1.0)
+    o = p.parse_args(a)
+    if not (o.i > 0 and o.s > 0 and o.b in BTNS) or min(o.j, o.n, o.r, o.t) < 0:
+        bad('bad option value')
+    CMD[cmd](o)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as x:
+        note('clicker failed', f'{x}\nRun clicker check' if isinstance(x, SetupError) else str(x))
+        print(f'clicker: {x}', file=sys.stderr)
+        pause()
+        sys.exit(1)

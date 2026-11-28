@@ -1,0 +1,9 @@
+# readline prompts (bash, read -e, Python…): the same word keys as zsh
+$include /etc/inputrc
+set bind-tty-special-chars off
+# Ctrl+Backspace deletes the word before the cursor, Ctrl+w the one after
+"\C-h": unix-word-rubout
+"\C-w": kill-word
+$if Bash
+"\C-w": shell-kill-word
+$endif

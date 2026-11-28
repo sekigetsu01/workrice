@@ -1,0 +1,26 @@
+#!/bin/bash
+# speak FILE…: reads text, documents and books aloud in a natural voice (Kokoro, offline), or makes them audiobooks
+#   installs the voice engine the first time, then runs ~/.local/lib/speak.py (speak -h lists the options)
+D=${XDG_DATA_HOME:-$HOME/.local/share}/speak
+U=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+if [ ! -f "$D/venv/.ok" ] || [ ! -s "$D/kokoro-v1.0.onnx" ] || [ ! -s "$D/voices-v1.0.bin" ]; then
+    # shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+    . "$HOME/.local/lib/common.sh" || exit 1
+    [[ $(readlink /proc/$$/fd/1) == /dev/pts/* ]] || [ -n "$SPEAK_INSTALLING" ] || SPEAK_INSTALLING=1 term_exec --app-id=speak --title=speak -e "$0" "$@"
+    echo "First run: installing the voice engine (about 400 MB)…"
+    fail() { [ -n "$SPEAK_INSTALLING" ] && read -r -p "The install failed. Enter closes this window. "; exit 1; }
+    for p in uv ffmpeg; do command -v "$p" >/dev/null || sudo pacman -S --needed --noconfirm "$p" || fail; done
+    mkdir -p "$D"
+    [ -f "$D/venv/.ok" ] || {
+        rm -rf "$D/venv"
+        uv venv -q --python 3.12 "$D/venv" &&
+        uv pip install -q --python "$D/venv/bin/python" kokoro-onnx pypdf ebooklib beautifulsoup4 python-docx misaki spacy num2words \
+            "en_core_web_sm@https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" &&
+        touch "$D/venv/.ok"
+    } || { rm -rf "$D/venv"; fail; }
+    for f in kokoro-v1.0.onnx voices-v1.0.bin; do
+        [ -s "$D/$f" ] && continue
+        if ! { curl -fL --progress-bar -o "$D/$f.part" "$U/$f" && mv -f "$D/$f.part" "$D/$f"; }; then rm -f "$D/$f.part"; fail; fi
+    done
+fi
+exec "$D/venv/bin/python" "$HOME/.local/lib/speak.py" "$@"

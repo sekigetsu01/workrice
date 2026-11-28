@@ -1,0 +1,52 @@
+#!/bin/bash
+# pause-all (Super+Shift+m, the play key): pauses everything playing (playerctl); pressed again, plays those again.
+# --pause NAME / --resume NAME: the same, kept apart by NAME (the lock screen pauses with lock, resumes on unlock)
+DIR="${XDG_RUNTIME_DIR:-/tmp}"
+case "${1:-}" in
+    --pause)  mode=pause ;;
+    --resume) mode=resume ;;
+    *)        mode=toggle ;;
+esac
+if [ "$mode" = toggle ]; then STATE="$DIR/pause-all"; else n=${2:-}; STATE="$DIR/pause-all-${n//\//_}"; fi
+
+command -v playerctl >/dev/null || {
+    [ "$mode" = toggle ] && notify-send --app-name="Pause all" --urgency=critical "Pause all" "playerctl isn't installed (sudo pacman -S playerctl)" 2>/dev/null
+    exit 1
+}
+
+pause_playing() {
+    playerctl -a status -f '{{status}} {{playerInstance}}' 2>/dev/null |
+    while read -r s p; do
+        [ "$s" = Playing ] && playerctl -p "$p" pause 2>/dev/null && printf '%s\n' "$p"
+    done
+}
+
+save() {
+    local new
+    new=$(cat)
+    [ -n "$new" ] || return 0
+    { [ -f "$STATE" ] && cat -- "$STATE"; printf '%s\n' "$new"; } | awk 'NF && !seen[$0]++' > "$STATE.new" &&
+        mv -f -- "$STATE.new" "$STATE"
+}
+
+resume_saved() {
+    [ -f "$STATE" ] || return 0
+    while IFS= read -r p; do
+        playerctl -p "$p" play 2>/dev/null
+    done < "$STATE"
+    rm -f "$STATE"
+}
+
+case $mode in
+    pause)  pause_playing | save ;;
+    resume) resume_saved ;;
+    toggle)
+        paused=$(pause_playing)
+        if [ -n "$paused" ]; then
+            printf '%s\n' "$paused" | save
+        elif [ -s "$STATE" ]; then
+            resume_saved
+        else
+            notify-send --app-name="Pause all" "Nothing is playing that can be paused" 2>/dev/null
+        fi ;;
+esac

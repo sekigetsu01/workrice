@@ -1,0 +1,3 @@
+# The notifications module: the names shell.qml imports it by
+NotificationPopup 1.0 NotificationPopup.qml
+NotificationCenter 1.0 NotificationCenter.qml

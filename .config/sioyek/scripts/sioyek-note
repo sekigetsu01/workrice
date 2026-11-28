@@ -1,0 +1,156 @@
+#!/bin/bash
+# sioyek's Enter: adds the selected text (or a figure from sioyek-figure) to the book's page in the notes wiki,
+# --TITLE--.md, listed in the wiki's index
+WIKI="$HOME/sync/notes/vimwiki"
+INDEX="$WIKI/index.md"
+RUN=${XDG_RUNTIME_DIR:-/tmp}
+tmp=$(mktemp -d "$RUN/sioyek-note.XXXXXX") || exit 1
+trap 'rm -rf "$tmp"' EXIT
+
+sockets() {
+    local s
+    {
+        printf '%s\n' "$RUN"/nvim.*
+        ss -xlpH 2>/dev/null | awk '/"nvim"/ {print $5}'
+    } | while IFS= read -r s; do [ -S "$s" ] && printf '%s\n' "$s"; done | sort -u
+}
+notify() { notify-send --app-name=sioyek "$@" 2>/dev/null; }
+
+doc=$1
+text=$2
+image=$3
+if [ -z "${text//[[:space:]]/}" ]; then
+    notify "Nothing selected"
+    exit 0
+fi
+
+text=$(printf '%s' "$text" | python3 -c '
+import re, sys
+t = sys.stdin.read()
+t = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", t)
+t = re.sub(r"\s+", " ", t).strip()
+print(t)
+')
+preview=$text
+[ ${#preview} -gt 80 ] && preview="${preview:0:77}…"
+
+title=${doc:-notes}
+title=${title##*/}
+title=${title%.*}
+name="--$title--"
+page="$WIKI/$name.md"
+
+note_for() {
+    if [ -n "$image" ]; then
+        printf '![%s](%s)\n' "$text" "$(realpath -m --relative-to="$1" "$image")"
+    else
+        printf '%s\n' "$text"
+    fi
+}
+
+helper="$tmp/add.lua"
+data="$tmp/data"
+cat > "$helper" <<'LUA'
+local add = vim.fn.readfile(vim.g.sioyek_note)
+local target, gap = table.remove(add, 1), table.remove(add, 1) == "1"
+local buf = -1
+if target == "" then
+    buf = vim.api.nvim_get_current_buf()
+else
+    local want = vim.fn.resolve(vim.fn.fnamemodify(target, ":p"))
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+        local name = vim.api.nvim_buf_get_name(b)
+        if name ~= "" and vim.api.nvim_buf_is_loaded(b)
+            and vim.fn.resolve(vim.fn.fnamemodify(name, ":p")) == want then buf = b break end
+    end
+end
+if buf < 1 then return end
+local n = vim.api.nvim_buf_line_count(buf)
+local last = n
+while last > 0 and vim.api.nvim_buf_get_lines(buf, last - 1, last, false)[1]:match("^%s*$") do
+    last = last - 1
+end
+if gap and last > 0 then table.insert(add, 1, "") end
+vim.api.nvim_buf_set_lines(buf, last, n, false, add)
+local saved
+vim.api.nvim_buf_call(buf, function()
+    vim.cmd("silent! write")
+    saved = not vim.bo.modified
+    if not saved then vim.cmd("silent! undo") end
+end)
+print(saved and "sioyek-note-saved" or "sioyek-note-unsaved")
+LUA
+
+nvim_eval() { timeout 5 nvim --server "$1" --remote-expr "$2" 2>/dev/null; }
+nvim_add() {
+    local r
+    r=$(timeout 5 nvim --server "$1" --remote-expr \
+        "execute(['let g:sioyek_note = \"$data\"', 'luafile $helper'])" 2>/dev/null)
+    case $r in *sioyek-note-saved*) return 0 ;; *sioyek-note-unsaved*) return 2 ;; esac
+    return 1
+}
+add_to() {
+    local file=$1 gap=$2 sock
+    printf '%s\n%s\n%s' "$file" "$gap" "$3" > "$data"
+    while IFS= read -r sock && [ -n "$sock" ]; do
+        nvim_add "$sock"
+        case $? in
+            0) return 0 ;;
+            2) notify --urgency=critical "Not added" "${file##*/} is open in nvim, but it couldn't be saved. The text is still copied."
+               return 1 ;;
+        esac
+    done <<< "$socks"
+    python3 - "$file" "$gap" "$3" <<'PY'
+import os, sys
+path, gap, add = sys.argv[1], sys.argv[2] == "1", sys.argv[3].rstrip("\n")
+path = os.path.realpath(path)
+body = open(path, encoding="utf-8").read().rstrip() if os.path.exists(path) else ""
+sep = ("\n\n" if gap else "\n") if body else ""
+tmp = os.path.join(os.path.dirname(path), ".%s.%d.tmp" % (os.path.basename(path), os.getpid()))
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write(body + sep + add + "\n")
+if os.path.exists(path):
+    os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+os.replace(tmp, path)
+PY
+}
+
+socks=$(sockets)
+wiki_real=$(realpath -m "$WIKI")
+
+linked=$("$HOME/.local/bin/bookset" which book "$doc" 2>/dev/null |
+    python3 -c 'import json, sys; print(json.load(sys.stdin).get("note") or "")' 2>/dev/null)
+if [ -n "$doc" ] && [ -n "$linked" ] && [ -f "$linked" ]; then
+    add_to "$linked" 1 "$(note_for "${linked%/*}")" || exit 1
+    notify "Added to $(basename "$linked" .md)" "$preview"
+    exit 0
+fi
+while IFS= read -r sock && [ -n "$sock" ]; do
+    open=$(nvim_eval "$sock" 'expand("%:p")') || continue
+    [ -n "$open" ] || continue
+    open=$(realpath -m "$open" 2>/dev/null)
+    ft=$(nvim_eval "$sock" '&filetype')
+    case $open in
+        "$wiki_real"/index.md | "$RUN"/capture.*) continue ;;
+        "$wiki_real"/*.md) ;;
+        *) [[ $ft == markdown || $ft == vimwiki ]] || continue ;;
+    esac
+    printf '\n1\n%s' "$(note_for "${open%/*}")" > "$data"
+    if nvim_add "$sock"; then
+        notify "Added to ${open##*/}" "$preview"
+        exit 0
+    fi
+done <<< "$socks"
+
+mkdir -p "$WIKI"
+add_to "$page" 1 "$(note_for "$WIKI")" || exit 1
+
+if [ -f "$INDEX" ] && ! grep -qF -e "]($name)" -e "[[$name]]" -e "[[$name|" "$INDEX"; then
+    if grep -q '\[[^]]*\]([^)]*)' "$INDEX" && ! grep -q '\[\[' "$INDEX"; then
+        add_to "$INDEX" 1 "[$name]($name)"
+    else
+        add_to "$INDEX" 1 "[[$name]]"
+    fi
+fi
+
+notify "Added to $title" "$preview"

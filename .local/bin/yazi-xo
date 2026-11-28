@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+# yazi's o (and xo in the shell): opens each file with xdg-open, then takes you to the window it opened in
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+
+WAIT = 8        # seconds to wait for a window to show the file
+SAME_AFTER = 2
+
+
+def mmsg(*args):
+    try:
+        return subprocess.run(["mmsg", *args], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def clients():
+    try:
+        d = json.loads(mmsg("get", "all-clients"))
+    except ValueError:
+        return []
+    return d.get("clients", []) if isinstance(d, dict) else d
+
+
+def app_names(path):
+    """What the app that opens PATH may call its windows (lower case): its desktop file's StartupWMClass, its
+    command's name, the desktop file's name."""
+    run = lambda *a: subprocess.run(a, capture_output=True, text=True).stdout.strip()  # noqa: E731
+    desktop = run("xdg-mime", "query", "default", run("xdg-mime", "query", "filetype", path))
+    if not desktop:
+        return set()
+    names = {desktop.removesuffix(".desktop").lower()}
+    dirs = [os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")] + \
+           (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    for f in (p for d in dirs for p in glob.glob(os.path.join(d, "applications", desktop))):
+        with open(f, errors="replace") as fh:
+            for line in fh:
+                if line.startswith("StartupWMClass="):
+                    names.add(line.split("=", 1)[1].strip().lower())
+                elif line.startswith("Exec="):
+                    names.add(os.path.basename(line.split("=", 1)[1].split()[0]).lower())
+        break
+    return {n for n in names if len(n) >= 3 and n not in ("bash", "env", "flatpak", "dash", "zsh")}
+
+
+def is_app(c, names):
+    appid = (c.get("appid") or "").lower()
+    return bool(appid) and any(n == appid or n in appid or appid in n for n in names)
+
+
+def go(c):
+    tags = c.get("tags") or []
+    if tags and not c.get("is_visible"):
+        mmsg("dispatch", f"view,{tags[0]}")
+    mmsg("dispatch", "focusid", f"client,{c['id']}")
+
+
+files = sys.argv[1:]
+if not files:
+    sys.exit(0)
+before = {c["id"]: c.get("title") for c in clients()}
+names = set().union(*(app_names(f) for f in files))
+for f in files:
+    subprocess.Popen(["xdg-open", f], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+start = time.time()
+while time.time() - start < WAIT:
+    time.sleep(0.2)
+    now = clients()
+    new = [c for c in now if c["id"] not in before]
+    if new:
+        go(next((c for c in new if is_app(c, names)), new[0]))
+        break
+    mine = [c for c in now if is_app(c, names)]
+    changed = [c for c in mine if c.get("title") != before.get(c["id"])]
+    if changed or (mine and time.time() - start >= SAME_AFTER):
+        go(sorted(changed or mine, key=lambda c: not c.get("is_focused"))[0])
+        break

@@ -1,0 +1,12 @@
+#!/bin/sh
+# kitty as one shared process, so a new window opens in the kitty that's already running
+k=/usr/bin/kitty
+case $1 in @*|+*|-v|--version|-h|--help) exec "$k" "$@" ;; esac
+for a; do
+    case $a in
+        -o|-o?*|--override*|-c|-c?*|--config*|-1|--single-instance*) exec "$k" "$@" ;;
+        -*) ;;
+        *) break ;;
+    esac
+done
+exec "$k" -1 --wait-for-single-instance-window-close "$@"

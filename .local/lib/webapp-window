@@ -1,0 +1,45 @@
+"""A web app in its own window, not the browser: no tabs or address bar.
+Run with a Python that has PyQt6-WebEngine (watermark uses IOPaint's).
+
+    webapp-window URL TITLE APP_ID [DOWNLOAD_DIR]
+
+APP_ID is the window's app id (for mango's window rules). Downloads go to DOWNLOAD_DIR without asking.
+Closing the window ends it.
+"""
+import os
+import sys
+
+from PyQt6.QtCore import QUrl
+from PyQt6.QtWebEngineCore import QWebEngineDownloadRequest
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWidgets import QApplication
+
+
+def main():
+    if len(sys.argv) not in (4, 5):
+        sys.exit(__doc__.strip().splitlines()[3].strip())
+    url, title, app_id = sys.argv[1:4]
+    dl_dir = sys.argv[4] if len(sys.argv) == 5 else None
+    app = QApplication([sys.argv[0]])
+    app.setApplicationName(app_id)
+    app.setDesktopFileName(app_id)
+    view = QWebEngineView()
+    view.setWindowTitle(title)
+
+    def download(req: QWebEngineDownloadRequest):
+        if not dl_dir:
+            req.cancel()
+            return
+        req.setDownloadDirectory(dl_dir)
+        req.accept()
+
+    if dl_dir:
+        os.makedirs(dl_dir, exist_ok=True)
+    view.page().profile().downloadRequested.connect(download)
+    view.load(QUrl(url))
+    view.resize(1180, 720)
+    view.show()
+    sys.exit(app.exec())
+
+
+main()

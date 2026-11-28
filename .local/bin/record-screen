@@ -1,0 +1,193 @@
+#!/bin/bash
+# record-screen: records the screen to ~/Videos (Super+F1 starts and stops, Super+Shift+F1 a region, Super+F2 pauses)
+#   record-screen [-r region] [-m microphone | -n no sound] [-p pause / carry on] [-s notifications still pop up]
+
+OUTPUT_DIR="$HOME/Videos"
+LOG_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/screen-recorder.log"
+PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/screen-recorder.pid"
+
+notify() {
+    notify-send --app-name="Screen Recorder" --icon="media-record" "$1" "$2" 2>/dev/null
+}
+notify_quiet() {
+    notify-send --app-name="Screen Recorder" --icon="media-record" -h boolean:x-quiet:true "$@" 2>/dev/null
+}
+# tells the shell it's recording (its pid) or not (0): pop-ups are held back, unless -s
+qs_recording() {
+    if [ "$1" != 0 ] && $SHOW; then
+        qs ipc call notifications recordingShown "$1" >/dev/null 2>&1
+    else
+        qs ipc call notifications recording "$1" >/dev/null 2>&1
+    fi
+}
+
+REGION=false
+SOUND=desktop
+PAUSE=false
+SHOW=false
+while getopts "rmnps" opt; do
+    case $opt in
+        r) REGION=true ;;
+        m) SOUND=mic ;;
+        n) SOUND=none ;;
+        p) PAUSE=true ;;
+        s) SHOW=true ;;
+        *) echo "Usage: record-screen [-r] [-m | -n] [-s]   (-s: notifications still pop up; -p pauses / carries on)" >&2; exit 1 ;;
+    esac
+done
+
+old=
+{ read -r old < "$PID_FILE"; } 2>/dev/null
+if [ -n "$old" ] && [ "$old" != $$ ] && grep -qa record-screen "/proc/$old/cmdline" 2>/dev/null; then
+    if $PAUSE; then kill -USR1 "$old"; else kill -TERM "$old"; fi
+    exit 0
+fi
+$PAUSE && { notify "Screen Recorder" "Not recording"; exit 0; }
+trap '' USR1
+echo $$ > "$PID_FILE"
+RECORDING=false STOPPED=false
+SEGDIR='' GEOM_FILE='' SLURP_PID='' RECORDER_PID='' GEOMETRY='' MONITOR=''
+_cleanup() {
+    rm -f "$PID_FILE" "$GEOM_FILE"
+    [ -n "$SEGDIR" ] && find "$SEGDIR" -maxdepth 1 -type f -empty -delete 2>/dev/null && rmdir "$SEGDIR" 2>/dev/null
+    if $RECORDING; then qs_recording 0; fi
+}
+trap _cleanup EXIT
+trap '_stop; exit 0' TERM INT
+
+stop_recorder() {
+    if [ -n "$RECORDER_PID" ] && kill -0 "$RECORDER_PID" 2>/dev/null; then
+        kill -TERM "$RECORDER_PID"
+        sleep 10 &
+        local t=$!
+        while kill -0 "$RECORDER_PID" 2>/dev/null && kill -0 "$t" 2>/dev/null; do wait -n "$RECORDER_PID" "$t"; done
+        kill -KILL "$t" 2>/dev/null
+        kill -0 "$RECORDER_PID" 2>/dev/null && kill -KILL "$RECORDER_PID"
+        wait "$RECORDER_PID" 2>/dev/null
+    fi
+    RECORDER_PID=
+}
+
+join_segments() {
+    local segs=() f
+    for f in "$SEGDIR"/*.mp4; do [ -s "$f" ] && segs+=("$f"); done
+    if [ ${#segs[@]} -eq 1 ]; then
+        mv -f -- "${segs[0]}" "$OUTPUT_FILE"
+    elif [ ${#segs[@]} -gt 1 ]; then
+        printf "file '%s'\n" "${segs[@]}" > "$SEGDIR/list"
+        if ! ffmpeg -nostdin -v error -f concat -safe 0 -i "$SEGDIR/list" -c copy -movflags +faststart \
+                "file:$OUTPUT_FILE" >> "$LOG_FILE" 2>&1; then
+            rm -f -- "$OUTPUT_FILE" "$SEGDIR/list"
+            notify "Screen Recorder" "⚠️ Couldn't join the parts: they're in ${SEGDIR/#$HOME/\~}"
+            SEGDIR=
+            return
+        fi
+    fi
+    rm -rf -- "$SEGDIR"
+    SEGDIR=
+}
+
+_stop() {
+    trap '' TERM INT
+    $STOPPED && return
+    STOPPED=true
+    [ -n "$SLURP_PID" ] && kill "$SLURP_PID" 2>/dev/null
+    [ -n "$SEGDIR" ] || exit 0
+    stop_recorder
+    join_segments
+    if [ -s "$OUTPUT_FILE" ]; then
+        notify "Screen Recorder" "✅ Saved: ${OUTPUT_FILE##*/}"
+        echo "Saved to: $OUTPUT_FILE"
+    else
+        notify "Screen Recorder" "⚠️ Nothing was saved (see $LOG_FILE)"
+    fi
+}
+
+AUDIO=()
+if [ -n "$WAYLAND_DISPLAY" ]; then
+    command -v wf-recorder &>/dev/null || { notify "Screen Recorder" "❌ wf-recorder not installed"; exit 1; }
+    if $REGION; then
+        command -v slurp &>/dev/null || { notify "Screen Recorder" "❌ slurp not installed (sudo pacman -S slurp)"; exit 1; }
+        GEOM_FILE="$PID_FILE.region"
+        slurp > "$GEOM_FILE" 2>/dev/null &
+        SLURP_PID=$!
+        wait "$SLURP_PID" || exit 0
+        SLURP_PID=
+        read -r GEOMETRY < "$GEOM_FILE"
+    else
+        MONITOR=$("$HOME/.config/mango/scripts/mm" monitor 2>/dev/null)
+    fi
+    case $SOUND in
+        desktop)
+            sink=$(pactl get-default-sink 2>/dev/null)
+            if [ -n "$sink" ]; then AUDIO=(--audio="$sink.monitor"); else SOUND=none; fi ;;
+        mic) AUDIO=(--audio) ;;
+    esac
+else
+    notify "Screen Recorder" "❌ No display detected"
+    exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR" "${LOG_FILE%/*}"
+[ -f "$LOG_FILE" ] && tail -n 300 "$LOG_FILE" > "$LOG_FILE.new" && mv "$LOG_FILE.new" "$LOG_FILE"
+printf '\n── %(%F %T)T  monitor=%s  region=%s  sound=%s\n' -1 "${MONITOR:-?}" "${GEOMETRY:-no}" "$SOUND" >> "$LOG_FILE"
+printf -v OUTPUT_FILE '%s/recording_%(%Y-%m-%d_%H-%M-%S)T.mp4' "$OUTPUT_DIR" -1
+SEGDIR="$OUTPUT_DIR/.recording-$$"
+mkdir -p "$SEGDIR"
+SEGN=0
+trap 'TOGGLE=true' USR1
+
+start_recorder() {
+    SEGN=$((SEGN + 1))
+    printf -v SEG '%s/%03d.mp4' "$SEGDIR" "$SEGN"
+    wf-recorder -D ${GEOMETRY:+-g "$GEOMETRY"} ${MONITOR:+-o "$MONITOR"} "${AUDIO[@]}" \
+        --codec libx264 --codec-param crf=18 --codec-param preset=veryfast \
+        -f "$SEG" >> "$LOG_FILE" 2>&1 < /dev/null &
+    RECORDER_PID=$!
+    sleep 0.4
+    kill -0 "$RECORDER_PID" 2>/dev/null
+}
+
+RECORDING=true
+qs_recording $$
+if ! start_recorder && [ ${#AUDIO[@]} -gt 0 ]; then
+    AUDIO=()
+    SOUND=none
+    rm -f "$SEG"
+    SEGN=$((SEGN - 1))
+    start_recorder
+fi
+if ! kill -0 "$RECORDER_PID" 2>/dev/null; then
+    notify "Screen Recorder" "❌ Failed to start (see $LOG_FILE)"
+    tail -n 20 "$LOG_FILE" >&2
+    exit 1
+fi
+
+if $REGION; then what="part of the screen"; else what="the screen"; fi
+case $SOUND in
+    desktop) what+=", with sound" ;;
+    mic)     what+=", with the microphone" ;;
+    none)    what+=", no sound" ;;
+esac
+$SHOW && what+=", notifications showing"
+notify_quiet "🔴 Recording" "${what^}"
+echo "Recording $what → $OUTPUT_FILE"
+
+TOGGLE=false
+while :; do
+    $TOGGLE || wait "$RECORDER_PID"
+    $TOGGLE || break
+    TOGGLE=false
+    stop_recorder
+    qs_recording 0
+    notify_quiet "⏸ Paused"
+    while ! $TOGGLE; do sleep 1 & wait $!; done
+    TOGGLE=false
+    qs_recording $$
+    if ! start_recorder; then
+        notify "Screen Recorder" "❌ Couldn't carry on recording (see $LOG_FILE)"
+        break
+    fi
+    notify_quiet "🔴 Recording again"
+done
+_stop

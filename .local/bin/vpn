@@ -1,0 +1,194 @@
+#!/bin/bash
+# The VPN (Riseup, through openvpn) with a kill switch: nothing leaves except through the VPN until it's off.
+#   vpn             on or off (Super+u): `vpn run` in a terminal on tag 9
+#   vpn run         the VPN in this terminal (vp); Ctrl+C, closing it, or Super+u turns it off
+#   vpn fetch [-q]  download a fresh config into ~/RiseupVPN-OpenVPN (-q: no "set up" notification; -s: none at all)
+#   vpn avoid       edit the countries (or cities) it never connects to: ~/.config/vpn/avoid, one per line
+# The first run installs a sudo rule for its root half (/usr/local/lib/vpn-root), asking your password once.
+self=$HOME/.local/bin/vpn
+dev=tun-riseup
+dir=$HOME/RiseupVPN-OpenVPN
+conf=$dir/riseup-ovpn.conf
+full=$dir/riseup-ovpn.full.conf
+avoid=${XDG_CONFIG_HOME:-$HOME/.config}/vpn/avoid
+root=/usr/local/lib/vpn-root
+run=${XDG_RUNTIME_DIR:-/tmp}
+log=${XDG_CACHE_HOME:-$HOME/.cache}/vpn-fetch.log
+
+notify() { notify-send --app-name=VPN "$@" 2>/dev/null; }
+[ -f "$avoid" ] || { mkdir -p "${avoid%/*}" && printf '%s\n' \
+    "# Countries (or cities) the VPN never connects to, one per line. Riseup's servers are in" \
+    "# France (Paris), Netherlands (Amsterdam), United States (Seattle, Miami, New York City), Canada (Montreal)" \
+    France Netherlands > "$avoid"; }
+
+apply_avoid() {
+    [ -f "$full" ] || cp -f "$conf" "$full" 2>/dev/null || return
+    awk -v out="$conf.tmp" '
+        BEGIN {
+            n = split("paris:france:fr|amsterdam:netherlands:holland:nl|seattle:united states:usa:us:america|miami:united states:usa:us:america|new york city:new york:united states:usa:us:america|montreal:canada:ca", m, "|")
+            for (i = 1; i <= n; i++) { k = split(m[i], a, ":"); for (j = 2; j <= k; j++) names[a[1]] = names[a[1]] ":" a[j] ":" }
+        }
+        FILENAME == ARGV[1] { sub(/#.*/, ""); gsub(/^[ \t]+|[ \t\r]+$/, ""); if ($0 != "") no[tolower($0)] = 1; next }
+        $1 == "remote" && match($0, /\([^)]*\)/) {
+            city = tolower(substr($0, RSTART + 1, RLENGTH - 2))
+            if (city in no) next
+            for (c in no) if (index(names[city], ":" c ":")) next
+        }
+        $1 == "remote" { left++ }
+        { print > out }
+        END { print left + 0 }
+    ' "$avoid" "$full" && mv -f "$conf.tmp" "$conf"
+}
+
+ready() { sudo -n -l "$root" >/dev/null 2>&1 && cmp -s "$HOME/.local/lib/vpn-root" "$root"; }
+
+toggle() {
+    if { read -r pid < "$run/riseup-ovpn.pid"; } 2>/dev/null && [ -n "$pid" ] &&
+        ps -o args= -p "$pid" 2>/dev/null | grep -q "vpn run"; then
+        if pgrep -P "$pid" -x sudo >/dev/null 2>&1 || pgrep -f "^/bin/sh $root\$" >/dev/null 2>&1; then
+            kill -TERM "$pid"
+        else
+            kill -TERM "$pid" && notify "VPN off" "Stopped before it connected."
+        fi
+        exit 0
+    fi
+    if ! flock -n "$run/riseup-ovpn.lock" true 2>/dev/null; then
+        notify "VPN is still turning off" "Try again in a moment."
+        exit 0
+    fi
+    if ! ready; then
+        kitty --class=passprompt --title="VPN password" sh -c '
+            printf "\nThe VPN needs your password this once, so it can start without one from now on.\n\n"
+            sudo sh ~/.local/lib/vpn-install && sleep 1'
+        ready || { notify --urgency=critical "VPN not started" "It still needs your password once (Super+u asks again)."; exit 1; }
+    fi
+    exec kitty --class=vpn --title=VPN "$self" run
+}
+
+fetch() {
+    local quiet='' silent='' new=$dir.new
+    case ${1:-} in -q) quiet=1 ;; -s) quiet=1 silent=1 ;; esac
+    set -eE
+    # shellcheck disable=SC2329
+    failed() {
+        rm -rf "$new"
+        [ -n "$silent" ] || notify-send --app-name=VPN --urgency=critical "VPN setup failed" "The reason is in the terminal; nothing was changed"
+    }
+    trap failed ERR
+    trap 'rm -rf "$new"; exit 1' TERM INT HUP
+    umask 077
+    rm -rf "$new"
+    git clone -q https://github.com/BarbossHack/RiseupVPN-OpenVPN.git "$new"
+    cd "$new"
+    git -c advice.detachedHead=false checkout -q 35f73fa3af7e5ffd62cc916a78de8021b31c7d39
+    ./generate.sh
+    cp -f riseup-ovpn.conf riseup-ovpn.full.conf
+    trap '' TERM INT HUP
+    rm -rf "$dir"
+    mv "$new" "$dir"
+    [ -n "$quiet" ] || notify-send --app-name=VPN "VPN is set up" "Connect with vp"
+}
+
+start() {
+    umask 077
+    cd / || exit 1
+    mkdir -p "${log%/*}"
+    bar() { qs ipc call bar vpn >/dev/null 2>&1; }
+    fail() { echo "$2" >&2; notify --urgency=critical "$1" "$2"; exit 1; }
+
+    exec 9>"$run/riseup-ovpn.lock"
+    flock -n 9 || { echo "The VPN is already on." >&2; exit 1; }
+    echo $$ > "$run/riseup-ovpn.pid"
+
+    fresh() {
+        for block in ca cert; do
+            awk -v b="$block" '$0 == "<" b ">" {f = 1; next} $0 == "</" b ">" {f = 0} f' "$conf" 2>/dev/null |
+                openssl x509 -noout -checkend "$1" >/dev/null 2>&1 || return 1
+        done
+    }
+    if ! fresh 86400; then
+        got=$( { { "$self" fetch -s 2>&1; echo "$?" >&3; } | tee "$log" >&2; } 3>&1 9>&- )
+        if ! fresh 0; then
+            why=$(grep -v '^[[:space:]]*$' "$log" 2>/dev/null | tail -n 1)
+            ca_end=$(awk '$0 == "<ca>" {f = 1; next} $0 == "</ca>" {f = 0} f' "$conf" 2>/dev/null |
+                openssl x509 -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
+            if [ "$got" = 0 ] && [ -n "$ca_end" ] && ! date -d "$ca_end" >/dev/null 2>&1; then ca_end=; fi
+            if [ "$got" = 0 ] && [ -n "$ca_end" ] && [ "$(date -d "$ca_end" +%s)" -le "$(date +%s)" ]; then
+                fail "VPN not started: Riseup's fault" "Riseup's own certificate ran out on $(date -d "$ca_end" '+%-d %b %H:%M'), so nobody can connect until they renew it. Nothing's wrong on your side; Super+u works again once they do."
+            elif [ "$got" = 0 ]; then what="The VPN config just downloaded has already run out, and it won't connect with it"; why=
+            elif [ -f "$conf" ]; then what="The VPN config has run out and a new one couldn't be downloaded"
+            else what="There's no VPN config and it couldn't be downloaded"; fi
+            fail "VPN not started" "$what${why:+: $why}. Super+u tries again."
+        fi
+    fi
+
+    left=$(apply_avoid) || fail "VPN not started" "Couldn't leave out the countries in $avoid."
+    [ "$left" -gt 0 ] || fail "VPN not started" "Every server is in a country you avoid ($avoid): take one out with vpn avoid."
+    echo "Servers: $left (not in: $(grep -v '^[[:space:]]*\(#\|$\)' "$avoid" | paste -sd, | sed 's/,/, /g'))"
+
+    if ! ready; then
+        # shellcheck disable=SC2015
+        [[ $(tty 2>/dev/null) == /dev/pts/* ]] && echo "The VPN needs your password this once, so it can start without one from now on." &&
+            sudo sh "$HOME/.local/lib/vpn-install" ||
+            fail "VPN not started" "It needs your password once: press Super+u, or run vp in a terminal."
+    fi
+
+    busy() { pgrep -f "^/bin/sh $root\$" >/dev/null 2>&1; }
+    i=0
+    while busy && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i + 1)); done
+
+    vpn_up() { read -r s 2>/dev/null < "/sys/class/net/$dev/operstate" && [ "$s" != down ]; }
+
+    main=$$
+    (
+        trap '' HUP
+        i=0
+        until vpn_up; do
+            kill -0 "$main" 2>/dev/null || exit 0
+            i=$((i + 1))
+            [ "$i" -ge 60 ] && { notify --urgency=critical "VPN didn't connect" "Still nothing after a minute. Check its window on tag 9."; exit 0; }
+            sleep 1
+        done
+        bar
+        sleep 2
+        for _ in 1 2 3; do
+            info=$(curl -fsS --max-time 8 https://am.i.mullvad.net/json 2>/dev/null) && break
+            sleep 2
+        done
+        field() { printf '%s' "$info" | sed -n "s/.*\"$1\": *\"\([^\"]*\)\".*/\1/p"; }
+        kill -0 "$main" 2>/dev/null && vpn_up || exit 0
+        country=$(field country)
+        city=$(field city)
+        ip=$(field ip)
+        if [ -n "$country" ]; then
+            notify "VPN on: ${country}" "${city:+$city · }${ip}"
+        else
+            notify "VPN on" "Couldn't check which country you're in."
+        fi
+        setsid "$self" fetch -s >"$log" 2>&1 </dev/null & fetch=$!
+        ( while kill -0 "$main" 2>/dev/null && vpn_up; do sleep 0.2; done; kill -TERM -- "-$fetch" 2>/dev/null ) & guard=$!
+        wait "$fetch"
+        kill "$guard" 2>/dev/null
+    ) 9>&- &
+
+    trap ':' INT
+    sudo -n "$root" 9>&-
+    rc=$?
+    bar
+    case $rc in
+        0) ;;
+        1) if busy; then fail "VPN not started" "It was still turning off. Press Super+u again."
+           else fail "VPN not started" "sudo or its setup failed, so nothing was changed."; fi ;;
+        2) fail "VPN not started" "sudo or its setup failed, so nothing was changed." ;;
+        3) exit 1 ;;
+        *) fail "VPN stopped unexpectedly" "If the internet's blocked: sudo nft delete table inet vpnkill" ;;
+    esac
+}
+
+case ${1:-} in
+    '') toggle ;;
+    run) start ;;
+    fetch) shift; fetch "$@" ;;
+    avoid) exec "${EDITOR:-nvim}" "$avoid" ;;
+    *) echo "Usage: vpn [run | fetch [-q] | avoid]" >&2; exit 1 ;;
+esac

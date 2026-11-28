@@ -1,0 +1,80 @@
+#!/bin/bash
+# yt-transcript [-c] [URL] [OUT.txt]: a YouTube video's English captions as tidy text in the folder you're in (ytt)
+#   no URL: the link you copied; -c also copies the text
+set -o pipefail
+usage() { echo "Usage: yt-transcript [-c] [URL] [OUT.txt]   (no URL: uses the clipboard; -c also copies the text)" >&2; exit 1; }
+copy=0
+[ "$1" = -c ] && { copy=1; shift; }
+case $1 in -h|--help) usage ;; esac
+url=${1:-$(wl-paste -n 2>/dev/null)}
+[[ $url =~ ^https?:// ]] || [[ $url =~ ^[A-Za-z0-9_-]{11}$ ]] || usage
+command -v yt-dlp >/dev/null || { echo "yt-dlp missing (sudo pacman -S yt-dlp)" >&2; exit 1; }
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+yt-dlp --no-warnings --no-playlist -J --skip-download -- "$url" > "$tmp/j" 2>"$tmp/err" || { echo "yt-dlp failed: $(tail -n 1 "$tmp/err")" >&2; exit 1; }
+IFS=$'\t' read -r kind lang title < <(python3 -I -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+m=d.get("subtitles") or {}
+a=d.get("automatic_captions") or {}
+t=(d.get("title") or d.get("id") or "transcript").replace("\t", " ")
+t=t.encode()[:200].decode("utf-8", "ignore")
+pick=lambda ks: next((k for k in ks if k in m), None)
+k=pick(["en","en-GB","en-US"]) or next((k for k in m if k.startswith("en")), None)
+if k: print("subs", k, t, sep="\t")
+elif "en-orig" in a: print("auto", "en-orig", t, sep="\t")
+elif any(k.endswith("-orig") for k in a): print("auto", "en", t, sep="\t")
+else: print("none", "", t, sep="\t")' "$tmp/j")
+[ "$kind" = none ] && { echo "This video has no captions." >&2; exit 1; }
+extra=()
+if [ "$kind" = auto ] && [ "$lang" = en ]; then
+    echo "No English captions: getting YouTube's English translation (YouTube makes this wait about a minute)…" >&2
+    extra=(--sleep-subtitles 65)
+fi
+yt-dlp --no-warnings --no-playlist --skip-download "--write-$([ "$kind" = subs ] && echo subs || echo auto-subs)" --sub-langs "$lang" \
+    --sub-format vtt "${extra[@]}" --load-info-json "$tmp/j" -o "$tmp/s.%(ext)s" 2>"$tmp/err" || {
+    grep -q 'HTTP Error 429' "$tmp/err" && echo "YouTube refused the captions (429). Try again in a few minutes." >&2 || echo "yt-dlp failed: $(tail -n 1 "$tmp/err")" >&2
+    exit 1; }
+sub=
+for f in "$tmp"/s.*.vtt; do [ -f "$f" ] && { sub=$f; break; }; done
+[ -n "$sub" ] || { echo "No transcript came back for this video." >&2; exit 1; }
+name=${title//[\/:*?\"<>|]/-}
+out=${2:-$PWD/$name.txt}
+[ -d "$out" ] && out=${out%/}/$name.txt
+mkdir -p -- "$(dirname -- "$out")"
+python3 -I - "$sub" "$kind" > "$tmp/t" <<'EOF' || { echo "Couldn't read the transcript." >&2; exit 1; }
+import html, re, sys, textwrap
+lines = []
+auto = sys.argv[2] == "auto"
+raws = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+for i, raw in enumerate(raws):
+    s = raw.strip()
+    if not s or s == "WEBVTT" or "-->" in s or re.match(r"^(Kind|Language):|^(NOTE|STYLE)\b", s):
+        continue
+    if s.isdigit() and i + 1 < len(raws) and "-->" in raws[i + 1]:
+        continue
+    s = html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+    if not s:
+        continue
+    if auto and lines:
+        prev = lines[-1]
+        if s == prev or prev.endswith(" " + s):
+            continue
+        if s.startswith(prev + " "):
+            s = s[len(prev):].strip()
+    lines.append(s)
+text = re.sub(r"\s+", " ", " ".join(lines)).strip()
+paras = re.split(r"(?<=[.!?])\s+(?=[A-Z])", text)
+out, cur = [], ""
+for p in paras:
+    cur = (cur + " " + p).strip()
+    if len(cur) > 600:
+        out.append(cur); cur = ""
+if cur:
+    out.append(cur)
+print("\n\n".join(textwrap.fill(p, 100) for p in out))
+EOF
+mv -f -- "$tmp/t" "$out" || exit 1
+(( copy )) && wl-copy < "$out"
+echo "$out"
+notify-send --app-name=yt-transcript "Transcript saved" "${out/#$HOME/\~}" 2>/dev/null
+exit 0

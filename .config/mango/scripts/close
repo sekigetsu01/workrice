@@ -1,0 +1,52 @@
+#!/bin/bash
+# close --id <client id>: close one window; nvim windows save first (qs-capture and the calendar toggle with it).
+# Super+q is mango's own killclient; nvim saves itself when its window is closed that way (nvim/plugin/savequit.lua)
+rt=${XDG_RUNTIME_DIR:-/tmp}
+
+clients() {
+    mmsg get all-clients 2>/dev/null | python3 -I -c '
+import json, sys
+cs = json.load(sys.stdin).get("clients", [])
+c = next((c for c in cs if str(c["id"]) == sys.argv[1]), None)
+if c: print("%s %s %d %s" % (c["id"], c.get("appid") or "-", bool(c.get("is_focused")), (c.get("title") or "").replace("\n", " ")))
+' "$1"
+}
+
+is_nvim() { [[ ($1 == kitty || $1 == notepad || $1 == reminders || $1 == qs-capture) && $2 == *[Nn][Vv][Ii][Mm] ]]; }
+
+kill_id() { mmsg dispatch killclient "client,$1" >/dev/null 2>&1; }
+
+SKIP=
+claimed() {
+    local s
+    for _ in $(seq "$1"); do
+        s=$(cat "$rt/nvim-focused" 2>/dev/null)
+        if [ -S "$s" ] && [[ " $SKIP " != *" $s "* ]]; then printf '%s' "$s"; return 0; fi
+        sleep 0.02
+    done
+    return 1
+}
+
+save_quit() {
+    timeout 3 nvim --headless --clean --server "$1" --remote-expr 'v:lua.SaveQuit()' 2>/dev/null </dev/null | grep -q '^saved'
+}
+
+close_one() {
+    local sock tries=5
+    if is_nvim "$2" "$4"; then
+        if [ "$3" != 1 ]; then
+            SKIP+=" $(cat "$rt/nvim-focused" 2>/dev/null)"
+            ~/.config/mango/scripts/mm bring "$1" >/dev/null 2>&1
+            tries=25
+        fi
+        if sock=$(claimed "$tries"); then
+            SKIP+=" $sock"
+            save_quit "$sock" && for _ in $(seq 100); do [ -S "$sock" ] || break; sleep 0.02; done
+        fi
+    fi
+    kill_id "$1"
+}
+
+[ "${1:-}" = --id ] && [ -n "${2:-}" ] || exit 1
+read -r id app f title <<< "$(clients "$2")"
+[ -n "$id" ] && close_one "$id" "$app" "$f" "$title"

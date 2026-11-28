@@ -1,0 +1,11 @@
+# The default for text files: nvim in a kitty window (hidden from the launcher)
+[Desktop Entry]
+Type=Application
+Name=Neovim (kitty)
+Comment=Edit text files in Neovim inside a kitty window
+Exec=kitty nvim %F
+Icon=nvim
+Terminal=false
+MimeType=text/plain;text/english;text/markdown;text/x-markdown;text/css;text/javascript;text/csv;text/tab-separated-values;text/x-log;text/x-diff;text/x-patch;text/x-makefile;text/x-cmake;text/x-c;text/x-c++;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/x-java;text/x-moc;text/x-pascal;text/x-tcl;text/x-tex;text/x-python;text/x-python3;text/x-lua;text/x-rust;text/x-go;text/x-shellscript;text/x-qml;text/x-sql;text/x-ini;text/x-readme;text/xml;text/x-systemd-unit;text/x-dockerfile;application/json;application/x-ndjson;application/x-shellscript;application/x-sh;application/xml;application/yaml;application/x-yaml;application/toml;application/x-desktop;application/javascript;application/typescript;application/x-perl;application/x-ruby;application/x-php;application/x-subrip;application/x-zerosize;application/sql;text/x-script.python;text/x-perl;text/x-ruby;text/x-php;text/x-awk;text/x-gawk;text/x-nawk;text/x-asm;text/x-m4;text/x-po;text/x-msdos-batch;text/x-fortran;text/x-objective-c;text/troff;application/x-wine-extension-ini;inode/x-empty;
+NoDisplay=true
+X-Apphide=edited

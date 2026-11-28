@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+# mm COMMAND: window and tag helpers for mango, on top of mmsg (mm alone lists them): bring a window to this tag,
+# focus an app, the last or a free tag, step, resize. mango's keys, raise, close, the panels and books use it
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+
+def get(what):
+    try:
+        return json.loads(subprocess.run(["mmsg", "get", what], capture_output=True, text=True).stdout)
+    except (OSError, ValueError):
+        return {}
+
+
+def walk(o, depth=0):
+    if isinstance(o, dict):
+        yield depth, o
+        o = o.values()
+    if isinstance(o, (list, type({}.values()))):
+        for v in o:
+            yield from walk(v, depth + 1)
+
+
+def monitor():
+    found = [(d, o["name"]) for d, o in walk(get("all-monitors"))
+             if o.get("active") is True and isinstance(o.get("name"), str)]
+    if found:
+        return min(found, key=lambda f: f[0])[1]
+    for what in ("focusing-client", "cursorpos"):
+        name = next((o["monitor"] for _, o in walk(get(what)) if isinstance(o.get("monitor"), str)), "")
+        if name:
+            return name
+    return ""
+
+
+def bring(cid):
+    cid = str(cid)
+    c = next((o for o in get("all-clients").get("clients", []) if str(o.get("id")) == cid), None)
+    if c and not c.get("is_minimized") and not c.get("is_visible"):
+        mons = get("all-monitors").get("monitors", [])
+        mon = next((m for m in mons if m.get("active")), mons[0] if mons else None)
+        here = (mon or {}).get("active_tags") or []
+        if len(here) == 1:
+            if c.get("monitor") == mon.get("name"):
+                subprocess.run(["mmsg", "dispatch", f"tagsilent,{here[0]}", f"client,{cid}"], capture_output=True)
+            else:
+                subprocess.run(["mmsg", "dispatch", f"tagcrossmon,{here[0]},{mon.get('name')}", f"client,{cid}"],
+                               capture_output=True)
+    subprocess.run(["mmsg", "dispatch", "focusid", f"client,{cid}"], capture_output=True)
+    if c and c.get("is_floating") and not c.get("is_fullscreen"):
+        subprocess.run(["mmsg", "dispatch", "centerwin", f"client,{cid}"], capture_output=True)
+
+
+def silent_rules():
+    rules = []
+    try:
+        with open(os.path.expanduser("~/.config/mango/config.conf")) as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith("window_rule") or "=" not in line:
+                    continue
+                fields = dict(kv.split(":", 1) for kv in line.split("=", 1)[1].split(",") if ":" in kv)
+                if fields.get("is_tag_silent", "").strip() == "1":
+                    rules.append((fields.get("app_id", "").strip(), fields.get("title", "").strip()))
+    except OSError:
+        pass
+    return rules
+
+
+def matches(pattern, text):
+    try:
+        return re.search(pattern, text) is not None
+    except re.error:
+        return pattern == text
+
+
+FOLLOW = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "open-link-follow")
+
+
+def following():
+    try:
+        fresh = time.time() - os.path.getmtime(FOLLOW) < 5
+        os.remove(FOLLOW)
+        return fresh
+    except OSError:
+        return False
+
+
+def go(c):
+    tags = c.get("tags") or []
+    if tags and not c.get("is_visible") and not c.get("is_minimized"):
+        subprocess.run(["mmsg", "dispatch", f"view,{tags[0]}"], capture_output=True)
+    subprocess.run(["mmsg", "dispatch", "focusid", f"client,{c['id']}"], capture_output=True)
+
+
+def attention():
+    rules = silent_rules()
+    seen = set()
+    for obj in stream(["all-clients"]):
+        clients = obj.get("clients") if isinstance(obj, dict) else None
+        if not isinstance(clients, list):
+            continue
+        urgent = set()
+        for o in clients:
+            if not o.get("is_urgent") or "id" not in o:
+                continue
+            urgent.add(o["id"])
+            if o["id"] in seen:
+                continue
+            appid, title = str(o.get("appid", "")), str(o.get("title", ""))
+            if any((a or t) and (not a or matches(a, appid)) and (not t or matches(t, title)) for a, t in rules):
+                continue
+            if appid.startswith("glide") and following():
+                go(o)
+            else:
+                bring(o["id"])
+        seen = urgent
+
+
+def focus(appid):
+    for _ in range(10):
+        time.sleep(0.2)
+        found = next((o["id"] for _, o in walk(get("all-clients"))
+                      if "id" in o and appid in str(o.get("appid", "")).lower()), "")
+        if found != "":
+            bring(found)
+            return
+
+
+def goto(names):
+    names = {n.lower() for n in names if n}
+    for _, o in walk(get("all-clients")):
+        if "id" in o and str(o.get("appid", "")).lower() in names:
+            tags = o.get("tags") or []
+            if tags:
+                subprocess.run(["mmsg", "dispatch", f"view,{tags[0]}"], capture_output=True)
+            subprocess.run(["mmsg", "dispatch", "focusid", f"client,{o['id']}"], capture_output=True)
+            return 0
+    return 1
+
+
+def stream(args):
+    while True:
+        try:
+            p = subprocess.Popen(["mmsg", "watch", *args], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, text=True, errors="replace")
+        except OSError:
+            time.sleep(1)
+            continue
+        for line in p.stdout:
+            try:
+                yield json.loads(line)
+            except ValueError:
+                pass
+        p.wait()
+        time.sleep(1)
+
+
+LAST = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "mango-lasttag.json")
+
+
+def track():
+    now, prev = {}, {}
+    for obj in stream(["all-monitors"]):
+        for _, m in walk(obj):
+            name, tags = m.get("name"), m.get("tags")
+            if not isinstance(name, str) or not isinstance(tags, list):
+                continue
+            active = [t["index"] for t in tags if isinstance(t, dict) and t.get("is_active")]
+            t = active[0] if len(active) == 1 else None
+            if t is None or t == now.get(name):
+                continue
+            if name in now:
+                prev[name] = now[name]
+                with open(LAST + ".new", "w") as f:
+                    json.dump(prev, f)
+                os.replace(LAST + ".new", LAST)
+            now[name] = t
+
+
+def last():
+    try:
+        with open(LAST) as f:
+            return json.load(f).get(monitor(), "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def lasttag():
+    # SUPER+Tab: back to the tag you were on before this one
+    t = last()
+    if t != "":
+        subprocess.run(["mmsg", "dispatch", f"view,{t}"], capture_output=True)
+
+
+def freetag():
+    mons = get("all-monitors").get("monitors", [])
+    mon = next((m for m in mons if m.get("active")), mons[0] if mons else None)
+    if not mon:
+        return
+    n = mon.get("tag_num", 9)
+    busy = {t["index"] for t in mon.get("tags", []) if t.get("client_count")}
+    here = (mon.get("active_tags") or [1])[0]
+    pick = next((t for t in [here - 1, *range(here + 1, n + 1)] if 1 <= t <= n and t not in busy), None)
+    if pick:
+        subprocess.run(["mmsg", "dispatch", f"view,{pick}"], capture_output=True)
+        print(pick)
+
+
+QS = os.path.expanduser("~/.config/quickshell")
+CALC_SIDE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "qs-calc-side")
+
+
+def calc(fn, *args):
+    try:
+        return subprocess.run(["qs", "ipc", "-p", QS, "call", "calcKeys", fn, *args],
+                              capture_output=True, text=True, timeout=1).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def step(way):
+    # SUPER+j / SUPER+k: the next / previous window; the open calculator counts as one
+    nxt = way == "next"
+    typing = calc("typing") if os.path.exists(CALC_SIDE) else ""
+    if typing in ("true", "false"):
+        focused = get("focusing-client")
+        mon = focused.get("monitor") or monitor()
+        wins = [o["id"] for o in get("all-clients").get("clients", [])
+                if o.get("is_visible") and o.get("monitor") == mon and not o.get("is_unglobal") and "id" in o]
+        if typing == "true":
+            if wins and calc("release") == "true":
+                subprocess.run(["mmsg", "dispatch", "focusid", f"client,{wins[0] if nxt else wins[-1]}"], capture_output=True)
+            return
+        if not wins or focused.get("id") not in wins or focused.get("id") == (wins[-1] if nxt else wins[0]):
+            calc("focus")
+            return
+    subprocess.run(["mmsg", "dispatch", f"focusstack,{way}"], capture_output=True)
+
+
+def resize(dx, dy):
+    # SUPER+h / SUPER+l: the focused window narrower / wider
+    if os.path.exists(CALC_SIDE) and calc("side", "h" if str(dx).startswith("-") else "l") == "true":
+        return
+    if any(str(o.get("appid", "")) == "books" for _, o in walk(get("focusing-client"))):
+        return
+    subprocess.run(["mmsg", "dispatch", f"resizewin,{dx},{dy}"], capture_output=True)
+
+
+cmd, args = (sys.argv[1:2] or [""])[0], sys.argv[2:]
+if cmd == "monitor":
+    print(monitor())
+elif cmd == "focus" and args:
+    focus(args[0].lower())
+elif cmd == "goto" and args:
+    sys.exit(goto(args))
+elif cmd == "bring" and args:
+    bring(args[0])
+elif cmd == "attention":
+    attention()
+elif cmd == "track":
+    track()
+elif cmd == "lasttag":
+    lasttag()
+elif cmd == "freetag":
+    freetag()
+elif cmd == "step" and args[:1] in (["next"], ["prev"]):
+    step(args[0])
+elif cmd == "resize" and len(args) == 2:
+    resize(*args)
+else:
+    sys.exit("usage: mm monitor | lasttag | freetag | step next|prev | resize DX DY | bring ID | attention | track | focus APPID | goto APPID...")

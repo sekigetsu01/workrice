@@ -1,0 +1,104 @@
+# yazi theme (colours only), made by pywal
+
+[mgr]
+cwd             = {{ fg = "blue", bold = true }}
+find_keyword    = {{ fg = "black", bg = "white", bold = true }}
+find_position   = {{ fg = "magenta", bold = true }}
+marker_copied   = {{ fg = "green", bg = "green" }}
+marker_cut      = {{ fg = "red", bg = "red" }}
+marker_marked   = {{ fg = "cyan", bg = "cyan" }}
+marker_selected = {{ fg = "yellow", bg = "yellow" }}
+count_copied    = {{ fg = "black", bg = "green" }}
+count_cut       = {{ fg = "black", bg = "red" }}
+count_selected  = {{ fg = "black", bg = "yellow" }}
+border_style    = {{ fg = "darkgray" }}
+symlink_target  = {{ }}
+
+[tabs]
+active   = {{ fg = "black", bg = "blue", bold = true }}
+inactive = {{ fg = "blue", bg = "darkgray" }}
+
+[mode]
+normal_main = {{ fg = "black", bg = "blue", bold = true }}
+normal_alt  = {{ fg = "blue", bg = "darkgray" }}
+select_main = {{ fg = "black", bg = "magenta", bold = true }}
+select_alt  = {{ fg = "magenta", bg = "darkgray" }}
+unset_main  = {{ fg = "black", bg = "red", bold = true }}
+unset_alt   = {{ fg = "red", bg = "darkgray" }}
+
+[indicator]
+parent  = {{ fg = "black", bg = "darkgray" }}
+current = {{ fg = "black", bg = "blue", bold = true }}
+preview = {{ fg = "blue", underline = true }}
+
+[status]
+perm_sep        = {{ fg = "darkgray" }}
+perm_type       = {{ fg = "green" }}
+perm_read       = {{ fg = "yellow" }}
+perm_write      = {{ fg = "red" }}
+perm_exec       = {{ fg = "cyan" }}
+progress_normal = {{ fg = "blue", bg = "darkgray" }}
+progress_error  = {{ fg = "yellow", bg = "red" }}
+
+[which]
+border          = {{ fg = "blue" }}
+cand            = {{ fg = "cyan" }}
+rest            = {{ fg = "darkgray" }}
+desc            = {{ fg = "magenta" }}
+separator_style = {{ fg = "darkgray" }}
+
+[confirm]
+border = {{ fg = "blue" }}
+title  = {{ fg = "blue" }}
+
+[spot]
+border   = {{ fg = "blue" }}
+title    = {{ fg = "blue" }}
+tbl_col  = {{ fg = "blue" }}
+tbl_cell = {{ fg = "yellow", reversed = true }}
+
+[notify]
+title_info  = {{ fg = "green" }}
+title_warn  = {{ fg = "yellow" }}
+title_error = {{ fg = "red" }}
+
+[pick]
+border = {{ fg = "blue" }}
+active = {{ fg = "magenta", bold = true }}
+
+[input]
+border = {{ fg = "blue" }}
+
+[cmp]
+border = {{ fg = "blue" }}
+
+[tasks]
+border  = {{ fg = "blue" }}
+hovered = {{ fg = "magenta", bold = true }}
+
+[help]
+border  = {{ fg = "blue" }}
+chord   = {{ fg = "cyan" }}
+hovered = {{ reversed = true, bold = true }}
+
+[icon]
+prepend_dirs = [
+  {{ name = ".config", text = "\ue5fc", fg = "cyan" }},
+  {{ name = ".git", text = "\ue5fb", fg = "cyan" }},
+  {{ name = ".github", text = "\ue5fd", fg = "cyan" }},
+  {{ name = ".npm", text = "\ue5fa", fg = "cyan" }},
+  {{ name = "Desktop", text = "\uf108", fg = "cyan" }},
+  {{ name = "Development", text = "\ue70c", fg = "cyan" }},
+  {{ name = "Documents", text = "\uf401", fg = "cyan" }},
+  {{ name = "Downloads", text = "\uf498", fg = "cyan" }},
+  {{ name = "Library", text = "\ueb9c", fg = "cyan" }},
+  {{ name = "Movies", text = "\uf447", fg = "cyan" }},
+  {{ name = "Music", text = "\uf025", fg = "cyan" }},
+  {{ name = "Pictures", text = "\ue244", fg = "cyan" }},
+  {{ name = "Public", text = "\uf42b", fg = "cyan" }},
+  {{ name = "Videos", text = "\uf447", fg = "cyan" }},
+]
+prepend_conds = [
+  {{ if = "dir & hovered", text = "\ue5fe", fg = "black" }},
+  {{ if = "dir", text = "\ue5ff", fg = "cyan" }},
+]

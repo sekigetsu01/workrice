@@ -1,0 +1,65 @@
+# yazi's keys, in front of its own (each has a desc: ~ in yazi lists them all)
+[mgr]
+prepend_keymap = [
+	{ on = "l", run = "plugin smart-enter", desc = "Enter the child directory, or open the file" },
+	{ on = "<Enter>", run = "plugin smart-enter", desc = "Enter the child directory, or open the file" },
+	{ on = "p", run = "plugin smart-paste", desc = "Paste into the hovered directory or CWD" },
+	{ on = "y", run = [ '''shell -- LC_ALL=C awk 'BEGIN { ORS = "\r\n"; for (i = 1; i < 256; i++) ord[sprintf("\045c", i)] = i; for (a = 1; a < ARGC; a++) { s = ""; n = length(ARGV[a]); for (i = 1; i <= n; i++) { c = substr(ARGV[a], i, 1); s = s (c ~ /[A-Za-z0-9\/._~-]/ ? c : sprintf("\045\045\04502X", ord[c])) } print "file://" s } }' %s | wl-copy -t text/uri-list''', "yank" ], desc = "Yank (and copy the files for other apps)" },
+
+	{ on = "a",     run = "toggle_all",    desc = "Invert selection of all files" },
+	{ on = "<Esc>", run = [ "escape", "escape --visual --select", "unyank" ], desc = "Unselect everything (selected, yanked, cut) wherever you are; also closes find / filter / search one at a time" },
+	{ on = "d",     run = "yank --cut",    desc = "Yank selected files (cut)" },
+	{ on = "D",     run = [ "escape --visual", "plugin deletes" ], desc = "Delete selected files permanently (no confirm, no bin)" },
+	{ on = "F",     run = "create",        desc = "Create a file (ends with / for directories)" },
+	{ on = "R",     run = "plugin save-last", desc = "Saving for another app: save into the folder you last saved to" },
+	{ on = "<C-s>", run = "hidden toggle", desc = "Toggle the visibility of hidden files" },
+	{ on = "f",     run = "plugin stay-filter", desc = "Filter as you type; Enter / Esc keep only the matches (Esc again shows all)" },
+	{ on = [ "c", "m" ], run = "plugin chmod", desc = "Chmod selected files" },
+
+	{ on = [ "s", "s" ], run = "search --via=fd", desc = "Search files by name via fd" },
+	{ on = [ "s", "g" ], run = "search --via=rg", desc = "Search inside files via ripgrep" },
+	{ on = [ "s", "c" ], run = "cd ~/.local",     desc = "Cd into .local" },
+
+	{ on = [ "c", "f" ], run = "cd ~/.config",  desc = "Cd into .config" },
+	{ on = [ "c", "F" ], run = "copy filename", desc = "Copy the filename" },
+
+	{ on = "g", run = "plugin goto", desc = "Go to a folder (then a key)" },
+
+	{ on = "t", run = "tab_create --current", desc = "Create a new tab with CWD" },
+
+	{ on = "O", run = '''shell --orphan -- sh -c 'exec "$HOME/.local/bin/bookset" yazi "$1"' _ %h''', desc = "A book or audiobook with its note and the other (asks which), on tags side by side; yazi closes" },
+	{ on = "L", run = "open --interactive", desc = "Open with… (pick the app)" },
+	{ on = "o", run = [ "escape --visual", '''shell --orphan -- sh -c 'exec "$HOME/.local/bin/yazi-xo" "$@"' _ %s''' ], desc = "Open the selected files (or the hovered one) with plain xdg-open, and go to the window they open in (its tag)" },
+	{ on = "e", run = '''shell --block -- bash -c 'f=$1; l=$(mktemp -p "${XDG_RUNTIME_DIR:-/tmp}"); { if [ -x "$f" ]; then "$f"; else read -r x < "$f"; case $x in "#!"*) ${x#??} "$f" ;; *) sh "$f" ;; esac; fi; } 2>&1 | tee "$l"; r=${PIPESTATUS[0]}; if [ "$r" = 0 ]; then t=done; else t="failed (exit $r)"; fi; notify-send -a yazi "${f##*/} $t" "$(tail -n 4 "$l")"; rm -f "$l"' _ %h''', desc = "Run the hovered script" },
+	{ on = "w", run = 'shell --block -- "$SHELL"', desc = "Open $SHELL here" },
+	{ on = "W", run = "tasks:show", desc = "Show task manager" },
+	{ on = "b", run = '''shell --orphan -- sh -c 'exec "$HOME/.local/bin/wallpaper" "$1"' _ %h''', desc = "Set hovered image as wallpaper; on a folder, a random image from it" },
+
+	{ on = "M",                run = "plugin mount",       desc = "Mount / unmount drives" },
+	{ on = "A",                run = "plugin mkcd",        desc = "Make a folder and go into it (mkcd)" },
+
+	{ on = "m",  run = "plugin marks",      desc = "Set mark (then a letter; - clears all)" },
+	{ on = "'",  run = "plugin marks jump", desc = "Jump to mark (then a letter)" },
+
+	{ on = "Y", run = '''shell -- sh -c 'mime=$(file -b --mime-type -- "$1"); case "$mime" in image/*|text/*) wl-copy --type "$mime" < "$1" && notify-send -a yazi -t 1500 "Copied to clipboard" "$(basename -- "$1")" ;; *) notify-send -a yazi "Not an image or text file" "$(basename -- "$1")" ;; esac' _ %h''', desc = "Copy file contents (image / text) to clipboard" },
+	{ on = "x", run = [ "escape --visual", '''shell -- sh -c 'out=$(scrub -p "$@" 2>&1); notify-send -a scrub "Scrub" "$(echo "$out" | tail -n 4)"' _ %s''' ], desc = "Scrub hidden data from selected files (photos: also hide which camera took them)" },
+	{ on = "S", run = [ "escape --visual", '''shell --block -- "$HOME/.local/bin/send" %s''' ], desc = "Send the selected files to another computer over SSH (asks where)" },
+	{ on = "<C-g>", run = '''shell --block -- "$HOME/.local/bin/send" get''', desc = "Get files from another computer into this folder (picked from a list)" },
+	{ on = "U", run = [ "escape --visual", '''shell --block -- "$HOME/.local/bin/ud" %s''' ], desc = "Publish the selected folders in ~/github to GitHub (ud)" },
+	{ on = "u",                run = [ "escape --visual", "plugin folder-size" ], desc = "Show size of hovered / selected (du)" },
+	{ on = "i",                run = "plugin jump-char",   desc = "Jump to next file starting with a letter (then n / N)" },
+
+	{ on = "1", run = "plugin counts 1", desc = "Count prefix" },
+	{ on = "2", run = "plugin counts 2", desc = "Count prefix" },
+	{ on = "3", run = "plugin counts 3", desc = "Count prefix" },
+	{ on = "4", run = "plugin counts 4", desc = "Count prefix" },
+	{ on = "5", run = "plugin counts 5", desc = "Count prefix" },
+	{ on = "6", run = "plugin counts 6", desc = "Count prefix" },
+	{ on = "7", run = "plugin counts 7", desc = "Count prefix" },
+	{ on = "8", run = "plugin counts 8", desc = "Count prefix" },
+	{ on = "9", run = "plugin counts 9", desc = "Count prefix" },
+	{ on = [ "c", "s" ], run = [ "escape --visual", '''shell --orphan -- sh -c 'exec "$HOME/.local/bin/speak" --add "$@"' _ %s''' ], desc = "Make audiobooks of the selected books (or the hovered one), in the background: follow them in Books" },
+	{ on = [ "c", "t" ], run = [ "escape --visual", '''shell --orphan -- sh -c 'exec "$HOME/.local/bin/transcribe" "$@"' _ %s''' ], desc = "Transcribe the selected audio or video (or the hovered one) to Word and PDF" },
+	{ on = [ "c", "a", "a" ], run = "plugin compress-named",    desc = "Archive selected files" },
+	{ on = [ "c", "a", "p" ], run = "plugin compress-named -p", desc = "Archive selected files (with password)" },
+]

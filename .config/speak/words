@@ -1,0 +1,21 @@
+# How speak should say words it gets wrong: one per line, the word, =, then how it sounds.
+# Spell it the way you'd spell it out for a friend, with hyphens between the parts so it's said as one word.
+# Any capitals match, and a phrase works too. Changes are picked up straight away, even by a book being made.
+# Try one: copy a sentence and run  speak -c
+#
+#   sioyek = see-oh-yek
+#   Hermione = her-my-oh-nee
+#   Nietzsche = nee-cha
+#   lead pipe = led pipe
+#
+# For exact sounds, put misaki's sound symbols between slashes:  Quickshell = /kwˈɪkʃɛl/
+
+# Names from your setup that the voice got wrong
+yazi = yah-zee
+OPSEC = opsec
+lazygit = lazy-git
+cliphist = clip-hist
+swayimg = sway-image
+yt = Y T
+yta = Y T eh
+ytt = Y T T

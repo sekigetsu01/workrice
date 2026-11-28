@@ -1,0 +1,12 @@
+{
+    "_help": "Per-app rules for notifications, by the app name shown on the pop-up. quiet: notification center only, no pop-up. open: what a click in the notification center opens: a panel (\"calendar\"), or false for nothing (your own scripts in an app, which would otherwise open the app). window: the app's window name (app id), when its desktop entry doesn't say it. Saved changes apply straight away.",
+
+    "swayimg":       { "open": false },
+    "sioyek":        { "open": false },
+    "FreeTube":      { "open": false },
+    "Glide Browser": { "window": "glide-glide" },
+    "Glide":         { "window": "glide-glide" },
+    "Calendar":      { "open": "calendar" },
+    "Reminder":      { "open": false },
+    "scrub":         { "open": false }
+}

@@ -1,0 +1,101 @@
+#!/bin/bash
+# doc FILE…: writing (markdown, notes, text) to a Word document in your house style, next to it; -p makes a PDF too
+#   doc -o OUT FILE · doc --style edits the house style (~/.config/doc/reference.docx) · doc -h
+STYLE=${XDG_CONFIG_HOME:-$HOME/.config}/doc/reference.docx
+LO=$(realpath -m "${XDG_CACHE_HOME:-$HOME/.cache}/doc/libreoffice")
+
+fail() { echo "doc: $1" >&2; exit 1; }
+usage() {
+    cat >&2 <<'EOF'
+doc: turn writing (markdown, notes, plain text) into a Word document in your house style,
+and a PDF that looks the same. Saved next to the file.
+  doc FILE...          FILE.docx
+  doc -p FILE...       FILE.docx and FILE.pdf
+  doc -o OUT FILE      save as OUT (.docx or .pdf)
+  doc --style          open the house style in LibreOffice: change fonts, headings, margins, save
+A title block at the top of a markdown file fills the title, subtitle, author and date:
+  ---
+  title: Proposal
+  author: Your Name
+  date: 14 October 2026
+  ---
+EOF
+    exit 1
+}
+command -v pandoc >/dev/null || fail "pandoc isn't installed (sys-setup installs it)"
+
+pdf=false out=
+while [ $# -gt 0 ]; do
+    case $1 in
+        -p|--pdf) pdf=true ;;
+        -o) out=$2; shift; [ -n "$out" ] || usage ;;
+        --style)
+            [ -f "$STYLE" ] || fail "no house style at $STYLE"
+            exec libreoffice --writer "$STYLE" ;;
+        -h|--help) usage ;;
+        --) shift; break ;;
+        -*) usage ;;
+        *) break ;;
+    esac
+    shift
+done
+[ $# -gt 0 ] || usage
+[ -n "$out" ] && [ $# -gt 1 ] && fail "-o works with one file at a time"
+
+LO_URL=file://$(printf '%s' "$LO" | sed 's/%/%25/g; s/ /%20/g; s/#/%23/g; s/?/%3F/g')
+
+topdf() {
+    command -v soffice >/dev/null || fail "PDFs need LibreOffice"
+    local tmp; tmp=$(mktemp -d) || exit 1
+    timeout 180 soffice --headless --norestore "-env:UserInstallation=$LO_URL" --convert-to pdf --outdir "$tmp" "$1" >/dev/null 2>&1
+    local n=${1##*/} made
+    made=$tmp/${n%.*}.pdf
+    [ -s "$made" ] && mv -f "$made" "$2"; local ok=$?
+    rm -rf "$tmp"
+    return $ok
+}
+
+same() { [ "$(realpath -m -- "$1")" = "$(realpath -m -- "$2")" ]; }
+tmpdocx=""
+trap 'rm -f -- "$tmpdocx"' EXIT
+
+style=(); [ -f "$STYLE" ] && style=(--reference-doc="$STYLE")
+for f; do
+    [ -f "$f" ] || fail "no such file: $f"
+    case ${f,,} in
+        *.md|*.markdown|*.txt|*.text) from=markdown ;;
+        *.wiki) from=vimwiki ;;
+        *.org) from=org ;;
+        *.rst) from=rst ;;
+        *.html|*.htm) from=html ;;
+        *.odt) from=odt ;;
+        *.docx) from=docx ;;
+        *) from=markdown ;;
+    esac
+    name=${f##*/}
+    case $name in ?*.*) base=${f%.*} ;; *) base=$f ;; esac
+    if [ "$from" = docx ]; then
+        case $out in
+            "") $pdf || fail "$f is already a Word document (doc -p makes a PDF of it)"; pdf_out=$base.pdf ;;
+            *.pdf|*.PDF) pdf_out=$out ;;
+            *) fail "$f is already a Word document" ;;
+        esac
+        topdf "$f" "$pdf_out" || fail "LibreOffice couldn't make the PDF"
+        echo "${pdf_out/#$HOME/\~}"
+        continue
+    fi
+    case $out in
+        "") docx=$base.docx; want_pdf=$pdf; pdf_out=$base.pdf ;;
+        *.pdf|*.PDF) tmpdocx=$(mktemp --suffix=.docx) || exit 1; docx=$tmpdocx; want_pdf=true; pdf_out=$out ;;
+        *) docx=$out; want_pdf=$pdf
+           case ${out##*/} in ?*.*) pdf_out=${out%.*}.pdf ;; *) pdf_out=$out.pdf ;; esac ;;
+    esac
+    same "$docx" "$f" && fail "that would write over $f"
+    pandoc -f "$from" -t docx "${style[@]}" --resource-path="$(dirname "$f")" -o "$docx" "$f" || fail "couldn't convert $f"
+    [ "$docx" = "$tmpdocx" ] || echo "${docx/#$HOME/\~}"
+    if $want_pdf; then
+        topdf "$docx" "$pdf_out" || fail "LibreOffice couldn't make the PDF"
+        echo "${pdf_out/#$HOME/\~}"
+    fi
+done
+exit 0

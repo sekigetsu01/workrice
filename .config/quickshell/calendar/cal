@@ -1,0 +1,1572 @@
+#!/usr/bin/env python3
+# The calendar's helper (CalStore runs it; ALT+a runs cal todo-edit): your events in ~/sync/calendar/calendar.ics plus
+# the feeds in ~/.config/calendar/feeds, with repeats, alarms and the to-do list. cal COMMAND: range, add, edit,
+# delete, next-alarm, fetch, todo, todo-edit, todo-delete, todo-done, routine-done, todo-tidy, routines
+import json
+import os
+import pickle
+import re
+import subprocess
+import sys
+from datetime import date, datetime, time, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+
+
+def xdg(var, default):
+    return os.environ.get(var) or os.path.join(HOME, default)
+
+
+ICS = os.environ.get("CAL_FILE") or os.path.join(HOME, "sync/calendar/calendar.ics")
+FEEDS = os.environ.get("CAL_FEEDS") or os.path.join(xdg("XDG_CONFIG_HOME", ".config"), "calendar/feeds")
+CACHE = os.environ.get("CAL_CACHE") or os.path.join(xdg("XDG_CACHE_HOME", ".cache"), "calendar")
+UTC = timezone.utc
+FREQS = ("DAILY", "WEEKLY", "MONTHLY", "YEARLY")
+WD = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December")
+WIN = {
+    "GMT Standard Time": "Europe/London", "Greenwich Standard Time": "Atlantic/Reykjavik",
+    "W. Europe Standard Time": "Europe/Berlin", "Romance Standard Time": "Europe/Paris",
+    "Central Europe Standard Time": "Europe/Budapest", "Central European Standard Time": "Europe/Warsaw",
+    "E. Europe Standard Time": "Europe/Chisinau", "FLE Standard Time": "Europe/Kyiv", "GTB Standard Time": "Europe/Bucharest",
+    "Eastern Standard Time": "America/New_York", "Central Standard Time": "America/Chicago",
+    "Mountain Standard Time": "America/Denver", "Pacific Standard Time": "America/Los_Angeles",
+    "India Standard Time": "Asia/Kolkata", "China Standard Time": "Asia/Shanghai", "Tokyo Standard Time": "Asia/Tokyo",
+    "AUS Eastern Standard Time": "Australia/Sydney", "UTC": "UTC", "Coordinated Universal Time": "UTC",
+}
+DUR = re.compile(r"P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$")
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg + "\n")
+    sys.exit(code)
+
+
+def unfold(text):
+    out = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if line[:1] in (" ", "\t") and out:
+            out[-1] += line[1:]
+        elif line.strip():
+            out.append(line)
+    return out
+
+
+def split_quoted(s, sep):
+    if '"' not in s:
+        return s.split(sep)
+    out, cur, q = [], [], False
+    for c in s:
+        if c == '"':
+            q = not q
+        if c == sep and not q:
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+    out.append("".join(cur))
+    return out
+
+
+def split_line(line):
+    if '"' in line:
+        i, q = -1, False
+        for n, c in enumerate(line):
+            if c == '"':
+                q = not q
+            elif c == ":" and not q:
+                i = n
+                break
+    else:
+        i = line.find(":")
+    if i < 0:
+        return line.upper(), {}, ""
+    parts = split_quoted(line[:i], ";")
+    params = {}
+    for p in parts[1:]:
+        k, _, v = p.partition("=")
+        params[k.strip().upper()] = v.strip('"')
+    return parts[0].strip().upper(), params, line[i + 1:]
+
+
+def prop_name(line):
+    m = len(line)
+    for c in ";:":
+        i = line.find(c)
+        if 0 <= i < m:
+            m = i
+    return line[:m].strip().upper()
+
+
+def tree(lines):
+    root = ["", [], []]
+    stack = [root]
+    for line in lines:
+        head = line[:6].upper()
+        if head == "BEGIN:":
+            c = [line[6:].strip().upper(), [], []]
+            stack[-1][2].append(c)
+            stack.append(c)
+        elif head[:4] == "END:":
+            if len(stack) > 1:
+                stack.pop()
+        else:
+            stack[-1][1].append(line)
+    return root
+
+
+def props(comp):
+    d = {}
+    for line in comp[1]:
+        n, p, v = split_line(line)
+        d.setdefault(n, []).append((p, v))
+    return d
+
+
+def unesc(v):
+    if "\\" not in v:
+        return v
+    out, i, n = [], 0, len(v)
+    while i < n:
+        c = v[i]
+        if c == "\\" and i + 1 < n:
+            nx = v[i + 1]
+            out.append("\n" if nx in "nN" else nx)
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def esc(v):
+    return v.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\r\n", "\n").replace("\n", "\\n")
+
+
+_tzc = {}
+
+
+def get_tz(tzid, vtz):
+    if tzid in _tzc:
+        return _tzc[tzid]
+    from zoneinfo import ZoneInfo
+    tz = None
+    parts = tzid.strip().split("/")
+    for c in [tzid.strip(), WIN.get(tzid.strip())] + ["/".join(parts[-k:]) for k in (3, 2, 1) if len(parts) > k]:
+        if not c:
+            continue
+        try:
+            tz = ZoneInfo(c)
+            break
+        except Exception:
+            pass
+    if tz is None:
+        tz = vtz.get(tzid)
+    _tzc[tzid] = tz
+    return tz
+
+
+def offset(v):
+    v = v.strip()
+    sign = -1 if v[:1] == "-" else 1
+    v = v.lstrip("+-")
+    return timezone(sign * timedelta(hours=int(v[:2]), minutes=int(v[2:4] or 0)))
+
+
+def parse_dt(value, params, tzf):
+    v = value.strip()
+    if params.get("VALUE", "").upper() == "DATE" or (len(v) == 8 and v.isdigit()):
+        return date(int(v[:4]), int(v[4:6]), int(v[6:8]))
+    dt = datetime(int(v[:4]), int(v[4:6]), int(v[6:8]), int(v[9:11]), int(v[11:13]), min(59, int(v[13:15] or 0)))
+    if v[-1:] in "zZ":
+        return dt.replace(tzinfo=UTC)
+    tzid = params.get("TZID")
+    if tzid and tzf:
+        tz = tzf(tzid)
+        if tz:
+            return dt.replace(tzinfo=tz)
+    return dt
+
+
+def parse_dur(v):
+    v = v.strip()
+    sign = -1 if v[:1] == "-" else 1
+    m = DUR.match(v.lstrip("+-"))
+    if not m:
+        raise ValueError(v)
+    w, d, h, mi, s = (int(x or 0) for x in m.groups())
+    return sign * timedelta(weeks=w, days=d, hours=h, minutes=mi, seconds=s)
+
+
+def isdt(v):
+    return isinstance(v, datetime)
+
+
+def loc(v):
+    if isdt(v) and v.tzinfo:
+        return v.astimezone().replace(tzinfo=None)
+    return v
+
+
+def as_dt(v):
+    return v if isdt(v) else datetime.combine(v, time())
+
+
+def epoch(v):
+    return as_dt(loc(v)).timestamp()
+
+
+def iso(v):
+    return v.isoformat("T", "minutes") if isdt(v) else v.isoformat()
+
+
+def parse_rrule(v, tzf):
+    r = {}
+    for part in v.split(";"):
+        k, _, val = part.partition("=")
+        r[k.strip().upper()] = val.strip()
+    freq = r.get("FREQ", "").upper()
+    if freq not in FREQS:
+        return None
+    byday = []
+    for x in filter(None, r.get("BYDAY", "").upper().split(",")):
+        x = x.strip()
+        if x[-2:] in WD:
+            n = x[:-2]
+            byday.append((int(n) if n not in ("", "+", "-") else 0, WD[x[-2:]]))
+
+    def ints(k):
+        return [int(x) for x in r.get(k, "").split(",") if x.strip().lstrip("+-").isdigit()]
+    return {
+        "freq": freq, "interval": max(1, int(r.get("INTERVAL") or 1)),
+        "count": int(r["COUNT"]) if r.get("COUNT", "").isdigit() else None,
+        "until": parse_dt(r["UNTIL"], {}, None) if r.get("UNTIL") else None,
+        "byday": byday, "bymonthday": [x for x in ints("BYMONTHDAY") if x], "bymonth": [x for x in ints("BYMONTH") if 1 <= x <= 12],
+        "bysetpos": [x for x in ints("BYSETPOS") if x], "wkst": WD.get(r.get("WKST", "MO").upper(), 0),
+        "simple": set(r) <= {"FREQ", "INTERVAL", "WKST"} and int(r.get("INTERVAL") or 1) == 1,
+    }
+
+
+def mdays(y, m):
+    return (date(y + m // 12, m % 12 + 1, 1) - date(y, m, 1)).days
+
+
+def nth_pick(hits, nth):
+    if nth > 0 and nth <= len(hits):
+        return [hits[nth - 1]]
+    if nth < 0 and -nth <= len(hits):
+        return [hits[nth]]
+    return []
+
+
+def month_cands(y, m, rule, d0):
+    n = mdays(y, m)
+    days = None
+    if rule["bymonthday"]:
+        days = {x if x > 0 else n + x + 1 for x in rule["bymonthday"]}
+        days = {x for x in days if 1 <= x <= n}
+    if rule["byday"]:
+        first = date(y, m, 1).weekday()
+        hits = set()
+        for nth, wd in rule["byday"]:
+            every = list(range(1 + (wd - first) % 7, n + 1, 7))
+            hits.update(every if nth == 0 else nth_pick(every, nth))
+        days = hits if days is None else hits & days
+    if days is None:
+        days = {d0} if d0 <= n else set()
+    return [date(y, m, d) for d in sorted(days)]
+
+
+def period(rule, d0, k):
+    f, iv = rule["freq"], rule["interval"]
+    bymonth = rule["bymonth"]
+    if f == "DAILY":
+        d = d0 + timedelta(days=k * iv)
+        ok = (not bymonth or d.month in bymonth) and (not rule["byday"] or d.weekday() in {w for _, w in rule["byday"]})
+        if ok and rule["bymonthday"]:
+            n = mdays(d.year, d.month)
+            ok = d.day in {x if x > 0 else n + x + 1 for x in rule["bymonthday"]}
+        return d, [d] if ok else []
+    if f == "WEEKLY":
+        ws = d0 - timedelta(days=(d0.weekday() - rule["wkst"]) % 7) + timedelta(days=7 * iv * k)
+        wds = {w for _, w in rule["byday"]} or {d0.weekday()}
+        c = sorted(ws + timedelta(days=(w - rule["wkst"]) % 7) for w in wds)
+        return ws, [d for d in c if not bymonth or d.month in bymonth]
+    if f == "MONTHLY":
+        t = d0.month - 1 + k * iv
+        y, m = d0.year + t // 12, t % 12 + 1
+        return date(y, m, 1), [] if bymonth and m not in bymonth else month_cands(y, m, rule, d0.day)
+    y = d0.year + k * iv
+    if rule["byday"] and not bymonth and not rule["bymonthday"]:
+        hits = set()
+        n = (date(y + 1, 1, 1) - date(y, 1, 1)).days
+        first = date(y, 1, 1).weekday()
+        for nth, wd in rule["byday"]:
+            every = [date(y, 1, 1) + timedelta(days=x) for x in range((wd - first) % 7, n, 7)]
+            hits.update(every if nth == 0 else nth_pick(every, nth))
+        return date(y, 1, 1), sorted(hits)
+    c = []
+    for m in sorted(bymonth) or [d0.month]:
+        if rule["byday"] or rule["bymonthday"]:
+            c += month_cands(y, m, rule, d0.day)
+        elif d0.day <= mdays(y, m):
+            c.append(date(y, m, d0.day))
+    return date(y, 1, 1), c
+
+
+def skip(rule, d0, lo):
+    if rule["count"] is not None or lo <= d0:
+        return 0
+    f, iv = rule["freq"], rule["interval"]
+    if f == "DAILY":
+        k = (lo - d0).days // iv
+    elif f == "WEEKLY":
+        k = (lo - d0).days // (7 * iv)
+    elif f == "MONTHLY":
+        k = ((lo.year - d0.year) * 12 + lo.month - d0.month) // iv
+    else:
+        k = (lo.year - d0.year) // iv
+    return max(0, k - 1)
+
+
+def expand(start, rule, lo, hi, until):
+    dt = isdt(start)
+    d0 = start.date() if dt else start
+    t0 = start.time() if dt else None
+    count = rule["count"]
+    if until is None or start <= until:
+        yield start
+    n = 1
+    hid = hi.date() if dt else hi
+    k = skip(rule, d0, lo.date() if dt else lo)
+    for k in range(k, k + 200000):
+        pstart, cands = period(rule, d0, k)
+        if pstart > hid:
+            return
+        if rule["bysetpos"]:
+            cands = sorted({c for p in rule["bysetpos"] for c in nth_pick(cands, p)})
+        for c in cands:
+            v = datetime.combine(c, t0) if dt else c
+            if v <= start:
+                continue
+            if (until is not None and v > until) or (count is not None and n >= count):
+                return
+            if v > hi:
+                return
+            n += 1
+            yield v
+
+
+def wall_until(u, start, tz):
+    if u is None:
+        return None
+    if isdt(start):
+        if not isdt(u):
+            return datetime.combine(u, time(23, 59, 59))
+        if u.tzinfo:
+            return u.astimezone(tz).replace(tzinfo=None) if tz else loc(u)
+        return u
+    return loc(u).date() if isdt(u) else u
+
+
+def occurrences(ev, lo, hi, ovr):
+    s, dur = ev["s"], ev["dur"]
+    rule = ev["rule"]
+    if rule is None and not ev["rd"]:
+        a, b = ev["span"]
+        if b > lo and a < hi or (a == b and lo <= a < hi):
+            L = loc(s)
+            return [(L, L + dur)]
+        return []
+    if rule is None:
+        cands = [s] + ev["rd"]
+    else:
+        tz = s.tzinfo if isdt(s) else None
+        ws = s.replace(tzinfo=None) if tz else s
+        slack = timedelta(days=2)
+        if isdt(ws):
+            wlo, whi = lo - dur - slack, hi + slack
+        else:
+            wlo, whi = (lo - dur - slack).date(), (hi + slack).date()
+        cands = []
+        for w in expand(ws, rule, wlo, whi, wall_until(rule["until"], ws, tz)):
+            if w >= wlo:
+                cands.append(w.replace(tzinfo=tz) if tz else w)
+        cands += ev["rd"]
+    skipset = ovr.get(ev["uid"], ()) if rule is not None or ev["rd"] else ()
+    out = []
+    for c in cands:
+        L = loc(c)
+        if L in ev["ex"] or (isdt(L) and L.date() in ev["ex"]):
+            continue
+        if skipset and (L in skipset or (isdt(L) and L.date() in skipset)):
+            continue
+        E = L + dur
+        if as_dt(E) > lo and as_dt(L) < hi or (dur == timedelta(0) and lo <= as_dt(L) < hi):
+            out.append((L, E))
+    return out
+
+
+def comp_events(comp, tzf):
+    p = props(comp)
+
+    def one(k):
+        v = p.get(k)
+        return v[0] if v else ({}, "")
+
+    sp, sv = one("DTSTART")
+    if not sv:
+        return None
+    s = parse_dt(sv, sp, tzf)
+    ep, evv = one("DTEND")
+    if evv:
+        e = parse_dt(evv, ep, tzf)
+    elif p.get("DURATION"):
+        e = s + parse_dur(one("DURATION")[1])
+    else:
+        e = s + timedelta(days=1) if not isdt(s) else s
+    if isdt(s) and not isdt(e):
+        e = as_dt(e)
+    if not isdt(s) and isdt(e):
+        e = loc(e).date()
+    dur = loc(e) - loc(s)
+    if dur < timedelta(0) or (not isdt(s) and dur < timedelta(days=1)):
+        dur = timedelta(days=1) if not isdt(s) else timedelta(0)
+    rr = one("RRULE")[1]
+    rule = parse_rrule(rr, tzf) if rr else None
+    ex = set()
+    for xp, xv in p.get("EXDATE", ()):
+        for x in xv.split(","):
+            if x.strip():
+                ex.add(loc(parse_dt(x, xp, tzf)))
+    rd = []
+    for xp, xv in p.get("RDATE", ()):
+        if xp.get("VALUE", "").upper() != "PERIOD":
+            for x in xv.split(","):
+                if x.strip():
+                    rd.append(parse_dt(x, xp, tzf))
+    rp, rv = one("RECURRENCE-ID")
+    alarms = []
+    for sub in comp[2]:
+        if sub[0] != "VALARM":
+            continue
+        tp, tv = one_of(props(sub), "TRIGGER")
+        if not tv:
+            continue
+        try:
+            if tp.get("VALUE", "").upper() == "DATE-TIME":
+                alarms.append(("a", epoch(parse_dt(tv, tp, tzf)), False))
+            else:
+                alarms.append(("r", -int(parse_dur(tv).total_seconds()), tp.get("RELATED", "").upper() == "END"))
+        except ValueError:
+            pass
+    return {
+        "uid": one("UID")[1].strip(), "title": unesc(one("SUMMARY")[1]), "note": unesc(one("DESCRIPTION")[1]),
+        "loc": unesc(one("LOCATION")[1]), "s": s, "dur": dur, "rule": rule, "rrule": rr, "ex": ex, "rd": rd,
+        "rid": loc(parse_dt(rv, rp, tzf)) if rv else None, "cancelled": one("STATUS")[1].strip().upper() == "CANCELLED",
+        "alarms": alarms,
+    }
+
+
+def one_of(p, k):
+    v = p.get(k)
+    return v[0] if v else ({}, "")
+
+
+def calendars(root):
+    return [c for c in root[2] if c[0] == "VCALENDAR"] or [root]
+
+
+def parse_text(text):
+    root = tree(unfold(text))
+    events, ovr = [], {}
+    for cal in calendars(root):
+        vtz = {}
+        for c in cal[2]:
+            if c[0] == "VTIMEZONE":
+                tid = one_of(props(c), "TZID")[1].strip()
+                for sub in c[2]:
+                    if sub[0] == "STANDARD":
+                        try:
+                            vtz[tid] = offset(one_of(props(sub), "TZOFFSETTO")[1])
+                        except ValueError:
+                            pass
+
+        def tzf(tzid, vtz=vtz):
+            return get_tz(tzid, vtz)
+        for c in cal[2]:
+            if c[0] == "VEVENT":
+                try:
+                    ev = comp_events(c, tzf)
+                except (ValueError, IndexError):
+                    ev = None
+                if ev:
+                    L = loc(ev["s"])
+                    ev["span"] = (as_dt(L), as_dt(L + ev["dur"]))
+                    events.append(ev)
+                    if ev["rid"] is not None:
+                        ovr.setdefault(ev["uid"], set()).add(ev["rid"])
+    return events, ovr
+
+
+def read_text(path):
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8", "replace")
+
+
+def atomic_write(path, data):
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, ".%s.tmp%d" % (os.path.basename(path), os.getpid()))
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class Store:
+    def __init__(self):
+        self.path = os.path.join(CACHE, "parsed.pickle")
+        self.dirty = False
+        try:
+            zone = os.environ.get("TZ", "") + "|" + os.path.realpath("/etc/localtime")
+        except OSError:
+            zone = os.environ.get("TZ", "")
+        self.zone = (zone, 3)
+        try:
+            with open(self.path, "rb") as f:
+                self.cache = pickle.load(f)
+            if not isinstance(self.cache, dict) or self.cache.get("") != self.zone:
+                self.cache = {}
+        except Exception:
+            self.cache = {}
+
+    def load(self, path):
+        try:
+            st = os.stat(path)
+        except OSError:
+            return [], {}
+        sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+        hit = self.cache.get(path)
+        if hit and hit[0] == sig:
+            return hit[1]
+        data = parse_text(read_text(path))
+        self.cache[path] = (sig, data)
+        self.dirty = True
+        return data
+
+    def save(self):
+        if self.dirty:
+            keep = {p: v for p, v in self.cache.items() if p and os.path.exists(p)}
+            keep[""] = self.zone
+            try:
+                atomic_write(self.path, pickle.dumps(keep, pickle.HIGHEST_PROTOCOL))
+            except OSError:
+                pass
+
+
+def feed_urls():
+    try:
+        lines = read_text(FEEDS).splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        u = line.strip()
+        if not u or u.startswith("#"):
+            continue
+        if u.lower().startswith("webcal://"):
+            u = "https://" + u[9:]
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def feed_path(url):
+    import hashlib
+    return os.path.join(CACHE, "feed-%s.ics" % hashlib.sha1(url.encode()).hexdigest()[:16])
+
+
+def sources():
+    out = [(0, ICS)]
+    for i, u in enumerate(feed_urls()):
+        out.append((i + 1, feed_path(u)))
+    return out
+
+
+def all_events(store):
+    for src, path in sources():
+        events, ovr = store.load(path)
+        for ev in events:
+            if not ev["cancelled"]:
+                yield src, ev, ovr
+
+
+def rep_of(ev):
+    r = ev["rule"]
+    if r is None:
+        return "custom" if ev["rd"] else "none"
+    return r["freq"].lower() if r["simple"] else "custom"
+
+
+def alarm_of(ev):
+    a = ev["alarms"]
+    if len(a) == 1 and a[0][0] == "r" and not a[0][2] and a[0][1] % 60 == 0:
+        return a[0][1] // 60
+    return None if not a else "other"
+
+
+def event_base(src, ev):
+    s = loc(ev["s"])
+    dt = isdt(s)
+    return {
+        "uid": ev["uid"], "src": src, "ro": src != 0, "title": ev["title"], "note": ev["note"], "loc": ev["loc"],
+        "allday": not dt, "rid": iso(ev["rid"]) if ev["rid"] is not None else "", "rep": rep_of(ev), "rule": ev["rrule"],
+        "alarm": alarm_of(ev), "d0": iso(s.date() if dt else s), "t0": s.strftime("%H:%M") if dt else "",
+        "t1": (s + ev["dur"]).strftime("%H:%M") if dt else "", "days": 0 if dt else ev["dur"].days,
+    }
+
+
+def sort_key(o):
+    return (o["s"][:10], 0 if o["allday"] else 1, 1 if o.get("routine") else 0, o.get("order", (0, 0)), o["s"], o["title"].lower())
+
+
+ROUTINES = os.path.join(os.path.dirname(ICS), "routines.md")
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+def day_row(t):
+    if ":" not in t:
+        return None
+    label, rest = t.split(":", 1)
+    w = label.strip().lower()
+    day = WEEKDAYS.index(w) if w in WEEKDAYS else rem_weekday(w)
+    if day is None:
+        return None
+    return day, [x.strip() for x in rest.split(",") if x.strip()]
+
+
+def read_routines():
+    try:
+        with open(ROUTINES, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        base = datetime.fromtimestamp(os.path.getmtime(ROUTINES))
+    except OSError:
+        return {}, [], []
+    found, appts, bad = {}, [], []
+    for i, kind, rest in plan_walk(lines):
+        n, t = i + 1, lines[i].strip()
+        if kind in ("head", "td", "item"):
+            continue
+        if kind == "appt":
+            a = appt_row(rest, base.date())
+            if a and a[1]:
+                appts.append((n, a[0], a[1]))
+            else:
+                bad.append("routines.md line %d: couldn't read “%s” (23/11/26: what)" % (n, t))
+            continue
+        r = day_row(rest) if kind == "day" else None
+        if r:
+            found.setdefault(r[0], []).extend(r[1])
+        elif kind == "day":
+            bad.append("routines.md line %d: couldn't read “%s” (Monday: routine, routine)" % (n, t))
+        else:
+            bad.append("routines.md line %d: couldn't read “%s” (under Agenda, Routines or To-do)" % (n, t))
+    return found, appts, bad
+
+
+def cmd_routines(args):
+    out({"errors": read_routines()[2]})
+
+
+def routines(a, b):
+    found, appts, bad = read_routines()
+    events, todos = [], {}
+    for n, d, text in appts:
+        if a <= d <= b:
+            day = iso(d)
+            events.append({
+                "uid": "plan-%d" % n, "src": -1, "ro": True, "plan": True, "title": text,
+                "note": "", "loc": "", "allday": True, "rid": "", "rep": "none", "rule": "", "alarm": None,
+                "d0": day, "t0": "", "t1": "", "days": 0, "s": day, "e": iso(d + timedelta(days=1)), "occ": day,
+                "order": (n, 0),
+            })
+    d = a
+    while d <= b:
+        if found.get(d.weekday()):
+            todos[iso(d)] = list(found[d.weekday()])
+        d += timedelta(days=1)
+    return events, todos, bad
+
+
+WD_ALIAS = {"tues": 1, "weds": 2, "thur": 3, "thurs": 3}
+
+
+def rem_weekday(w):
+    if w in WD_ALIAS:
+        return WD_ALIAS[w]
+    if len(w) >= 3:
+        for i, name in enumerate(WEEKDAYS):
+            if name.startswith(w) and (len(w) == 3 or w == name):
+                return i
+    return None
+
+
+PLAN_TEMPLATE = (
+    "# Under Agenda, type date: event (xx/yy/zz: event)",
+    "# Under the corresponding days where you have reoccurring tasks, separate by comma. (Monday: Eat, Sleep, Workout)",
+    "# Under To-do, type tasks under each other. Put [x] after one to cross it out.",
+    "",
+    "",
+    "Agenda",
+    "",
+    "Routines",
+    "Monday:",
+    "Tuesday:",
+    "Wednesday:",
+    "Thursday:",
+    "Friday:",
+    "Saturday:",
+    "Sunday:",
+    "",
+    "To-do",
+)
+PLAN_PREFIX = re.compile(r"^\s*(?:[-*+]\s+)?(td|todo|to-do)\s*:\s*", re.I)
+PLAN_SECTION = re.compile(r"^(agenda|routines?|to-?\s?dos?)\s*:?$", re.I)
+PLAN_SECTIONS = {"a": "appt", "r": "day", "t": "item"}
+
+
+def appt_row(t, today):
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})(?:/(\d{2}|\d{4}))?\s*:\s*(.+)", t)
+    if not m:
+        return None
+    d, mo, y = int(m.group(1)), int(m.group(2)), m.group(3)
+    try:
+        if y:
+            day = date(int(y) + (2000 if len(y) == 2 else 0), mo, d)
+        else:
+            day = date(today.year, mo, d)
+            if day < today:
+                day = date(today.year + 1, mo, d)
+    except ValueError:
+        return None
+    return day, m.group(4).strip()
+
+
+def plan_walk(lines):
+    sec = None
+    for i, line in enumerate(lines):
+        t = line.strip()
+        if not t or t.startswith("#"):
+            continue
+        m = PLAN_SECTION.match(t)
+        if m:
+            sec = PLAN_SECTIONS[m.group(1)[0].lower()]
+            yield i, "head", ""
+            continue
+        kind, rest = plan_kind(t)
+        if kind:
+            yield i, kind, rest
+        elif sec == "item":
+            yield i, "item", re.sub(r"^[-*+]\s+", "", t)
+        else:
+            yield i, sec, t
+
+
+def plan_kind(line):
+    m = PLAN_PREFIX.match(line)
+    if not m:
+        return None, line.strip()
+    return "td", line[m.end():].strip()
+
+
+def plan_tidy(text, today):
+    lines = text.split("\n")
+    drop, new = set(), {}
+    for i, kind, rest in plan_walk(lines):
+        if kind == "appt":
+            r = appt_row(rest, today)
+            if r:
+                if r[0] < today:
+                    drop.add(i)
+                else:
+                    new[i] = "%s: %s" % (r[0].strftime("%d/%m/%y"), r[1])
+    return "\n".join(new.get(i, l) for i, l in enumerate(lines) if i not in drop)
+
+
+def plan_read(now=None):
+    try:
+        with open(ROUTINES, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return "", []
+    today = (now or datetime.now()).date()
+    new = plan_tidy(text, today)
+    if new != text:
+        atomic_write(ROUTINES, new.encode("utf-8"))
+    tasks = []
+    for i, kind, rest in plan_walk(new.split("\n")):
+        if kind == "td":
+            tasks += [(i,) + done_split(t) for t in rest.split(",") if t.strip()]
+        elif kind == "item":
+            tasks.append((i,) + done_split(rest))
+    return new, tasks
+
+
+DONE_MARK = re.compile(r"\s*\[x\]\s*$", re.I)
+
+
+def done_split(t):
+    t = t.strip()
+    m = DONE_MARK.search(t)
+    return (t[:m.start()].strip(), True) if m else (t, False)
+
+
+def done_join(t, done):
+    return t + " [x]" if done else t
+
+
+def cmd_todo_tidy(args):
+    sys.stdout.write(plan_tidy(sys.stdin.read(), date.today()))
+
+
+def cmd_todo(args):
+    text, tasks = plan_read()
+    out({"text": text, "now": tasks, "days": {}})
+
+
+def todo_change(args, name, fn):
+    if len(args) < 2 or not args[0].isdigit():
+        die("usage: cal %s LINE TASK" % name)
+    n, task = int(args[0]), args[1]
+    text, tasks = plan_read()
+    if any(t[0] == n and t[1] == task for t in tasks):
+        lines = text.split("\n")
+        kind, rest = plan_kind(lines[n])
+        if kind == "td":
+            parts = [done_split(t) for t in rest.split(",") if t.strip()]
+            i = next(i for i, p in enumerate(parts) if p[0] == task)
+            parts[i] = fn(parts[i])
+            parts = [p for p in parts if p]
+            if parts:
+                lines[n] = "TD: " + ", ".join(done_join(*p) for p in parts)
+            else:
+                del lines[n]
+        else:
+            lead = re.match(r"^\s*(?:[-*+]\s+)?", lines[n]).group(0)
+            p = fn(done_split(lines[n][len(lead):]))
+            if p:
+                lines[n] = lead + done_join(*p)
+            else:
+                del lines[n]
+        atomic_write(ROUTINES, "\n".join(lines).encode("utf-8"))
+        text, tasks = plan_read()
+    out({"text": text, "now": tasks, "days": {}})
+
+
+def cmd_todo_delete(args):
+    todo_change(args, "todo-delete", lambda p: None)
+
+
+def cmd_todo_done(args):
+    todo_change(args, "todo-done", lambda p: (p[0], not p[1]))
+
+
+ROUTINE_DONE = os.path.join(CACHE, "routines-done.json")
+
+
+def routine_done():
+    try:
+        with open(ROUTINE_DONE, encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("day") == iso(date.today()):
+            return list(d.get("done", []))
+    except (OSError, ValueError, AttributeError):
+        pass
+    return []
+
+
+def cmd_routine_done(args):
+    if not args:
+        die("usage: cal routine-done TASK")
+    done = routine_done()
+    if args[0] in done:
+        done.remove(args[0])
+    else:
+        done.append(args[0])
+    atomic_write(ROUTINE_DONE, json.dumps({"day": iso(date.today()), "done": done}).encode("utf-8"))
+    out({"done": done})
+
+
+def vim_str(s):
+    return "'" + s.replace("'", "''") + "'"
+
+
+def cmd_todo_edit(args):
+    add = "--add" in args
+    try:
+        r = subprocess.run(["mmsg", "get", "all-clients"], capture_output=True, text=True, timeout=2)
+        win = next((c for c in json.loads(r.stdout).get("clients", [])
+                    if c.get("appid") == "notepad" and "routines.md" in (c.get("title") or "")), None)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        win = None
+    if win and not add:
+        if win.get("is_focused"):
+            os.execv(os.path.join(HOME, ".config/mango/scripts/close"), ["close", "--id", str(win["id"])])
+        os.execv(os.path.join(HOME, ".config/mango/scripts/mm"), ["mm", "bring", str(win["id"])])
+    if not os.path.exists(ROUTINES) or not os.path.getsize(ROUTINES):
+        atomic_write(ROUTINES, ("\n".join(PLAN_TEMPLATE) + "\n").encode("utf-8"))
+    text, tasks = plan_read()
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    td = [i for i, kind, _ in plan_walk(lines) if kind in ("td", "item")]
+    head = [i for i, kind, _ in plan_walk(lines) if kind == "head" and lines[i].strip().lower().startswith("t")]
+    if td:
+        at = td[-1] + 1
+    elif head:
+        at = head[-1] + 1
+    else:
+        lines += ["", "To-do"]
+        atomic_write(ROUTINES, ("\n".join(lines) + "\n").encode("utf-8"))
+        at = len(lines)
+    kitty = os.path.join(HOME, ".local/bin/kitty")
+    tidy = ("+lua vim.api.nvim_create_autocmd('BufWritePre', {buffer = 0, callback = function()"
+            " local old = vim.api.nvim_buf_get_lines(0, 0, -1, false)"
+            " local r = vim.system({'python3', '-S', [[%s]], 'todo-tidy'}, {stdin = table.concat(old, '\\n') .. '\\n'}):wait()"
+            " if r.code ~= 0 or not r.stdout then return end"
+            " local new = vim.split(r.stdout:gsub('\\n$', ''), '\\n')"
+            " if vim.deep_equal(new, old) then return end"
+            " local v = vim.fn.winsaveview() vim.api.nvim_buf_set_lines(0, 0, -1, false, new) vim.fn.winrestview(v)"
+            " end})") % os.path.abspath(__file__)
+    cmd = [kitty, "--class=notepad", "nvim", tidy]
+    if add:
+        cmd += ["+call append(%d, [''])" % at, "+%d" % (at + 1), "+startinsert!"]
+    else:
+        cmd += ["+normal G"]
+    os.execv(kitty, cmd + [ROUTINES])
+
+
+def range_events(store, a, b):
+    lo, hi = datetime.combine(a, time()), datetime.combine(b + timedelta(days=1), time())
+    out = []
+    for src, ev, ovr in all_events(store):
+        occ = occurrences(ev, lo, hi, ovr)
+        if occ:
+            base = event_base(src, ev)
+            rec = bool(ev["rule"] or ev["rd"])
+            for L, E in occ:
+                o = dict(base)
+                o["s"], o["e"] = iso(L), iso(E)
+                o["occ"] = o["s"] if rec else ""
+                o["allday"] = not isdt(L)
+                out.append(o)
+    return out
+
+
+def cmd_range(args):
+    a = date.fromisoformat(args[0]) if args else date.today()
+    b = date.fromisoformat(args[1]) if len(args) > 1 else a + timedelta(days=14)
+    if b < a:
+        a, b = b, a
+    store = Store()
+    revs, rtodos, rbad = routines(a, b)
+    events = range_events(store, a, b) + revs
+    events.sort(key=sort_key)
+    store.save()
+    out({"events": events, "errors": feed_errors(), "routineErrors": rbad, "routineTodos": rtodos, "routineDone": routine_done()})
+
+
+def day_word(d, ref):
+    n = (d - ref).days
+    if n == 0:
+        return "Today"
+    if n == 1:
+        return "Tomorrow"
+    s = "%s %d %s" % (DAYS[d.weekday()], d.day, MONTHS[d.month - 1])
+    return s if d.year == ref.year else s + " " + str(d.year)
+
+
+def alarm_body(L, E, at):
+    ref = datetime.fromtimestamp(at).date()
+    if not isdt(L):
+        last = E - timedelta(days=1)
+        w = day_word(L, ref) + ", all day"
+        return w if last <= L else w + " until " + day_word(last, ref)
+    t = L.strftime("%H:%M")
+    if E > L:
+        t += "–" + E.strftime("%H:%M")
+        if E.date() != L.date():
+            t += " " + day_word(E.date(), ref)
+    return day_word(L.date(), ref) + " " + t
+
+
+def next_alarm(store, after):
+    base = datetime.fromtimestamp(after)
+    evs = [x for x in all_events(store) if x[1]["alarms"]]
+    for horizon in (2, 35, 400, 3000):
+        limit = after + horizon * 86400
+        lo, hi = base - timedelta(days=8), base + timedelta(days=horizon + 8)
+        best, items = None, []
+        for src, ev, ovr in evs:
+            occ = None
+            for kind, secs, rel_end in ev["alarms"]:
+                if kind == "a":
+                    hits = [(secs, None, None)] if after < secs <= limit else []
+                else:
+                    if occ is None:
+                        occ = occurrences(ev, lo, hi, ovr)
+                    hits = []
+                    for L, E in occ:
+                        t = (epoch(E) if rel_end else epoch(L)) - secs
+                        if after < t <= limit:
+                            hits.append((t, L, E))
+                for t, L, E in hits:
+                    t = int(t)
+                    if best is None or t < best:
+                        best, items = t, []
+                    if t == best:
+                        if L is None:
+                            L, E = loc(ev["s"]), loc(ev["s"]) + ev["dur"]
+                        items.append({"uid": ev["uid"], "title": ev["title"] or "(no title)", "body": alarm_body(L, E, t)})
+        if best is not None:
+            seen, uniq = set(), []
+            for it in items:
+                k = (it["uid"], it["title"], it["body"])
+                if k not in seen:
+                    seen.add(k)
+                    uniq.append(it)
+            return {"at": best, "items": uniq}
+    return {"at": None, "items": []}
+
+
+def cmd_next_alarm(args):
+    now = datetime.now().timestamp()
+    after = float(args[0]) if args else now
+    store = Store()
+    res = next_alarm(store, after)
+    store.save()
+    out(res)
+
+
+def fold(line):
+    b = line.encode()
+    if len(b) <= 75:
+        return line
+    out, cur, n, lim = [], [], 0, 75
+    for c in line:
+        cl = len(c.encode())
+        if n + cl > lim:
+            out.append("".join(cur))
+            cur, n, lim = [], 0, 74
+        cur.append(c)
+        n += cl
+    out.append("".join(cur))
+    return "\r\n ".join(out)
+
+
+def serialise(comp, out):
+    if comp[0]:
+        out.append("BEGIN:" + comp[0])
+    out.extend(fold(x) for x in comp[1])
+    for sub in comp[2]:
+        serialise(sub, out)
+    if comp[0]:
+        out.append("END:" + comp[0])
+
+
+def utcnow():
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def set_prop(comp, name, lines):
+    idx, keep = None, []
+    for line in comp[1]:
+        if prop_name(line) == name:
+            if idx is None:
+                idx = len(keep)
+        else:
+            keep.append(line)
+    if idx is None:
+        idx = len(keep)
+    keep[idx:idx] = lines
+    comp[1] = keep
+
+
+def get_prop(comp, name):
+    for line in comp[1]:
+        if prop_name(line) == name:
+            return split_line(line)
+    return None
+
+
+class Raw:
+    def __enter__(self):
+        import fcntl
+        os.makedirs(CACHE, exist_ok=True)
+        self.lock = open(os.path.join(CACHE, "write.lock"), "w")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        try:
+            self.root = tree(unfold(read_text(ICS)))
+        except FileNotFoundError:
+            self.root = ["", [], []]
+        cals = [c for c in self.root[2] if c[0] == "VCALENDAR"]
+        if not cals:
+            cal = ["VCALENDAR", ["VERSION:2.0", "PRODID:-//cal//EN", "CALSCALE:GREGORIAN"], []]
+            self.root[2].append(cal)
+            cals = [cal]
+        self.cal = cals[0]
+        self.changed = False
+        self.tzs = {}
+        for c in self.cal[2]:
+            if c[0] == "VTIMEZONE":
+                p = get_prop(c, "TZID")
+                if p:
+                    for sub in c[2]:
+                        if sub[0] == "STANDARD":
+                            o = get_prop(sub, "TZOFFSETTO")
+                            if o:
+                                try:
+                                    self.tzs[p[2].strip()] = offset(o[2])
+                                except ValueError:
+                                    pass
+        return self
+
+    def __exit__(self, et, ev, tb):
+        try:
+            if et is None and self.changed:
+                lines = []
+                serialise(self.root, lines)
+                atomic_write(ICS, ("\r\n".join(lines) + "\r\n").encode())
+        finally:
+            self.lock.close()
+        return False
+
+    def tzf(self, tzid):
+        return get_tz(tzid, self.tzs)
+
+    def comps(self, kind):
+        return [c for cal in calendars(self.root) for c in cal[2] if c[0] == kind]
+
+    def find(self, kind, uid):
+        return [c for c in self.comps(kind) if (get_prop(c, "UID") or ("", {}, ""))[2].strip() == uid]
+
+    def remove(self, kind, uids, pred=None):
+        n = 0
+        for cal in calendars(self.root):
+            keep = []
+            for c in cal[2]:
+                if c[0] == kind and (get_prop(c, "UID") or ("", {}, ""))[2].strip() in uids and (pred is None or pred(c)):
+                    n += 1
+                else:
+                    keep.append(c)
+            cal[2] = keep
+        self.changed = self.changed or n > 0
+        return n
+
+    def add(self, comp):
+        self.cal[2].append(comp)
+        self.changed = True
+
+
+def new_uid():
+    import uuid
+    return str(uuid.uuid4()) + "@cal"
+
+
+def dt_style(comp, raw):
+    p = get_prop(comp, "DTSTART")
+    if not p:
+        return None
+    _, params, v = p
+    if params.get("TZID"):
+        tz = raw.tzf(params["TZID"])
+        if tz:
+            return ("TZ", params["TZID"], tz)
+    if v.strip()[-1:] in "zZ":
+        return ("Z",)
+    return None
+
+
+def ics_value(v, style):
+    if not isdt(v):
+        return ";VALUE=DATE", v.strftime("%Y%m%d")
+    if style and style[0] == "Z":
+        return "", v.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+    if style and style[0] == "TZ":
+        tid = style[1]
+        q = '"%s"' % tid if any(c in tid for c in ':;,') else tid
+        return ";TZID=" + q, v.astimezone(style[2]).strftime("%Y%m%dT%H%M%S")
+    return "", v.strftime("%Y%m%dT%H%M%S")
+
+
+def trigger(m):
+    if m == 0:
+        return "PT0S"
+    sign, m = ("-", m) if m > 0 else ("", -m)
+    if m % 1440 == 0:
+        return "%sP%dD" % (sign, m // 1440)
+    if m % 60 == 0:
+        return "%sPT%dH" % (sign, m // 60)
+    return "%sPT%dM" % (sign, m)
+
+
+def valarm(m, title):
+    return ["VALARM", ["ACTION:DISPLAY", "DESCRIPTION:" + esc(title or "Reminder"), "TRIGGER:" + trigger(m)], []]
+
+
+def fix_until(rr, allday, style):
+    m = re.search(r"(?i)UNTIL=([0-9TZ]+)", rr)
+    if not m:
+        return rr
+    try:
+        u = loc(parse_dt(m.group(1), {}, None))
+    except ValueError:
+        return rr
+    if allday:
+        v = (u.date() if isdt(u) else u).strftime("%Y%m%d")
+    else:
+        u = u if isdt(u) else datetime.combine(u, time(23, 59, 59))
+        v = u.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ") if style else u.strftime("%Y%m%dT%H%M%S")
+    return rr[:m.start(1)] + v + rr[m.end(1):]
+
+
+def hm(s):
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s or "")
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        return None
+    return time(int(m.group(1)), int(m.group(2)))
+
+
+def read_input():
+    try:
+        d = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        die("bad JSON on stdin", 2)
+    return d
+
+
+def fill_event(comp, d, raw, is_new):
+    title = (d.get("title") or "").strip()
+    if not title:
+        die("title is empty", 2)
+    try:
+        day = date.fromisoformat(d.get("date", ""))
+    except ValueError:
+        die("bad date", 2)
+    st = d.get("start") or ""
+    style = None if is_new else dt_style(comp, raw)
+    old = None
+    if not is_new:
+        try:
+            p = props(comp)
+            sp, sv = one_of(p, "DTSTART")
+            s0 = parse_dt(sv, sp, raw.tzf)
+            ep, ev = one_of(p, "DTEND")
+            if ev:
+                old = loc(parse_dt(ev, ep, raw.tzf)) - loc(s0)
+            elif p.get("DURATION"):
+                old = parse_dur(one_of(p, "DURATION")[1])
+            old = (old, isdt(s0), s0)
+        except (ValueError, IndexError):
+            old = None
+    if not st:
+        s = day
+        n = int(d.get("days") or 0)
+        if n < 1:
+            n = old[0].days if old and not old[1] and old[0] and old[0].days >= 1 else 1
+        e = day + timedelta(days=n)
+    else:
+        t0 = hm(st)
+        if t0 is None:
+            die("bad start time", 2)
+        s = datetime.combine(day, t0)
+        en = d.get("end") or ""
+        if en:
+            t1 = hm(en)
+            if t1 is None:
+                die("bad end time", 2)
+            e = datetime.combine(day, t1)
+            if e <= s:
+                e += timedelta(days=1)
+        else:
+            e = s + timedelta(hours=1)
+    pa, va = ics_value(s, style)
+    pb, vb = ics_value(e, style)
+    set_prop(comp, "DTSTART", ["DTSTART" + pa + ":" + va])
+    set_prop(comp, "DTEND", ["DTEND" + pb + ":" + vb])
+    set_prop(comp, "DURATION", [])
+    set_prop(comp, "SUMMARY", ["SUMMARY:" + esc(title)])
+    note = (d.get("note") or "").rstrip()
+    set_prop(comp, "DESCRIPTION", ["DESCRIPTION:" + esc(note)] if note else [])
+    now = utcnow()
+    set_prop(comp, "DTSTAMP", ["DTSTAMP:" + now])
+    set_prop(comp, "LAST-MODIFIED", ["LAST-MODIFIED:" + now])
+    if is_new:
+        set_prop(comp, "CREATED", ["CREATED:" + now])
+    else:
+        q = get_prop(comp, "SEQUENCE")
+        n = int(q[2]) + 1 if q and q[2].strip().isdigit() else 1
+        set_prop(comp, "SEQUENCE", ["SEQUENCE:%d" % n])
+    rep = d.get("repeat", "none")
+    override = get_prop(comp, "RECURRENCE-ID") is not None
+    if rep != "keep" and not override:
+        if rep in ("daily", "weekly", "monthly", "yearly"):
+            set_prop(comp, "RRULE", ["RRULE:FREQ=" + rep.upper()])
+        else:
+            for k in ("RRULE", "RDATE", "EXDATE"):
+                set_prop(comp, k, [])
+    else:
+        q = get_prop(comp, "RRULE")
+        if q and old and old[1] != isdt(s):
+            set_prop(comp, "RRULE", ["RRULE:" + fix_until(q[2], not isdt(s), style)])
+    if not is_new and not override and old:
+        move_exceptions(comp, raw, old[2], s, style)
+    al = d.get("alarm", "keep")
+    if al != "keep":
+        comp[2] = [c for c in comp[2] if c[0] != "VALARM"]
+        if al is not None:
+            comp[2].append(valarm(int(al), title))
+
+
+def move_exceptions(comp, raw, s0, s, style):
+    tz = style[2] if style and style[0] == "TZ" else UTC if style else None
+
+    def wall(v):
+        if not isdt(v) or not (tz or v.tzinfo):
+            return v
+        return v.astimezone(tz).replace(tzinfo=None) if tz else loc(v)
+
+    new, old = wall(s), wall(s0)
+    if new == old:
+        return
+    days = (new.date() if isdt(new) else new) - (old.date() if isdt(old) else old)
+
+    def moved(v):
+        d = wall(v)
+        d = (d.date() if isdt(d) else d) + days
+        if not isdt(new):
+            return d
+        d = datetime.combine(d, new.time())
+        return d.replace(tzinfo=tz) if tz else d
+
+    ex = []
+    for xp, xv in props(comp).get("EXDATE", ()):
+        for x in xv.split(","):
+            try:
+                ex.append(moved(parse_dt(x, xp, raw.tzf)))
+            except (ValueError, IndexError):
+                pass
+    set_prop(comp, "EXDATE", ["EXDATE%s:%s" % ics_value(v, style) for v in ex])
+    q = get_prop(comp, "RRULE")
+    m = re.search(r"(?i)UNTIL=([0-9TZ]+)", q[2]) if q else None
+    if m:
+        try:
+            u = parse_dt(m.group(1), {}, None)
+            u = u + (new - old if isdt(new) and isdt(old) and isdt(u) else days)
+            fmt = "%Y%m%d" if not isdt(u) else "%Y%m%dT%H%M%SZ" if m.group(1).upper().endswith("Z") else "%Y%m%dT%H%M%S"
+            set_prop(comp, "RRULE", ["RRULE:" + q[2][:m.start(1)] + u.strftime(fmt) + q[2][m.end(1):]])
+        except (ValueError, TypeError):
+            pass
+    uid =(get_prop(comp, "UID") or ("", {}, ""))[2].strip()
+    for c in raw.find("VEVENT", uid):
+        p = get_prop(c, "RECURRENCE-ID")
+        if c is not comp and p:
+            try:
+                set_prop(c, "RECURRENCE-ID", ["RECURRENCE-ID%s:%s" % ics_value(moved(parse_dt(p[2], p[1], raw.tzf)), style)])
+            except (ValueError, IndexError):
+                pass
+
+
+def cmd_add(args):
+    d = read_input()
+    with Raw() as raw:
+        uid = new_uid()
+        comp = ["VEVENT", ["UID:" + uid], []]
+        fill_event(comp, d, raw, True)
+        raw.add(comp)
+    out({"ok": True, "uid": uid})
+
+
+def pick(raw, uid, rid):
+    for c in raw.find("VEVENT", uid):
+        p = get_prop(c, "RECURRENCE-ID")
+        if rid:
+            if p:
+                try:
+                    if iso(loc(parse_dt(p[2], p[1], raw.tzf))) == rid:
+                        return c
+                except ValueError:
+                    pass
+        elif not p:
+            return c
+    return None
+
+
+def cmd_edit(args):
+    d = read_input()
+    uid = d.get("uid", "")
+    with Raw() as raw:
+        comp = pick(raw, uid, d.get("rid") or "")
+        if comp is None:
+            die("no such event", 1)
+        fill_event(comp, d, raw, False)
+        raw.changed = True
+    out({"ok": True, "uid": uid})
+
+
+def cmd_delete(args):
+    d = read_input()
+    uid, rid, only = d.get("uid", ""), d.get("rid") or "", d.get("only") or ""
+    with Raw() as raw:
+        master = pick(raw, uid, "")
+        if only and master is not None and (get_prop(master, "RRULE") or get_prop(master, "RDATE")):
+            key = rid or only
+            if rid:
+                target = pick(raw, uid, rid)
+                raw.remove("VEVENT", {uid}, lambda c: c is target)
+            try:
+                v = datetime.strptime(key, "%Y-%m-%dT%H:%M") if "T" in key else date.fromisoformat(key)
+            except ValueError:
+                die("bad occurrence", 2)
+            sp = get_prop(master, "DTSTART")
+            if sp and (len(sp[2].strip()) == 8 or sp[1].get("VALUE", "").upper() == "DATE"):
+                v = v.date() if isdt(v) else v
+            elif not isdt(v):
+                v = datetime.combine(v, time())
+            pa, va = ics_value(v, dt_style(master, raw))
+            master[1].append("EXDATE" + pa + ":" + va)
+            set_prop(master, "DTSTAMP", ["DTSTAMP:" + utcnow()])
+            raw.changed = True
+        elif rid and master is not None:
+            raw.remove("VEVENT", {uid}, lambda c: c is not master)
+        elif raw.remove("VEVENT", {uid}) == 0:
+            die("no such event", 1)
+    out({"ok": True})
+
+
+def state_path():
+    return os.path.join(CACHE, "feeds.json")
+
+
+def read_state():
+    try:
+        with open(state_path()) as f:
+            s = json.load(f)
+        return s if isinstance(s, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def feed_errors():
+    st = read_state().get("feeds", {})
+    return ["%s: %s" % (u, st[u]["err"]) for u in feed_urls() if st.get(u, {}).get("err")]
+
+
+def fetch_one(url, meta):
+    import urllib.request
+    import urllib.error
+    if not re.match(r"(?i)https?://", url):
+        return url, {"err": "not an http(s) URL"}, None
+    req = urllib.request.Request(url, headers={"User-Agent": "cal/1", "Accept": "text/calendar, */*"})
+    if meta.get("etag"):
+        req.add_header("If-None-Match", meta["etag"])
+    if meta.get("lm"):
+        req.add_header("If-Modified-Since", meta["lm"])
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = r.read(50 * 1024 * 1024 + 1)
+            if len(body) > 50 * 1024 * 1024:
+                return url, {"err": "too big"}, None
+            if b"BEGIN:VCALENDAR" not in body[:4096].upper() and b"BEGIN:VCALENDAR" not in body.upper():
+                return url, {"err": "not an iCalendar file"}, None
+            return url, {"etag": r.headers.get("ETag") or "", "lm": r.headers.get("Last-Modified") or ""}, body
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return url, {"etag": meta.get("etag", ""), "lm": meta.get("lm", "")}, None
+        return url, {"err": "HTTP %d" % e.code}, None
+    except Exception as e:
+        return url, {"err": str(getattr(e, "reason", e)) or e.__class__.__name__}, None
+
+
+def cmd_fetch(args):
+    force = "--force" in args or "-f" in args
+    now = datetime.now().timestamp()
+    urls = feed_urls()
+    state = read_state()
+    # a copy: changed in place, it would equal state below and never be saved
+    feeds = {u: dict(m) for u, m in state.get("feeds", {}).items()}
+    changed = False
+    due = [u for u in urls if force or now - feeds.get(u, {}).get("t", 0) >= 1800]
+    if due:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(8, len(due))) as ex:
+            results = list(ex.map(lambda u: fetch_one(u, feeds.get(u, {})), due))
+        for url, meta, body in results:
+            meta["t"] = now
+            if body is not None:
+                path = feed_path(url)
+                try:
+                    with open(path, "rb") as f:
+                        same = f.read() == body
+                except OSError:
+                    same = False
+                if not same:
+                    atomic_write(path, body)
+                    changed = True
+            feeds[url] = meta
+    keep = {os.path.basename(feed_path(u)) for u in urls}
+    try:
+        for n in os.listdir(CACHE):
+            if n.startswith("feed-") and n.endswith(".ics") and n not in keep:
+                os.unlink(os.path.join(CACHE, n))
+                changed = True
+    except OSError:
+        pass
+    feeds = {u: m for u, m in feeds.items() if u in urls}
+    try:
+        st = os.stat(ICS)
+        sig = [st.st_mtime_ns, st.st_size, st.st_ino]
+    except OSError:
+        sig = None
+    if state.get("local") != sig and "local" in state:
+        changed = True
+    new = {"feeds": feeds, "local": sig}
+    if new != state:
+        os.makedirs(CACHE, exist_ok=True)
+        atomic_write(state_path(), json.dumps(new).encode())
+    out({"changed": changed, "fetched": len(due), "errors": ["%s: %s" % (u, feeds[u]["err"]) for u in urls if feeds.get(u, {}).get("err")]})
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+CMDS = {
+    "range": cmd_range, "add": cmd_add, "edit": cmd_edit, "delete": cmd_delete,
+    "next-alarm": cmd_next_alarm, "fetch": cmd_fetch,
+    "todo": cmd_todo, "todo-edit": cmd_todo_edit,
+    "todo-delete": cmd_todo_delete, "todo-done": cmd_todo_done, "routine-done": cmd_routine_done,
+    "todo-tidy": cmd_todo_tidy, "routines": cmd_routines,
+}
+
+
+def main(argv):
+    if not argv or argv[0] not in CMDS:
+        die("usage: cal range [FROM [TO]] | add | edit | delete (JSON on stdin) | next-alarm [AFTER] | fetch [--force] | todo | todo-edit [DAY] [--add] | todo-delete LINE TASK | todo-done LINE TASK | routine-done TASK | todo-tidy | routines", 2)
+    CMDS[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

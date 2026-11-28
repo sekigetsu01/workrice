@@ -1,0 +1,39 @@
+#!/bin/sh
+# Glide, telling sites its time zone is UTC; it starts with your start tabs (~/.config/glide/start-tabs)
+TABS=$HOME/.config/glide/start-tabs
+
+running() {
+    for l in "$HOME"/.config/glide/glide/*/lock; do
+        p=$(readlink "$l" 2>/dev/null) || continue
+        p=${p##*+}
+        [ -n "$p" ] && kill -0 "$p" 2>/dev/null && grep -q glide "/proc/$p/comm" 2>/dev/null && { PID=$p; return 0; }
+    done
+    return 1
+}
+
+windows() {
+    mmsg get all-clients 2>/dev/null | python3 -I -c 'import json, sys
+try:
+    cs = json.load(sys.stdin).get("clients", [])
+except ValueError:
+    sys.exit(2)
+sys.exit(0 if any((c.get("appid") or "").startswith("glide") for c in cs) else 1)' 2>/dev/null
+}
+
+if running; then
+    windows
+    if [ $? = 1 ]; then
+        i=0
+        while kill -0 "$PID" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.2; i=$((i + 1)); done
+    fi
+fi
+
+case " $* " in *" --private-window "*) TABS= ;; esac
+if [ -n "$TABS" ] && [ -s "$TABS" ] && ! running; then
+    tabs=$(grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$TABS")
+    set -f
+    # shellcheck disable=SC2086
+    set -- "$@" $tabs
+    set +f
+fi
+TZ=UTC exec /usr/bin/glide-bin "$@"

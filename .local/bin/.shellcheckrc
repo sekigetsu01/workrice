@@ -1,0 +1,2 @@
+# shellcheck follows the files the scripts source (~/.local/lib/common.sh)
+external-sources=true

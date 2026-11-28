@@ -1,0 +1,71 @@
+#!/bin/bash
+# The VPN lock on the bar: a click shows where you appear (IP, place, server, how long it's been on, kill switch);
+# a right-click checks for leaks (traffic outside the VPN, IPv6, DNS). Answers come as notifications.
+dev=tun-riseup
+conf=$HOME/RiseupVPN-OpenVPN/riseup-ovpn.conf
+id=
+note() {
+    local o
+    o=$(notify-send --app-name=VPN -p ${id:+-r "$id"} -h string:x-canonical-private-synchronous:vpn-info "$@" 2>/dev/null) && id=$o
+}
+up() { local s; read -r s 2>/dev/null < "/sys/class/net/$dev/operstate" && [ "$s" != down ]; }
+get() { curl -fsS --max-time 8 "$@" 2>/dev/null; }
+js() { python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print("\x1f".join(str(d.get(k) or "") for k in sys.argv[1:]))' "$@" 2>/dev/null; }
+
+where() {
+    IFS=$'\x1f' read -r ip country city org < <(get https://am.i.mullvad.net/json | js ip country city organization)
+    [ -n "$ip" ]
+}
+
+case ${1:-status} in
+status)
+    if ! up; then
+        if where; then note "VPN off" "Your real IP is showing: $ip · ${city:+$city, }$country"; else note "VPN off" "No internet"; fi
+        exit
+    fi
+    where || { note "VPN on" "Couldn't reach the internet to check where you appear."; exit; }
+    server=$(awk 'FILENAME == ARGV[1] { sub(/:[0-9]+$/, "", $NF); gsub(/[][]/, "", $NF); up[$NF] = 1; next }
+        $1 == "remote" && up[$2] { n = $0; if (sub(/^[^#]*#[ \t]*/, "", n) && n != "") print n; else print $2; exit }' \
+        <(ss -Htun state established 2>/dev/null) "$conf" 2>/dev/null)
+    t=$(ps -o etimes= -C openvpn 2>/dev/null | sort -n | tail -n1)
+    if [ -n "$t" ]; then printf -v since '%dh %02dm' $((t / 3600)) $((t % 3600 / 60)); fi
+    if pgrep -f '^/bin/sh /usr/local/lib/vpn-root$' >/dev/null; then ks=on; else ks=off; fi
+    note "VPN on: ${city:+$city, }$country" "IP $ip${server:+ · server $server}${since:+ · up $since} · kill switch $ks" ;;
+check)
+    note "VPN check" "Checking…"
+    if ! up; then
+        if where; then note --urgency=critical "VPN is off" "Your real IP is showing: $ip ($country)"; else note "VPN check" "No internet"; fi
+        exit
+    fi
+    bad=()
+    route=$(ip route get 1.1.1.1 2>/dev/null)
+    [[ $route == *"dev $dev "* ]] || bad+=("traffic isn't going through the VPN")
+    where || { note "VPN check" "Couldn't reach the internet (is the VPN connected yet?)"; exit; }
+    v6=$(curl -6 -fsS --max-time 5 https://am.i.mullvad.net/ip 2>/dev/null)
+    if [ -n "$v6" ] && [[ $(ip -6 route get 2606:4700:4700::1111 2>/dev/null) != *"dev $dev "* ]]; then bad+=("IPv6 leak: $v6"); fi
+    tid=$(get https://bash.ws/id)
+    dns="DNS test unavailable"
+    if [[ $tid =~ ^[0-9a-zA-Z]+$ ]]; then
+        for i in 1 2 3 4 5 6 7 8 9 10; do getent ahosts "$i.$tid.bash.ws" >/dev/null 2>&1 & done
+        wait
+        res=$(get "https://bash.ws/dnsleak/test/$tid?json")
+        home=$(z=$(readlink /etc/localtime); z=${z#*zoneinfo/}; awk -v z="$z" '$3 == z { print $1; exit }' /usr/share/zoneinfo/zone1970.tab 2>/dev/null)
+        dns=$(python3 -c 'import json,sys
+d=json.loads(sys.stdin.read() or "[]")
+home=sys.argv[1].lower()[:2]
+ex=next((x.get("country","").lower() for x in d if x.get("type")=="ip"),"")
+s=[x for x in d if x.get("type")=="dns"]
+leak=bool(home) and ex!=home and any(x.get("country","").lower()==home for x in s)
+names=sorted({(x.get("asn") or x.get("ip","?")) + " (" + (x.get("country_name") or x.get("country") or "?").split(",")[0] + ")" for x in s})
+print(("LEAK " if leak else "") + "DNS via " + (", ".join(names) or "?"))' "${home%%,*}" <<< "$res" 2>/dev/null) || dns="DNS test unavailable"
+        [[ $dns == LEAK* ]] && { bad+=("DNS may be leaking"); dns=${dns#LEAK }; }
+    fi
+    if (( ${#bad[@]} )); then
+        note --urgency=critical "VPN check: problem" "$(IFS=';'; echo "${bad[*]}") · seen as $ip ($country) · $dns"
+    else
+        note "VPN check: all good" "Seen as $ip · ${city:+$city, }$country · $org · $dns"
+    fi ;;
+*) echo "Usage: vpn-info [status|check]" >&2; exit 1 ;;
+esac

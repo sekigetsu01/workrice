@@ -1,0 +1,12 @@
+#!/bin/sh
+# ani-cli with this system's defaults, then the packaged one (/usr/bin/ani-cli) does the rest.
+# Each default gives way to the same variable set in the environment.
+#   downloads (-d)   into ~/Videos/Anime instead of the current folder
+#   openings/endings their times come from ani-skip, for mpv to skip by key (ani-cli.lua)
+#   player           ani-mpv: mpv, with ani-skip's own automatic skipping kept out
+export ANI_CLI_DOWNLOAD_DIR="${ANI_CLI_DOWNLOAD_DIR:-$HOME/Videos/Anime}"
+export ANI_CLI_PLAYER="${ANI_CLI_PLAYER:-ani-mpv}"
+# without ani-skip installed, ani-cli refuses to start when this is on
+command -v ani-skip >/dev/null && export ANI_CLI_SKIP_INTRO="${ANI_CLI_SKIP_INTRO:-1}"
+mkdir -p "$ANI_CLI_DOWNLOAD_DIR"
+exec /usr/bin/ani-cli "$@"
